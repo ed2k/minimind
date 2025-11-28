@@ -43,6 +43,10 @@ class SFTDataset:
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.data = self._load_data()
+        
+        # Token sequences for identifying assistant responses
+        self.bos_id = tokenizer(f'{tokenizer.bos_token}assistant', add_special_tokens=False).input_ids
+        self.eos_id = tokenizer(f'{tokenizer.eos_token}', add_special_tokens=False).input_ids
     
     def _load_data(self):
         """Load JSONL data with instruction-response pairs"""
@@ -56,48 +60,59 @@ class SFTDataset:
     def __len__(self):
         return len(self.data)
     
+    def _generate_loss_mask(self, input_ids):
+        """Generate loss mask - only compute loss on assistant responses"""
+        loss_mask = [0] * len(input_ids)
+        i = 0
+        while i < len(input_ids):
+            # Find <bos>assistant token sequence
+            if input_ids[i:i + len(self.bos_id)] == self.bos_id:
+                start = i + len(self.bos_id)
+                end = start
+                # Find <eos> token sequence
+                while end < len(input_ids):
+                    if input_ids[end:end + len(self.eos_id)] == self.eos_id:
+                        break
+                    end += 1
+                # Mask tokens between start and end (assistant response)
+                for j in range(start + 1, min(end + len(self.eos_id) + 1, self.max_length)):
+                    loss_mask[j] = 1
+                i = end + len(self.eos_id) if end < len(input_ids) else len(input_ids)
+            else:
+                i += 1
+        return loss_mask
+    
     def __getitem__(self, idx):
         item = self.data[idx]
         
-        # Apply chat template
-        conversation = [{"role": "user", "content": item.get('instruction', '')}]
-        if 'output' in item:
-            conversation.append({"role": "assistant", "content": item['output']})
+        # Handle different data formats
+        if 'conversations' in item:
+            # Format: {"conversations": [{"role": "user", "content": "..."}, ...]}
+            conversation = item['conversations']
+        else:
+            # Format: {"instruction": "...", "output": "..."}
+            conversation = [{"role": "user", "content": item.get('instruction', '')}]
+            if 'output' in item:
+                conversation.append({"role": "assistant", "content": item['output']})
         
         # Format with chat template
-        text = self.tokenizer.apply_chat_template(
+        prompt = self.tokenizer.apply_chat_template(
             conversation=conversation,
             tokenize=False,
             add_generation_prompt=False
         )
         
         # Tokenize
-        tokens = self.tokenizer(
-            text,
-            max_length=self.max_length,
-            truncation=True,
-            padding='max_length',
-            return_tensors='np'
-        )
+        input_ids_list = self.tokenizer(prompt).input_ids[:self.max_length]
+        input_ids_list += [self.tokenizer.pad_token_id] * (self.max_length - len(input_ids_list))
         
-        input_ids = tokens['input_ids'][0]
-        attention_mask = tokens['attention_mask'][0]
+        # Generate dynamic loss mask
+        loss_mask = self._generate_loss_mask(input_ids_list)
         
-        # Create loss mask - only compute loss on assistant response
-        # Find where assistant response starts
-        assistant_token = self.tokenizer.encode("assistant", add_special_tokens=False)[0]
-        loss_mask = np.zeros_like(input_ids, dtype=np.float32)
-        
-        # Simple heuristic: mask everything after finding assistant token
-        try:
-            assistant_idx = np.where(input_ids == assistant_token)[0]
-            if len(assistant_idx) > 0:
-                loss_mask[assistant_idx[0]:] = attention_mask[assistant_idx[0]:]
-        except:
-            # Fallback: use attention mask
-            loss_mask = attention_mask.astype(np.float32)
-        
-        labels = input_ids.copy()
+        # Build training data (shift by 1 for next-token prediction)
+        input_ids = np.array(input_ids_list[:-1], dtype=np.int32)
+        labels = np.array(input_ids_list[1:], dtype=np.int32)
+        loss_mask = np.array(loss_mask[1:], dtype=np.float32)
         
         return input_ids, labels, loss_mask
 
@@ -148,7 +163,7 @@ def train_epoch(
     dataset,
     epoch: int,
     args,
-    tokenizer
+    skip_steps: int = 0
 ):
     """Train for one epoch"""
     print(f"\n{'='*80}")
@@ -160,6 +175,10 @@ def train_epoch(
     start_time = time.time()
     
     for step in range(num_batches):
+        # Skip steps if resuming
+        if step < skip_steps:
+            continue
+        
         # Get batch
         batch_start = step * args.batch_size
         batch_end = min(batch_start + args.batch_size, len(dataset))
@@ -223,9 +242,10 @@ def train_epoch(
                   f"Tokens/s: {tokens_per_sec:.0f} "
                   f"ETA: {eta_min:.1f}min")
         
-        # Save checkpoint
+        # Save checkpoint (model weights and resume state)
         if (step + 1) % args.save_interval == 0 or step == num_batches - 1:
-            save_checkpoint(model, optimizer, epoch, step, args)
+            save_checkpoint(model, optimizer, epoch, step, args, save_resume=False)
+            save_checkpoint(model, optimizer, epoch, step, args, save_resume=True)
     
     return total_loss / num_batches
 
@@ -248,6 +268,7 @@ def main():
     parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1], help="是否使用MoE架构")
     parser.add_argument("--data_path", type=str, default="../dataset/sft_mini_512.jsonl", help="SFT数据路径")
     parser.add_argument('--from_weight', default='pretrain_mlx', type=str, help="基于哪个权重训练")
+    parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1], help="是否自动检测&续训（0=否，1=是）")
     parser.add_argument("--tokenizer_path", type=str, default="../model", help="Tokenizer路径")
     args = parser.parse_args()
     
@@ -269,6 +290,16 @@ def main():
     setup_seed(42)
     os.makedirs(args.save_dir, exist_ok=True)
     
+    # Check for resume checkpoint
+    resume_state = None
+    if args.from_resume == 1:
+        moe_suffix = '_moe' if args.use_moe else ''
+        resume_path = f'{args.save_dir}/{args.save_weight}_{args.hidden_size}{moe_suffix}_resume.npz'
+        if os.path.exists(resume_path):
+            print(f"✓ Found resume checkpoint: {resume_path}")
+        else:
+            print(f"⚠ No resume checkpoint found at {resume_path}, starting from scratch")
+    
     # Create config and model
     config = MiniMindMLXConfig(
         hidden_size=args.hidden_size,
@@ -278,8 +309,13 @@ def main():
     
     model = MiniMindForCausalLM(config)
     
-    # Load pretrained checkpoint if specified
-    if args.from_weight != 'none':
+    # Load checkpoint based on priority: resume > from_weight
+    if args.from_resume == 1:
+        moe_suffix = '_moe' if args.use_moe else ''
+        resume_path = f'{args.save_dir}/{args.save_weight}_{args.hidden_size}{moe_suffix}_resume.npz'
+        if os.path.exists(resume_path):
+            resume_state = load_checkpoint(model, resume_path, load_training_state=True)
+    elif args.from_weight != 'none':
         moe_suffix = '_moe' if args.use_moe else ''
         ckp_path = f'{args.save_dir}/{args.from_weight}_{args.hidden_size}{moe_suffix}.npz'
         load_checkpoint(model, ckp_path)
@@ -310,16 +346,34 @@ def main():
     print(f"✓ Dataset loaded: {len(dataset)} samples")
     
     # Create optimizer
-    optimizer = optim.AdamW(learning_rate=args.learning_rate)
+    initial_lr = args.learning_rate
+    if resume_state and 'learning_rate' in resume_state:
+        initial_lr = resume_state['learning_rate']
+    optimizer = optim.AdamW(learning_rate=initial_lr)
+    
+    # Determine starting epoch and step
+    start_epoch = resume_state['epoch'] if resume_state else 0
+    start_step = resume_state['step'] if resume_state else 0
     
     # Training loop
     print(f"\n{'='*80}")
-    print("Starting SFT Training")
+    if resume_state:
+        print(f"Resuming SFT Training from Epoch {start_epoch + 1}, Step {start_step + 1}")
+    else:
+        print("Starting SFT Training")
     print(f"{'='*80}")
     
-    for epoch in range(args.epochs):
-        avg_loss = train_epoch(model, optimizer, dataset, epoch, args, tokenizer)
+    for epoch in range(start_epoch, args.epochs):
+        # Skip steps if resuming mid-epoch
+        if epoch == start_epoch and start_step > 0:
+            print(f"\n⚠ Skipping first {start_step} steps of epoch {epoch + 1}")
+            avg_loss = train_epoch(model, optimizer, dataset, epoch, args, skip_steps=start_step)
+        else:
+            avg_loss = train_epoch(model, optimizer, dataset, epoch, args)
         print(f"\nEpoch {epoch + 1} completed. Average loss: {avg_loss:.6f}")
+        
+        # Save resume checkpoint at end of each epoch
+        save_checkpoint(model, optimizer, epoch, 0, args, save_resume=True)
     
     print(f"\n{'='*80}")
     print("SFT Training Complete!")
