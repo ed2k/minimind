@@ -43,6 +43,7 @@ def main():
     parser.add_argument('--temperature', default=0.85, type=float, help="生成温度，控制随机性（0-1，越大越随机）")
     parser.add_argument('--top_p', default=0.85, type=float, help="nucleus采样阈值（0-1）")
     parser.add_argument('--historys', default=0, type=int, help="携带历史对话轮数（需为偶数，0表示不携带历史）")
+    parser.add_argument('--input_mode', default=0, type=int, choices=[0, 1], help="输入模式（0=自动测试，1=手动输入）")
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu', type=str, help="运行设备")
     args = parser.parse_args()
     
@@ -59,7 +60,10 @@ def main():
     
     conversation = []
     model, tokenizer = init_model(args)
-    input_mode = int(input('[0] 自动测试\n[1] 手动输入\n'))
+    
+    # Determine input mode
+    input_mode = args.input_mode
+    
     streamer = TextStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
     
     prompt_iter = prompts if input_mode == 0 else iter(lambda: input('👶: '), '')
