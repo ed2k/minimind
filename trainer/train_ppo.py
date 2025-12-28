@@ -123,8 +123,8 @@ def ppo_train_epoch(epoch, loader, iters, old_actor_model, ref_model, actor_sche
     for step, batch in enumerate(loader, start=start_step + 1):
         prompts = batch["prompt"]  # list[str], length B
         enc = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, 
-                       max_length=args.max_seq_len).to(args.device)  # input_ids: [B, P], attention_mask: [B, P]
-        prompt_lengths = torch.full((enc.input_ids.size(0),), enc.input_ids.shape[1], dtype=torch.long, device=enc.input_ids.device)  # [B]
+                       max_length=args.max_seq_len, padding_side="left").to(args.device)  # input_ids: [B, P], attention_mask: [B, P]
+        prompt_length = enc.input_ids.shape[1]
 
         with torch.no_grad():
             # DDP 模型需要使用 .module 访问 generate 方法
@@ -134,7 +134,7 @@ def ppo_train_epoch(epoch, loader, iters, old_actor_model, ref_model, actor_sche
                 max_new_tokens=args.max_gen_len, do_sample=True, temperature=0.8,
                 pad_token_id=tokenizer.pad_token_id, eos_token_id=tokenizer.eos_token_id)  # [B, P+R]
 
-        responses_text = [tokenizer.decode(gen_out[i, prompt_lengths[i]:], skip_special_tokens=True) for i in range(len(prompts))]
+        responses_text = [tokenizer.decode(gen_out[i, prompt_length:], skip_special_tokens=True) for i in range(len(prompts))]
         rewards = calculate_rewards(prompts, responses_text, reward_model, reward_tokenizer)  # [B]
 
         full_mask = (gen_out != tokenizer.pad_token_id).long()  # [B, P+R]
@@ -147,7 +147,7 @@ def ppo_train_epoch(epoch, loader, iters, old_actor_model, ref_model, actor_sche
         labels = gen_out[:, 1:].clone()  # [B, P+R-1]
         logp_tokens = F.log_softmax(logits[:, :-1], dim=-1).gather(2, labels.unsqueeze(-1)).squeeze(-1)  # [B, P+R-1]
         seq_len = gen_out.size(1) - 1
-        resp_mask = torch.arange(seq_len, device=gen_out.device).unsqueeze(0) >= prompt_lengths.unsqueeze(1)
+        resp_mask = torch.arange(seq_len, device=gen_out.device).unsqueeze(0) >= prompt_length - 1
         final_mask = resp_mask & (~labels.eq(tokenizer.pad_token_id))  # [B, P+R-1]
         actor_logp = (logp_tokens * final_mask).sum(dim=1)  # [B]
 
@@ -179,7 +179,6 @@ def ppo_train_epoch(epoch, loader, iters, old_actor_model, ref_model, actor_sche
             critic_scheduler.step()
             actor_optimizer.zero_grad()
             critic_optimizer.zero_grad()
-            torch.cuda.empty_cache()
 
         if is_main_process():
             response_ids = gen_out[:, enc.input_ids.shape[1]:]
@@ -237,7 +236,6 @@ def ppo_train_epoch(epoch, loader, iters, old_actor_model, ref_model, actor_sche
         del enc, gen_out, responses_text, rewards, full_mask, values_seq, values, advantages
         del logits, labels, logp_tokens, final_mask, actor_logp, old_logits, old_logp, ref_logits, ref_logp
         del kl, kl_ref, ratio, surr1, surr2, policy_loss, value_loss, loss
-        torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":
@@ -250,7 +248,7 @@ if __name__ == "__main__":
     parser.add_argument("--critic_learning_rate", type=float, default=8e-8, help="Critic学习率")
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu", help="训练设备")
     parser.add_argument("--dtype", type=str, default="bfloat16", help="混合精度类型")
-    parser.add_argument("--num_workers", type=int, default=1, help="数据加载线程数")
+    parser.add_argument("--num_workers", type=int, default=8, help="数据加载线程数")
     parser.add_argument("--accumulation_steps", type=int, default=1, help="梯度累积步数")
     parser.add_argument("--grad_clip", type=float, default=1.0, help="梯度裁剪阈值")
     parser.add_argument("--log_interval", type=int, default=1, help="日志打印间隔")
@@ -300,7 +298,6 @@ if __name__ == "__main__":
     base_weight = "reason" if args.reasoning == 1 else "full_sft"
     # Actor模型
     actor_model, tokenizer = init_model(lm_config, base_weight, device=args.device)
-    tokenizer.padding_side = 'left'  # PPO需要左侧padding
     # Old Actor模型
     old_actor_model, _ = init_model(lm_config, base_weight, device=args.device)
     old_actor_model = old_actor_model.eval().requires_grad_(False)
