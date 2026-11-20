@@ -18,6 +18,8 @@ from selfchange.training.self_train_runner import (
     promote_lora_adapter,
     run_training_stage,
     stage_from_weight_for_trainer,
+    write_dpo_jsonl,
+    write_sft_jsonl,
 )
 
 
@@ -119,10 +121,12 @@ def run_offline_rft_dpo_round(
     from_weight: str = "warmstart_rung3",
     round_idx: int = 1,
     dry_run: bool = False,
+    from_weight_path: Path | None = None,
 ) -> dict:
     """Curate offline RFT + DPO datasets from collected rollouts and run Stage 1.5 training."""
     work_dir = Path(work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
+    moe_suffix = "_moe" if profile.use_moe else ""
 
     rft_samples = curate_rft_samples(trajectories, max_rep=0.15, max_per_family=50)
     mixed_rft = mix_with_anchor(rft_samples, anchor_samples, anchor_ratio=0.25)
@@ -130,13 +134,14 @@ def run_offline_rft_dpo_round(
 
     rft_path = work_dir / f"rft_round_{round_idx}.jsonl"
     dpo_path = work_dir / f"dpo_round_{round_idx}.jsonl"
-    atomic_write_text(rft_path, "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in mixed_rft))
-    atomic_write_text(dpo_path, "".join(json.dumps(p, ensure_ascii=False) + "\n" for p in dpo_pairs))
+    rft_written = write_sft_jsonl(rft_path, mixed_rft)
+    dpo_written = write_dpo_jsonl(dpo_path, dpo_pairs)
 
     rft_res = None
     dpo_res = None
     curr_weight = from_weight
-    if mixed_rft:
+    curr_weight_path: Path | None = Path(from_weight_path) if from_weight_path and Path(from_weight_path).is_file() else None
+    if rft_written > 0:
         rft_save = f"offline_rft_r{round_idx}"
         rft_res = run_training_stage(
             stage="lora",
@@ -148,12 +153,18 @@ def run_offline_rft_dpo_round(
             from_weight=curr_weight,
             save_weight=rft_save,
             dry_run=dry_run,
+            from_weight_path=curr_weight_path,
         )
         if rft_res.ok:
             if not dry_run and rft_res.output_weight_path:
-                base_pth = stage_from_weight_for_trainer(curr_weight, repo_root, workspace_dir, profile)
+                base_pth = stage_from_weight_for_trainer(
+                    curr_weight,
+                    repo_root,
+                    workspace_dir,
+                    profile,
+                    from_weight_path=curr_weight_path,
+                )
                 if base_pth is not None:
-                    moe_suffix = "_moe" if profile.use_moe else ""
                     merged_name = f"offline_rft_r{round_idx}_merged"
                     merged_path = (
                         workspace_dir
@@ -170,12 +181,16 @@ def run_offline_rft_dpo_round(
                         use_moe=profile.use_moe,
                     )
                     curr_weight = merged_name
+                    curr_weight_path = merged_path
                 else:
                     curr_weight = rft_save
+                    curr_weight_path = Path(rft_res.output_weight_path)
             else:
                 curr_weight = rft_save
+                if rft_res.output_weight_path:
+                    curr_weight_path = Path(rft_res.output_weight_path)
 
-    if dpo_pairs:
+    if dpo_written > 0:
         dpo_save = f"offline_dpo_r{round_idx}"
         dpo_res = run_training_stage(
             stage="dpo",
@@ -187,21 +202,62 @@ def run_offline_rft_dpo_round(
             from_weight=curr_weight,
             save_weight=dpo_save,
             dry_run=dry_run,
+            from_weight_path=curr_weight_path,
         )
         if dpo_res.ok:
             curr_weight = dpo_save
+            if dpo_res.output_weight_path:
+                curr_weight_path = Path(dpo_res.output_weight_path)
+
+    if curr_weight_path is None:
+        cand_guess = Path(workspace_dir) / "models" / "candidates" / f"{curr_weight}_{profile.hidden_size}{moe_suffix}.pth"
+        if cand_guess.is_file():
+            curr_weight_path = cand_guess
 
     return {
         "round": round_idx,
         "rft_count": len(rft_samples),
-        "mixed_rft_count": len(mixed_rft),
-        "dpo_pairs_count": len(dpo_pairs),
+        "mixed_rft_count": rft_written,
+        "dpo_pairs_count": dpo_written,
         "rft_path": str(rft_path),
         "dpo_path": str(dpo_path),
         "rft_ok": rft_res.ok if rft_res else False,
+        "rft_exit_code": rft_res.exit_code if rft_res else None,
+        "rft_log_tail": rft_res.log_tail if rft_res else None,
         "dpo_ok": dpo_res.ok if dpo_res else False,
+        "dpo_exit_code": dpo_res.exit_code if dpo_res else None,
+        "dpo_log_tail": dpo_res.log_tail if dpo_res else None,
         "final_weight_name": curr_weight,
+        "final_weight_path": str(curr_weight_path) if curr_weight_path else None,
     }
+
+
+def _resolve_offline_rft_model(
+    requested_path: Path | None,
+    repo_root: Path,
+    workspace_dir: Path,
+    profile: ComputeProfile,
+) -> Path:
+    repo_root = Path(repo_root).resolve()
+    workspace_dir = Path(workspace_dir).resolve()
+    moe_suffix = "_moe" if profile.use_moe else ""
+    if requested_path is not None and str(requested_path) != "auto":
+        cand = requested_path if requested_path.is_absolute() else (repo_root / requested_path)
+        if cand.is_file():
+            return cand
+
+    fallbacks = [
+        workspace_dir / "models" / "candidates" / f"warmstart_rung3_{profile.hidden_size}{moe_suffix}.pth",
+        workspace_dir / "models" / "candidates" / f"warmstart_rung2_{profile.hidden_size}{moe_suffix}.pth",
+        workspace_dir / "models" / "candidates" / f"warmstart_rung1_{profile.hidden_size}{moe_suffix}.pth",
+        workspace_dir / "models" / "base" / f"minimind3_{profile.hidden_size}{moe_suffix}.pth",
+        repo_root / "out" / f"full_sft_{profile.hidden_size}{moe_suffix}.pth",
+    ]
+    for path in fallbacks:
+        if path.is_file():
+            return path
+    searched = [str(p) for p in fallbacks]
+    raise FileNotFoundError(f"No MiniMind checkpoint found for offline RFT/DPO (requested={requested_path}, searched={searched})")
 
 
 def _make_minimind_rollout_factory(model_path: Path, tokenizer_path: Path, profile: ComputeProfile):
@@ -239,6 +295,7 @@ def main() -> int:
     parser.add_argument("--backend", choices=["scripted", "minimind"], default="scripted")
     parser.add_argument("--model-path", type=Path, default=None)
     parser.add_argument("--tokenizer-path", type=Path, default=Path("model"))
+    parser.add_argument("--anchor-jsonl", type=Path, default=None)
     parser.add_argument("--from-weight", type=str, default="warmstart_rung3")
     parser.add_argument("--rounds", type=int, default=1)
     parser.add_argument("--num-tasks", type=int, default=16)
@@ -248,14 +305,23 @@ def main() -> int:
     args = parser.parse_args()
 
     profile = get_profile(args.profile)
+    anchors: list[dict] = []
+    if args.anchor_jsonl is not None and args.anchor_jsonl.is_file():
+        anchors = [json.loads(ln) for ln in args.anchor_jsonl.read_text(encoding="utf-8").splitlines() if ln.strip()]
+
     factory = None
+    curr = args.from_weight
+    curr_path: Path | None = None
     if args.backend == "minimind":
-        if args.model_path is None:
-            raise ValueError("--model-path is required when --backend minimind")
-        factory = _make_minimind_rollout_factory(args.model_path, args.tokenizer_path, profile)
+        resolved_model = _resolve_offline_rft_model(args.model_path, args.repo_root, args.workspace_dir, profile)
+        curr_path = resolved_model
+        factory = _make_minimind_rollout_factory(resolved_model, args.tokenizer_path, profile)
+        if stage_from_weight_for_trainer(curr, args.repo_root, args.workspace_dir, profile) is None:
+            moe_suffix = "_moe" if profile.use_moe else ""
+            suffix = f"_{profile.hidden_size}{moe_suffix}"
+            curr = resolved_model.stem[: -len(suffix)] if resolved_model.stem.endswith(suffix) else "full_sft"
 
     outputs: list[dict] = []
-    curr = args.from_weight
     for r in range(1, args.rounds + 1):
         trajs = collect_offline_rollouts(
             args.worktree,
@@ -269,13 +335,15 @@ def main() -> int:
             repo_root=args.repo_root,
             workspace_dir=args.workspace_dir,
             work_dir=args.work_dir,
-            anchor_samples=[],
+            anchor_samples=anchors,
             profile=profile,
             from_weight=curr,
             round_idx=r,
             dry_run=args.dry_run,
+            from_weight_path=curr_path,
         )
         curr = res["final_weight_name"]
+        curr_path = Path(res["final_weight_path"]) if res.get("final_weight_path") else None
         outputs.append(res)
     print(json.dumps({"rounds": outputs}, indent=2))
     return 0

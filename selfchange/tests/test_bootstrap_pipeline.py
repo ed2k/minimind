@@ -13,8 +13,14 @@ from selfchange.bootstrap.offline_rft_dpo import collect_offline_rollouts, run_o
 from selfchange.bootstrap.setup_base import build_anchor_split, setup_micro_model
 from selfchange.bootstrap.warmstart_sft import run_warmstart_curriculum
 from selfchange.kernel.budgets import get_profile
-from selfchange.training.model_loader import normalize_messages_for_template
-from selfchange.training.self_train_runner import stage_from_weight_for_trainer
+from selfchange.training.model_loader import normalize_messages_for_template, restore_open_thinking_prefix
+from selfchange.training.self_train_runner import (
+    format_dpo_record,
+    format_sft_record,
+    stage_from_weight_for_trainer,
+    write_dpo_jsonl,
+    write_sft_jsonl,
+)
 from selfchange.training.train_self_agent import compute_group_advantages
 
 
@@ -113,6 +119,15 @@ class TestBootstrapPipeline(unittest.TestCase):
             )
             self.assertEqual(len(warm_res["stages"]), 3)
             self.assertTrue(all(s["ok"] for s in warm_res["stages"]))
+            expected_msg_keys = {"role", "content", "reasoning_content", "tools", "tool_calls"}
+            for idx in (1, 2, 3):
+                cpath = Path(warm_res["curriculum"][f"rung{idx}"]["mixed_path"])
+                rows = [json.loads(ln) for ln in cpath.read_text(encoding="utf-8").splitlines() if ln.strip()]
+                self.assertGreater(len(rows), 0)
+                for row in rows:
+                    self.assertEqual(set(row.keys()), {"conversations"})
+                    for msg in row["conversations"]:
+                        self.assertEqual(set(msg.keys()), expected_msg_keys)
 
             trajs = collect_offline_rollouts(self.repo_root, num_tasks=6, num_rollouts=4)
             rft_dpo_res = run_offline_rft_dpo_round(
@@ -130,6 +145,12 @@ class TestBootstrapPipeline(unittest.TestCase):
             self.assertTrue(Path(rft_dpo_res["dpo_path"]).is_file())
             self.assertTrue(rft_dpo_res["rft_ok"])
             self.assertTrue(rft_dpo_res["dpo_ok"])
+            for rrow in [json.loads(ln) for ln in Path(rft_dpo_res["rft_path"]).read_text(encoding="utf-8").splitlines() if ln.strip()]:
+                self.assertEqual(set(rrow.keys()), {"conversations"})
+            for drow in [json.loads(ln) for ln in Path(rft_dpo_res["dpo_path"]).read_text(encoding="utf-8").splitlines() if ln.strip()]:
+                self.assertEqual(set(drow.keys()), {"chosen", "rejected"})
+                self.assertTrue(all(set(m.keys()) == {"role", "content"} for m in drow["chosen"]))
+                self.assertTrue(all(set(m.keys()) == {"role", "content"} for m in drow["rejected"]))
 
             adv_varied, zero_v = compute_group_advantages([1.0, -1.0, 2.0, 0.0], 2)
             self.assertEqual(zero_v, 0)
@@ -152,8 +173,10 @@ class TestBootstrapPipeline(unittest.TestCase):
         joined_src = "\n".join("".join(c.get("source", [])) for c in nb["cells"])
         self.assertIn("-b mychanges", joined_src)
         self.assertIn("--backend minimind", joined_src)
+        self.assertIn("--require-model", joined_src)
+        self.assertIn("--eval-with-model", joined_src)
 
-    def test_stage_weight_and_normalize_messages(self) -> None:
+    def test_stage_weight_and_normalize_messages_and_strict_formatters(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             repo = tmp_path / "repo"
@@ -167,6 +190,12 @@ class TestBootstrapPipeline(unittest.TestCase):
             self.assertIsNotNone(staged)
             self.assertTrue((repo / "out" / f"warmstart_rung3_{profile.hidden_size}.pth").is_file())
 
+            custom_w = tmp_path / "custom.pth"
+            custom_w.write_bytes(b"custom-ckpt")
+            staged_custom = stage_from_weight_for_trainer("custom_base", repo, ws, profile, from_weight_path=custom_w)
+            self.assertIsNotNone(staged_custom)
+            self.assertEqual((repo / "out" / f"custom_base_{profile.hidden_size}.pth").read_bytes(), b"custom-ckpt")
+
             raw_msgs = [
                 {"role": "system", "content": "Sys", "tools": json.dumps([{"type": "function", "function": {"name": "foo"}}]), "tool_calls": None},
                 {"role": "assistant", "content": "", "tool_calls": json.dumps([{"name": "foo", "arguments": {}}]), "reasoning_content": None},
@@ -177,6 +206,16 @@ class TestBootstrapPipeline(unittest.TestCase):
             self.assertNotIn("tools", norm[0])
             self.assertIsInstance(norm[1]["tool_calls"], list)
             self.assertNotIn("reasoning_content", norm[1])
+
+            sft_rec = format_sft_record({"conversations": raw_msgs, "task_family": "drop_me", "score": 2.0})
+            self.assertEqual(set(sft_rec.keys()), {"conversations"})
+            self.assertEqual(set(sft_rec["conversations"][0].keys()), {"role", "content", "reasoning_content", "tools", "tool_calls"})
+            self.assertEqual(write_sft_jsonl(tmp_path / "sft.jsonl", [{"messages": raw_msgs, "score": 1.0}]), 1)
+            self.assertEqual(write_dpo_jsonl(tmp_path / "dpo.jsonl", [{"chosen": raw_msgs, "rejected": raw_msgs, "task_id": "x"}]), 1)
+
+            self.assertEqual(restore_open_thinking_prefix("check</think>\nok", True), "<think>\ncheck</think>\nok")
+            self.assertEqual(restore_open_thinking_prefix("<think>\ncheck</think>", True), "<think>\ncheck</think>")
+            self.assertEqual(restore_open_thinking_prefix("plain reply", False), "plain reply")
 
 
 if __name__ == "__main__":

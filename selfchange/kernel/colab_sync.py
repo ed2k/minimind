@@ -16,6 +16,16 @@ _STATE_FILES = (
     "trajectories.jsonl",
 )
 
+_DIAGNOSTIC_FILES = (
+    "report.md",
+    "session_info.json",
+    "baseline_untouched.json",
+    "baseline_prepared.json",
+    "logs/train.log",
+    "logs/train_history.jsonl",
+    "logs/fatal_report.json",
+)
+
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -64,7 +74,7 @@ class ColabDriveSync:
         files_sha: dict[str, str] = {}
         weight_rel_map: dict[str, str] = {}
 
-        for fname in _STATE_FILES:
+        for fname in (*_STATE_FILES, *_DIAGNOSTIC_FILES):
             src = self.local_workspace / fname
             if src.is_file():
                 dst = self.drive_mirror_dir / fname
@@ -148,7 +158,7 @@ class ColabDriveSync:
 
         self.local_workspace.mkdir(parents=True, exist_ok=True)
         restored_files: list[str] = []
-        for fname in _STATE_FILES:
+        for fname in (*_STATE_FILES, *_DIAGNOSTIC_FILES):
             if fname in expected_files:
                 src = self.drive_mirror_dir / fname
                 dst = self.local_workspace / fname

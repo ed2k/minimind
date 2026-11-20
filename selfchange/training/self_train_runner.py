@@ -51,13 +51,82 @@ def _extract_last_loss(log_text: str) -> float | None:
         return None
 
 
+def format_sft_record(row: dict) -> dict:
+    """Normalize a trace or sample strictly into dataset/lm_dataset.py SFTDataset Features schema."""
+    raw_convs = row.get("conversations") or row.get("messages") or []
+    normalized: list[dict] = []
+    for raw_msg in raw_convs:
+        if not isinstance(raw_msg, dict):
+            continue
+        raw_rc = raw_msg.get("reasoning_content")
+        raw_tools = raw_msg.get("tools")
+        raw_tcalls = raw_msg.get("tool_calls")
+        normalized.append(
+            {
+                "role": str(raw_msg.get("role", "user")),
+                "content": str(raw_msg.get("content") or ""),
+                "reasoning_content": None if raw_rc is None else str(raw_rc),
+                "tools": (
+                    None
+                    if raw_tools is None
+                    else (raw_tools if isinstance(raw_tools, str) else json.dumps(raw_tools, ensure_ascii=False))
+                ),
+                "tool_calls": (
+                    None
+                    if raw_tcalls is None
+                    else (raw_tcalls if isinstance(raw_tcalls, str) else json.dumps(raw_tcalls, ensure_ascii=False))
+                ),
+            }
+        )
+    return {"conversations": normalized}
+
+
+def format_dpo_record(row: dict) -> dict:
+    """Normalize a preference pair strictly into dataset/lm_dataset.py DPODataset schema."""
+    def _norm_side(msgs: list) -> list[dict]:
+        out: list[dict] = []
+        for raw_msg in msgs or []:
+            if not isinstance(raw_msg, dict):
+                continue
+            out.append({"role": str(raw_msg.get("role", "user")), "content": str(raw_msg.get("content") or "")})
+        return out
+
+    return {
+        "chosen": _norm_side(row.get("chosen") or []),
+        "rejected": _norm_side(row.get("rejected") or []),
+    }
+
+
+def write_sft_jsonl(path: Path, rows: list[dict]) -> int:
+    """Atomically write strictly formatted SFTDataset JSONL rows, returning count written."""
+    formatted: list[str] = []
+    for row in rows:
+        rec = format_sft_record(row)
+        if rec["conversations"]:
+            formatted.append(json.dumps(rec, ensure_ascii=False) + "\n")
+    atomic_write_text(Path(path), "".join(formatted))
+    return len(formatted)
+
+
+def write_dpo_jsonl(path: Path, rows: list[dict]) -> int:
+    """Atomically write strictly formatted DPODataset JSONL rows, returning count written."""
+    formatted: list[str] = []
+    for row in rows:
+        rec = format_dpo_record(row)
+        if rec["chosen"] and rec["rejected"]:
+            formatted.append(json.dumps(rec, ensure_ascii=False) + "\n")
+    atomic_write_text(Path(path), "".join(formatted))
+    return len(formatted)
+
+
 def stage_from_weight_for_trainer(
     from_weight: str,
     repo_root: Path,
     workspace_dir: Path,
     profile: ComputeProfile,
+    from_weight_path: Path | None = None,
 ) -> Path | None:
-    """Locate from_weight across workspace/out and stage into repo_root/out for trainer/*.py."""
+    """Locate from_weight across explicit path/workspace/out and stage into repo_root/out for trainer/*.py."""
     if not from_weight or from_weight == "none":
         return None
     repo_root = Path(repo_root).resolve()
@@ -65,11 +134,16 @@ def stage_from_weight_for_trainer(
     moe_suffix = "_moe" if profile.use_moe else ""
     filename = f"{from_weight}_{profile.hidden_size}{moe_suffix}.pth"
 
-    search_candidates = [
-        repo_root / "out" / filename,
-        workspace_dir / "models" / "candidates" / filename,
-        workspace_dir / "models" / "base" / filename,
-    ]
+    search_candidates: list[Path] = []
+    if from_weight_path is not None:
+        search_candidates.append(Path(from_weight_path))
+    search_candidates.extend(
+        [
+            repo_root / "out" / filename,
+            workspace_dir / "models" / "candidates" / filename,
+            workspace_dir / "models" / "base" / filename,
+        ]
+    )
     if from_weight == "full_sft":
         search_candidates.append(workspace_dir / "models" / "base" / f"minimind3_{profile.hidden_size}{moe_suffix}.pth")
 
@@ -214,6 +288,7 @@ def run_training_stage(
     save_weight: str = "cand",
     from_resume: bool = False,
     dry_run: bool = False,
+    from_weight_path: Path | None = None,
 ) -> TrainingRunResult:
     """Execute one bounded training stage or dry-run validation inside workspace budgets."""
     t0 = time.monotonic()
@@ -265,7 +340,7 @@ def run_training_stage(
             dry_run=True,
         )
 
-    stage_from_weight_for_trainer(from_weight, repo_root, workspace_dir, profile)
+    stage_from_weight_for_trainer(from_weight, repo_root, workspace_dir, profile, from_weight_path=from_weight_path)
 
     cwd = repo_root / "trainer" if stage in ("pretrain", "full_sft", "lora", "dpo") else repo_root
     trainer_env = os.environ.copy()

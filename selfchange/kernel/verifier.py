@@ -208,6 +208,7 @@ class Verifier:
         self,
         worktree_dir: Path,
         extra_eval_fn: Callable[[Path], float] | None = None,
+        min_extra_score: float = 0.7,
     ) -> GateResult:
         """Verify tool-call parsing, experience curation, recipe bounds, and optional LLM eval."""
         worktree_dir = Path(worktree_dir).resolve()
@@ -228,12 +229,13 @@ class Verifier:
         base_score = (probe["parse_score"] + float(probe["curator_ok"]) + float(probe["bounds_ok"])) / 3.0
         extra_score = float(extra_eval_fn(worktree_dir)) if extra_eval_fn is not None else 1.0
         eval_score = round(0.5 * base_score + 0.5 * extra_score, 4) if extra_eval_fn is not None else round(base_score, 4)
-        passed = probe["parse_score"] >= 0.95 and probe["curator_ok"] and probe["bounds_ok"] and extra_score >= 0.7
+        extra_ok = True if extra_eval_fn is None else (extra_score >= min_extra_score)
+        passed = probe["parse_score"] >= 0.95 and probe["curator_ok"] and probe["bounds_ok"] and extra_ok
         return GateResult(
             gate="gate3_regression",
             passed=passed,
             score=eval_score,
-            details={**probe, "extra_score": extra_score},
+            details={**probe, "extra_score": extra_score, "min_extra_score": min_extra_score},
         )
 
     def run_gate4_canary_and_score(
@@ -272,6 +274,7 @@ class Verifier:
         check_git: bool = True,
         seeds: list[int] | None = None,
         extra_eval_fn: Callable[[Path], float] | None = None,
+        min_extra_score: float = 0.7,
     ) -> VerificationReport:
         """Run immutable Gates 1-4 in order, short-circuiting immediately if Gate 1 fails."""
         t0 = time.monotonic()
@@ -294,7 +297,7 @@ class Verifier:
         gate2, drill_report = self.run_gate2_fault_drills(worktree_dir, seeds=seeds)
         gates["gate2"] = gate2
 
-        gate3 = self.run_gate3_regression(worktree_dir, extra_eval_fn=extra_eval_fn)
+        gate3 = self.run_gate3_regression(worktree_dir, extra_eval_fn=extra_eval_fn, min_extra_score=min_extra_score)
         gates["gate3"] = gate3
 
         elapsed = time.monotonic() - t0

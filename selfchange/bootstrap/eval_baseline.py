@@ -4,19 +4,50 @@ import argparse
 import json
 import math
 import random
+import sys
 import tempfile
 import time
 from pathlib import Path
 
 from selfchange.bootstrap.generate_traces import _CLEAN_FIXTURES, inject_ast_bug
-from selfchange.kernel.budgets import get_profile
+from selfchange.kernel.budgets import ComputeProfile, get_profile
 from selfchange.kernel.fault_drills import run_drill_suite
 from selfchange.kernel.integrity import atomic_write_text
-from selfchange.kernel.sandbox import scan_python_source
+from selfchange.kernel.sandbox import run_sandboxed, scan_python_source
 from selfchange.kernel.tool_runtime import SELFCHANGE_TOOLS, WorktreeToolExecutor, validate_tool_call
 from selfchange.mutable.agent_loop import parse_tool_calls
 from selfchange.mutable.data_curator import compute_rep_penalty
 from selfchange.mutable.recovery_policy import classify_fault, plan_recovery_action, propose_line_fix
+
+_TOOLS_BY_NAME = {t["function"]["name"]: t for t in SELFCHANGE_TOOLS}
+
+
+def _tools_by_names(names: list[str], compact: bool = True) -> list[dict]:
+    selected: list[dict] = []
+    for name in names:
+        tool = _TOOLS_BY_NAME.get(name)
+        if not tool:
+            continue
+        fn = tool["function"]
+        if compact:
+            selected.append({"type": "function", "function": {"name": fn["name"], "parameters": fn["parameters"]}})
+        else:
+            selected.append(tool)
+    return selected
+
+
+def _extract_worktree_system_prompt(worktree_dir: Path) -> str:
+    res = run_sandboxed(
+        [sys.executable, "-c", "from selfchange.mutable.prompts import SYSTEM_PROMPT; print(SYSTEM_PROMPT)"],
+        cwd=worktree_dir,
+        timeout_sec=5.0,
+        extra_env={"PYTHONPATH": str(worktree_dir)},
+    )
+    if not res.timed_out and res.returncode == 0 and res.stdout.strip():
+        return res.stdout.strip()
+    from selfchange.mutable.prompts import SYSTEM_PROMPT
+
+    return SYSTEM_PROMPT
 
 BOOTSTRAP_READY_THRESHOLDS: dict[str, float] = {
     "max_ppl_regression_pct": 5.0,
@@ -156,54 +187,27 @@ def _scripted_code_edit_eval(num_tasks: int = 20) -> dict:
     }
 
 
-def _minimind_eval(
-    model_path: Path,
-    tokenizer_path: Path,
-    profile_name: str | None,
-    heldout_path: Path | None,
-    num_tasks: int,
+def _run_tool_and_code_probes(
+    model,
+    tokenizer,
+    num_code_tasks: int,
+    system_prefix: str | None = None,
+    sample_pass4: bool = True,
 ) -> tuple[dict, dict, dict]:
-    import torch  # type: ignore[import-not-found]
-    from selfchange.training.model_loader import (
-        generate_agent_reply,
-        load_minimind_model,
-        normalize_messages_for_template,
-    )
+    from selfchange.training.model_loader import generate_agent_reply
 
-    profile = get_profile(profile_name)
-    model, tokenizer = load_minimind_model(model_path, tokenizer_path, profile)
     eos_tok = tokenizer.eos_token or "<|im_end|>"
     pad_tok = tokenizer.pad_token or "<|endoftext|>"
 
     def _strip_special(text: str) -> str:
         return text.replace(eos_tok, "").replace(pad_tok, "").strip()
 
-    # Tier 1: held-out dialogue loss / PPL if heldout_path is provided
-    losses: list[float] = []
-    if heldout_path is not None and heldout_path.is_file():
-        samples = [json.loads(ln) for ln in heldout_path.read_text(encoding="utf-8").splitlines() if ln.strip()][:32]
-        with torch.no_grad():
-            for sample in samples:
-                norm_msgs, sample_tools = normalize_messages_for_template(sample["conversations"])
-                text = tokenizer.apply_chat_template(
-                    norm_msgs,
-                    tokenize=False,
-                    add_generation_prompt=False,
-                    tools=sample_tools or None,
-                )
-                enc = tokenizer(text, return_tensors="pt", truncation=True, max_length=profile.max_seq_len).to(profile.device)
-                out = model(enc["input_ids"], labels=enc["input_ids"])
-                if out.loss is not None and torch.isfinite(out.loss):
-                    losses.append(float(out.loss.item()))
-    mean_loss = sum(losses) / len(losses) if losses else 2.5
-    ppl = round(math.exp(min(20.0, mean_loss)), 4)
-
-    # Tier 2: real MiniMind tool-call generation on compact fault prompts
+    prefix = f"{system_prefix}\n" if system_prefix else ""
     prompts = [
-        ([{"role": "system", "content": "Diagnose OOM."}, {"role": "user", "content": "fault=oom batch_size=8"}], SELFCHANGE_TOOLS[:3]),
-        ([{"role": "system", "content": "Diagnose NaN."}, {"role": "user", "content": "fault=nan_loss lr=0.0002"}], SELFCHANGE_TOOLS[:3]),
-        ([{"role": "system", "content": "Read file."}, {"role": "user", "content": "fault=syntax_or_test_error file=oom_helper.py line=1"}], SELFCHANGE_TOOLS[:5]),
-        ([{"role": "system", "content": "Rollback."}, {"role": "user", "content": "fault=corrupt_checkpoint ancestor=anc_1"}], SELFCHANGE_TOOLS),
+        ([{"role": "system", "content": f"{prefix}Diagnose OOM."}, {"role": "user", "content": "fault=oom batch_size=8"}], _tools_by_names(["read_log_tail", "patch_config"])),
+        ([{"role": "system", "content": f"{prefix}Diagnose NaN."}, {"role": "user", "content": "fault=nan_loss lr=0.0002"}], _tools_by_names(["read_log_tail", "patch_config"])),
+        ([{"role": "system", "content": f"{prefix}Read file."}, {"role": "user", "content": "fault=syntax_or_test_error file=oom_helper.py line=1"}], _tools_by_names(["read_file_lines", "replace_line_range"])),
+        ([{"role": "system", "content": f"{prefix}Rollback."}, {"role": "user", "content": "fault=corrupt_checkpoint ancestor=anc_1"}], _tools_by_names(["get_archive_summary", "rollback_to_ancestor"])),
     ]
     json_ok = schema_ok = tag_ok = eos_ok = non_empty = 0
     reps: list[float] = []
@@ -224,9 +228,7 @@ def _minimind_eval(
             if ok:
                 schema_ok += 1
 
-    tier1 = {
-        "dialogue_ppl": ppl,
-        "python_ppl": ppl,
+    tier1_rates = {
         "eos_rate": round(eos_ok / len(prompts), 4),
         "mean_rep_penalty": round(sum(reps) / len(reps), 4),
         "empty_rate": round(1.0 - non_empty / len(prompts), 4),
@@ -239,19 +241,21 @@ def _minimind_eval(
         "copy_fidelity_rate": round(schema_ok / len(prompts), 4),
     }
 
-    # Tier 3: evaluate model edits on AST bugs (pass@1 greedy + pass@4 sampled)
+    denom = max(1, min(num_code_tasks, 8))
+    code_tools = _tools_by_names(["replace_line_range"])
     pass1 = pass4 = ast_ok = exact_ok = 0
-    for i in range(min(num_tasks, 8)):
+    for i in range(denom):
         fname, clean_src, _ = _CLEAN_FIXTURES[i % len(_CLEAN_FIXTURES)]
         broken_src, _fix = inject_ast_bug(clean_src, i % 5)
         numbered = "\n".join(f"{ln_no + 1}: {ln}" for ln_no, ln in enumerate(broken_src.splitlines()))
         msgs = [
-            {"role": "system", "content": "Fix bug with replace_line_range."},
+            {"role": "system", "content": f"{prefix}Fix bug with replace_line_range."},
             {"role": "user", "content": f"{fname}:\n{numbered}"},
         ]
-        attempts = [generate_agent_reply(model, tokenizer, msgs, [SELFCHANGE_TOOLS[5]], 96, 0.0, 1.0)]
-        for _ in range(3):
-            attempts.append(generate_agent_reply(model, tokenizer, msgs, [SELFCHANGE_TOOLS[5]], 96, 0.7, 0.9))
+        attempts = [generate_agent_reply(model, tokenizer, msgs, code_tools, 96, 0.0, 1.0)]
+        if sample_pass4:
+            for _ in range(3):
+                attempts.append(generate_agent_reply(model, tokenizer, msgs, code_tools, 96, 0.7, 0.9))
 
         solved_any = False
         valid_any = False
@@ -279,7 +283,6 @@ def _minimind_eval(
         if solved_any:
             pass4 += 1
 
-    denom = max(1, min(num_tasks, 8))
     tier3 = {
         "num_tasks": denom,
         "exact_match_rate": round(exact_ok / denom, 4),
@@ -287,7 +290,108 @@ def _minimind_eval(
         "pass_at_1": round(pass1 / denom, 4),
         "pass_at_4": round(pass4 / denom, 4),
     }
+    return tier1_rates, tier2, tier3
+
+
+def evaluate_minimind_candidate(
+    worktree_dir: Path,
+    model,
+    tokenizer,
+    profile: ComputeProfile,
+    num_code_tasks: int = 4,
+) -> dict:
+    """Run lightweight greedy MiniMind-3 probes for Verifier Gate 3 candidate scoring."""
+    _ = profile
+    sys_prompt = _extract_worktree_system_prompt(Path(worktree_dir))
+    t1_rates, tier2, tier3 = _run_tool_and_code_probes(
+        model,
+        tokenizer,
+        num_code_tasks=num_code_tasks,
+        system_prefix=sys_prompt,
+        sample_pass4=False,
+    )
+    extra_score = round(
+        0.15 * tier2["json_parse_rate"]
+        + 0.25 * tier2["schema_validity_rate"]
+        + 0.15 * tier3["ast_valid_rate"]
+        + 0.30 * tier3["pass_at_1"]
+        + 0.075 * t1_rates["eos_rate"]
+        + 0.075 * max(0.0, 1.0 - 2.0 * t1_rates["mean_rep_penalty"]),
+        4,
+    )
+    return {
+        "extra_score": extra_score,
+        "json_parse_rate": tier2["json_parse_rate"],
+        "schema_validity_rate": tier2["schema_validity_rate"],
+        "ast_valid_rate": tier3["ast_valid_rate"],
+        "pass_at_1": tier3["pass_at_1"],
+        "eos_rate": t1_rates["eos_rate"],
+        "mean_rep_penalty": t1_rates["mean_rep_penalty"],
+    }
+
+
+def _minimind_eval(
+    model_path: Path,
+    tokenizer_path: Path,
+    profile_name: str | None,
+    heldout_path: Path | None,
+    num_tasks: int,
+) -> tuple[dict, dict, dict]:
+    import torch  # type: ignore[import-not-found]
+    from selfchange.training.model_loader import load_minimind_model, normalize_messages_for_template
+
+    profile = get_profile(profile_name)
+    model, tokenizer = load_minimind_model(model_path, tokenizer_path, profile)
+
+    losses: list[float] = []
+    if heldout_path is not None and heldout_path.is_file():
+        samples = [json.loads(ln) for ln in heldout_path.read_text(encoding="utf-8").splitlines() if ln.strip()][:32]
+        with torch.no_grad():
+            for sample in samples:
+                norm_msgs, sample_tools = normalize_messages_for_template(sample["conversations"])
+                text = tokenizer.apply_chat_template(
+                    norm_msgs,
+                    tokenize=False,
+                    add_generation_prompt=False,
+                    tools=sample_tools or None,
+                )
+                enc = tokenizer(text, return_tensors="pt", truncation=True, max_length=profile.max_seq_len).to(profile.device)
+                out = model(enc["input_ids"], labels=enc["input_ids"])
+                if out.loss is not None and torch.isfinite(out.loss):
+                    losses.append(float(out.loss.item()))
+    mean_loss = sum(losses) / len(losses) if losses else 2.5
+    ppl = round(math.exp(min(20.0, mean_loss)), 4)
+
+    t1_rates, tier2, tier3 = _run_tool_and_code_probes(model, tokenizer, num_code_tasks=num_tasks, sample_pass4=True)
+    tier1 = {
+        "dialogue_ppl": ppl,
+        "python_ppl": ppl,
+        **t1_rates,
+    }
     return tier1, tier2, tier3
+
+
+def _resolve_eval_model_path(repo_root: Path, profile_name: str | None, requested: Path | None) -> Path | None:
+    if requested is not None and str(requested) != "auto":
+        return requested
+    profile = get_profile(profile_name)
+    moe_suffix = "_moe" if profile.use_moe else ""
+    hs = profile.hidden_size
+    repo_root = Path(repo_root).resolve()
+    ws = repo_root / "selfchange" / "workspace"
+    candidates = [
+        ws / "models" / "candidates" / f"offline_dpo_r1_{hs}{moe_suffix}.pth",
+        ws / "models" / "candidates" / f"offline_rft_r1_merged_{hs}{moe_suffix}.pth",
+        ws / "models" / "candidates" / f"warmstart_rung3_{hs}{moe_suffix}.pth",
+        ws / "models" / "candidates" / f"warmstart_rung2_{hs}{moe_suffix}.pth",
+        ws / "models" / "candidates" / f"warmstart_rung1_{hs}{moe_suffix}.pth",
+        ws / "models" / "base" / f"minimind3_{hs}{moe_suffix}.pth",
+        repo_root / "out" / f"full_sft_{hs}{moe_suffix}.pth",
+    ]
+    for path in candidates:
+        if path.is_file():
+            return path
+    return None
 
 
 def evaluate_baseline(
@@ -370,15 +474,23 @@ def main() -> int:
     parser.add_argument("--output", type=Path, default=None)
     args = parser.parse_args()
 
+    resolved_model = args.model_path
+    if args.backend == "minimind":
+        resolved_model = _resolve_eval_model_path(args.worktree, args.profile, args.model_path)
+        if resolved_model is None or not resolved_model.is_file():
+            raise FileNotFoundError(f"Could not find MiniMind checkpoint for evaluation (requested={args.model_path})")
+
     scorecard = evaluate_baseline(
         worktree_dir=args.worktree,
         backend=args.backend,
-        model_path=args.model_path,
+        model_path=resolved_model,
         tokenizer_path=args.tokenizer_path,
         profile_name=args.profile,
         heldout_path=args.heldout_path,
         num_code_tasks=args.num_code_tasks,
     )
+    if resolved_model is not None:
+        scorecard["evaluated_model_path"] = str(resolved_model)
     rendered = json.dumps(scorecard, indent=2)
     if args.output is not None:
         atomic_write_text(args.output, rendered + "\n")

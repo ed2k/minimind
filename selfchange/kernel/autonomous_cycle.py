@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 import subprocess
 import time
@@ -33,6 +34,9 @@ class CycleConfig:
     drill_seeds: tuple[int, ...] = (42,)
     anchor_path: Path | None = None
     allow_small_batch_train: bool = True
+    base_weight_path: Path | None = None
+    extra_eval_max_regression: float = 0.05
+    extra_eval_floor: float = 0.0
 
 
 def _default_proposer(ctx: CycleContext, _handle: WorktreeHandle, executor: WorktreeToolExecutor) -> dict:
@@ -75,6 +79,7 @@ class AutonomousCycleRunner:
         kernel_dir: Path | None = None,
         manifest_path: Path | None = None,
         cycle_config: CycleConfig | None = None,
+        extra_eval_fn: Callable[..., float] | None = None,
     ):
         self.repo_root = Path(repo_root).resolve()
         self.workspace_dir = Path(workspace_dir).resolve()
@@ -87,10 +92,46 @@ class AutonomousCycleRunner:
             else self.kernel_dir / KERNEL_MANIFEST_FILENAME
         )
         self.cycle_config = cycle_config if cycle_config is not None else CycleConfig()
+        self.extra_eval_fn = extra_eval_fn
         self.worktree_mgr = WorktreeManager(self.repo_root, self.workspace_dir / "worktrees")
         self.verifier = Verifier(kernel_dir=self.kernel_dir, manifest_path=self.manifest_path, profile=self.profile)
         self.registry = LineageRegistry(self.workspace_dir)
         self.trajectories_path = self.workspace_dir / "trajectories.jsonl"
+        self.train_history_path = self.workspace_dir / "logs" / "train_history.jsonl"
+        self._best_extra_score: float | None = None
+
+    def _invoke_extra_eval(self, worktree_dir: Path, weight_path: Path | None) -> float:
+        assert self.extra_eval_fn is not None
+        sig = inspect.signature(self.extra_eval_fn)
+        params = sig.parameters.values()
+        positional = [
+            p for p in params if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        ]
+        accepts_two = any(p.kind == inspect.Parameter.VAR_POSITIONAL for p in params) or len(positional) >= 2
+        if accepts_two:
+            return float(self.extra_eval_fn(worktree_dir, weight_path))
+        return float(self.extra_eval_fn(worktree_dir))
+
+    def _compute_min_extra_score(self) -> float:
+        if self._best_extra_score is not None:
+            return round(
+                max(
+                    self.cycle_config.extra_eval_floor,
+                    self._best_extra_score - self.cycle_config.extra_eval_max_regression,
+                ),
+                4,
+            )
+        champ = self.registry.get_champion()
+        if champ is not None and champ.eval_score < 0.9999:
+            champ_extra = max(0.0, 2.0 * float(champ.eval_score) - 1.0)
+            return round(
+                max(
+                    self.cycle_config.extra_eval_floor,
+                    champ_extra - self.cycle_config.extra_eval_max_regression,
+                ),
+                4,
+            )
+        return float(self.cycle_config.extra_eval_floor)
 
     def _resolve_base_ref(self, parent: LineageNode | None) -> str:
         if parent and parent.commit_sha and parent.commit_sha != "HEAD":
@@ -109,10 +150,36 @@ class AutonomousCycleRunner:
         with self.trajectories_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
+    def _append_train_history(self, record: dict) -> None:
+        self.train_history_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.train_history_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def _resolve_training_from_weight(self, ctx: CycleContext) -> tuple[str, Path | None]:
+        cand: Path | None = None
+        if ctx.parent and ctx.parent.weight_path and Path(ctx.parent.weight_path).is_file():
+            cand = Path(ctx.parent.weight_path)
+        elif self.cycle_config.base_weight_path is not None and Path(self.cycle_config.base_weight_path).is_file():
+            cand = Path(self.cycle_config.base_weight_path)
+        if cand is None:
+            return "full_sft", None
+        moe_suffix = "_moe" if self.profile.use_moe else ""
+        suffix = f"_{self.profile.hidden_size}{moe_suffix}"
+        stem = cand.stem
+        if stem.endswith(suffix) and len(stem) > len(suffix):
+            return stem[: -len(suffix)], cand
+        return "full_sft", cand
+
     def _run_periodic_training(self, ctx: CycleContext, worktree_dir: Path) -> str | None:
         from selfchange.mutable.data_curator import build_dpo_pairs, curate_rft_samples, mix_with_anchor
         from selfchange.mutable.train_recipe import select_training_stage
-        from selfchange.training.self_train_runner import run_training_stage
+        from selfchange.training.self_train_runner import (
+            promote_lora_adapter,
+            run_training_stage,
+            stage_from_weight_for_trainer,
+            write_dpo_jsonl,
+            write_sft_jsonl,
+        )
 
         if not self.trajectories_path.is_file():
             return None
@@ -135,6 +202,17 @@ class AutonomousCycleRunner:
             elif rft:
                 stage = "lora"
         if stage == "none":
+            self._append_train_history(
+                {
+                    "timestamp": _utc_now(),
+                    "cycle_index": ctx.cycle_index,
+                    "stage": "none",
+                    "rft_count": len(rft),
+                    "dpo_count": len(dpo),
+                    "ok": False,
+                    "skipped_reason": "no_training_stage",
+                }
+            )
             return None
 
         anchors = []
@@ -145,12 +223,13 @@ class AutonomousCycleRunner:
         data_dir.mkdir(parents=True, exist_ok=True)
         if stage == "dpo":
             data_file = data_dir / f"dpo_c{ctx.cycle_index:04d}.jsonl"
-            data_file.write_text("".join(json.dumps(x, ensure_ascii=False) + "\n" for x in dpo), encoding="utf-8")
+            write_dpo_jsonl(data_file, dpo)
         else:
             mixed = mix_with_anchor(rft, anchors, anchor_ratio=recipe["training"].get("anchor_replay_ratio", 0.25))
             data_file = data_dir / f"rft_c{ctx.cycle_index:04d}.jsonl"
-            data_file.write_text("".join(json.dumps(x, ensure_ascii=False) + "\n" for x in mixed), encoding="utf-8")
+            write_sft_jsonl(data_file, mixed)
 
+        from_weight, from_weight_path = self._resolve_training_from_weight(ctx)
         res = run_training_stage(
             stage=stage,
             repo_root=self.repo_root,
@@ -158,13 +237,70 @@ class AutonomousCycleRunner:
             data_path=data_file,
             profile=self.profile,
             training_cfg=recipe["training"],
-            from_weight="full_sft",
+            from_weight=from_weight,
             save_weight=f"cand_c{ctx.cycle_index:04d}",
             dry_run=self.cycle_config.dry_run_training,
+            from_weight_path=from_weight_path,
         )
-        if res.ok and res.output_weight_path:
-            return res.output_weight_path
-        return None
+
+        final_weight_path: str | None = res.output_weight_path if res.ok else None
+        merge_error: str | None = None
+        if stage == "lora" and res.ok and res.output_weight_path and not self.cycle_config.dry_run_training:
+            try:
+                base_pth = stage_from_weight_for_trainer(
+                    from_weight,
+                    self.repo_root,
+                    self.workspace_dir,
+                    self.profile,
+                    from_weight_path=from_weight_path,
+                )
+                if base_pth is None:
+                    raise FileNotFoundError(f"Base weight {from_weight!r} not found for LoRA merge")
+                moe_suffix = "_moe" if self.profile.use_moe else ""
+                merged_path = (
+                    self.workspace_dir
+                    / "models"
+                    / "candidates"
+                    / f"cand_c{ctx.cycle_index:04d}_merged_{self.profile.hidden_size}{moe_suffix}.pth"
+                )
+                lora_rank = int(recipe["training"].get("lora_rank", 16))
+                promote_lora_adapter(
+                    base_weight=base_pth,
+                    lora_weight=Path(res.output_weight_path),
+                    merged_out=merged_path,
+                    hidden_size=self.profile.hidden_size,
+                    num_hidden_layers=self.profile.num_hidden_layers,
+                    use_moe=self.profile.use_moe,
+                    lora_rank=lora_rank,
+                )
+                final_weight_path = str(merged_path)
+            except Exception as exc:
+                merge_error = repr(exc)
+                final_weight_path = None
+
+        self._append_train_history(
+            {
+                "timestamp": _utc_now(),
+                "cycle_index": ctx.cycle_index,
+                "stage": stage,
+                "from_weight": from_weight,
+                "from_weight_path": str(from_weight_path) if from_weight_path else None,
+                "rft_count": len(rft),
+                "dpo_count": len(dpo),
+                "data_file": str(data_file),
+                "ok": res.ok,
+                "exit_code": res.exit_code,
+                "final_loss": res.final_loss,
+                "duration_sec": res.duration_sec,
+                "oom_detected": res.oom_detected,
+                "nan_detected": res.nan_detected,
+                "timed_out": res.timed_out,
+                "output_weight_path": final_weight_path,
+                "merge_error": merge_error,
+                "log_tail": res.log_tail,
+            }
+        )
+        return final_weight_path
 
     def __call__(self, ctx: CycleContext) -> CycleOutcome:
         cand_id = f"cand_c{ctx.cycle_index:04d}_{int(time.monotonic() * 1000) % 100000}"
@@ -190,12 +326,26 @@ class AutonomousCycleRunner:
             )
 
             ep_meta = self.proposer_fn(ctx, handle, executor) or {}
+            parent_weight_path = (
+                Path(ctx.parent.weight_path)
+                if (ctx.parent and ctx.parent.weight_path and Path(ctx.parent.weight_path).is_file())
+                else self.cycle_config.base_weight_path
+            )
+            verify_extra_fn = (
+                (lambda wt: self._invoke_extra_eval(wt, parent_weight_path))
+                if self.extra_eval_fn is not None
+                else None
+            )
+            min_extra = self._compute_min_extra_score() if self.extra_eval_fn is not None else 0.7
             report = self.verifier.verify_candidate(
                 handle.path,
                 base_ref=handle.base_commit,
                 check_git=True,
                 seeds=list(self.cycle_config.drill_seeds),
+                extra_eval_fn=verify_extra_fn,
+                min_extra_score=min_extra,
             )
+            extra_score = report.gates["gate3"].details.get("extra_score") if "gate3" in report.gates else None
             diff_rep = check_git_diff_boundary(handle.path, base_ref=handle.base_commit)
             boundary_violated = not diff_rep.ok
             reward = compute_rlvr_reward(
@@ -221,6 +371,7 @@ class AutonomousCycleRunner:
                     "messages": ep_meta.get("messages", []),
                     "final_text": ep_meta.get("final_text", ""),
                     "total_score": report.total_score,
+                    "extra_score": extra_score,
                 }
             )
 
@@ -253,11 +404,51 @@ class AutonomousCycleRunner:
                 except (BoundaryViolationError, SandboxPolicyError) as exc:
                     return CycleOutcome(passed=False, error=str(exc))
 
-            weight_path = ctx.parent.weight_path if ctx.parent else None
+            weight_path = ctx.parent.weight_path if ctx.parent else (str(self.cycle_config.base_weight_path) if self.cycle_config.base_weight_path else None)
             if self.cycle_config.train_every_n_cycles > 0 and ctx.cycle_index % self.cycle_config.train_every_n_cycles == 0:
                 trained_w = self._run_periodic_training(ctx, handle.path)
                 if trained_w is not None:
-                    weight_path = trained_w
+                    if self.extra_eval_fn is not None and not self.cycle_config.dry_run_training:
+                        post_report = self.verifier.verify_candidate(
+                            handle.path,
+                            base_ref=handle.base_commit,
+                            check_git=True,
+                            seeds=list(self.cycle_config.drill_seeds),
+                            extra_eval_fn=lambda wt: self._invoke_extra_eval(wt, Path(trained_w)),
+                            min_extra_score=min_extra,
+                        )
+                        if post_report.passed:
+                            weight_path = trained_w
+                            report = post_report
+                            self._append_train_history(
+                                {
+                                    "timestamp": _utc_now(),
+                                    "event": "post_train_eval",
+                                    "cycle_index": ctx.cycle_index,
+                                    "accepted": True,
+                                    "weight_path": trained_w,
+                                    "eval_score": post_report.eval_score,
+                                    "total_score": post_report.total_score,
+                                }
+                            )
+                        else:
+                            self._append_train_history(
+                                {
+                                    "timestamp": _utc_now(),
+                                    "event": "post_train_eval",
+                                    "cycle_index": ctx.cycle_index,
+                                    "accepted": False,
+                                    "rejected_weight_path": trained_w,
+                                    "eval_score": post_report.eval_score,
+                                    "total_score": post_report.total_score,
+                                }
+                            )
+                    else:
+                        weight_path = trained_w
+
+            if self.extra_eval_fn is not None and "gate3" in report.gates:
+                final_extra = float(report.gates["gate3"].details.get("extra_score", 0.0))
+                self._best_extra_score = max(self._best_extra_score or 0.0, final_extra)
 
             node = LineageNode(
                 node_id=cand_id,

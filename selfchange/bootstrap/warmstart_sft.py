@@ -8,7 +8,7 @@ from selfchange.bootstrap.generate_traces import generate_traces
 from selfchange.kernel.budgets import get_profile
 from selfchange.kernel.integrity import atomic_write_text
 from selfchange.mutable.data_curator import mix_with_anchor
-from selfchange.training.self_train_runner import run_training_stage
+from selfchange.training.self_train_runner import run_training_stage, write_sft_jsonl
 
 
 def _load_jsonl(path: Path) -> list[dict]:
@@ -49,12 +49,12 @@ def prepare_curriculum_datasets(
         op_rows = _load_jsonl(raw_path)
         mixed_rows = mix_with_anchor(op_rows, anchors, anchor_ratio=anchor_ratio)
         mixed_path = work_dir / f"curriculum_rung{rung_id}.jsonl"
-        atomic_write_text(mixed_path, "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in mixed_rows))
+        written = write_sft_jsonl(mixed_path, mixed_rows)
         outputs[f"rung{rung_id}"] = {
             "raw_path": str(raw_path),
             "mixed_path": str(mixed_path),
             "op_count": len(op_rows),
-            "mixed_count": len(mixed_rows),
+            "mixed_count": written,
             **gen_stats,
         }
     return outputs
@@ -97,10 +97,19 @@ def run_warmstart_curriculum(
             save_weight=save_name,
             dry_run=dry_run,
         )
-        results.append({"rung": idx, "ok": res.ok, "output_weight_path": res.output_weight_path, "final_loss": res.final_loss})
-        current_from = save_name
+        results.append(
+            {
+                "rung": idx,
+                "ok": res.ok,
+                "exit_code": res.exit_code,
+                "output_weight_path": res.output_weight_path,
+                "final_loss": res.final_loss,
+                "log_tail": res.log_tail,
+            }
+        )
         if not res.ok:
             break
+        current_from = save_name
     return {"curriculum": curriculum, "stages": results, "final_weight_name": current_from}
 
 
@@ -129,7 +138,8 @@ def main() -> int:
         dry_run=args.dry_run,
     )
     print(json.dumps(out, indent=2))
-    return 0
+    all_ok = bool(out.get("stages")) and all(s.get("ok") for s in out["stages"])
+    return 0 if all_ok else 1
 
 
 if __name__ == "__main__":

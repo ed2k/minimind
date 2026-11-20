@@ -102,6 +102,14 @@ def normalize_messages_for_template(conversations: list[dict]) -> tuple[list[dic
     return messages, tools
 
 
+def restore_open_thinking_prefix(decoded: str, open_thinking: bool) -> str:
+    """Restore the prompt-prefilled <think> opening tag so assistant outputs remain tag-balanced."""
+    text = decoded or ""
+    if open_thinking and "<think>" not in text and ("</think>" in text or text.strip()):
+        return "<think>\n" + text
+    return text
+
+
 def generate_agent_reply(
     model,
     tokenizer,
@@ -140,4 +148,5 @@ def generate_agent_reply(
     with torch.no_grad():
         generated_ids = model.generate(**gen_kwargs)
     prompt_len = inputs["input_ids"].size(1)
-    return tokenizer.decode(generated_ids[0][prompt_len:], skip_special_tokens=False)
+    decoded = tokenizer.decode(generated_ids[0][prompt_len:], skip_special_tokens=False)
+    return restore_open_thinking_prefix(decoded, open_thinking)

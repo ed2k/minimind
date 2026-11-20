@@ -8,6 +8,7 @@ import shutil
 from pathlib import Path
 
 from selfchange.kernel.integrity import atomic_write_text
+from selfchange.training.self_train_runner import format_sft_record
 
 _DIALOGUE_QA = [
     ("解释一下梯度累积的作用。", "梯度累积通过多次前向和反向传播累加梯度后再更新参数，可在显存受限时模拟更大的 batch_size。"),
@@ -37,22 +38,26 @@ _TOOL_EXAMPLES = [
 def _make_anchor_record(idx: int, rng: random.Random) -> dict:
     if idx % 3 == 0:
         prompt, tools, call, obs, final_ans = _TOOL_EXAMPLES[idx % len(_TOOL_EXAMPLES)]
-        return {
+        return format_sft_record(
+            {
+                "conversations": [
+                    {"role": "system", "content": "You are MiniMind.", "tools": json.dumps(tools, ensure_ascii=False)},
+                    {"role": "user", "content": f"{prompt} (case {idx})"},
+                    {"role": "assistant", "content": "", "tool_calls": json.dumps([call], ensure_ascii=False)},
+                    {"role": "tool", "content": obs},
+                    {"role": "assistant", "content": final_ans},
+                ]
+            }
+        )
+    q, a = _DIALOGUE_QA[(idx + rng.randint(0, 3)) % len(_DIALOGUE_QA)]
+    return format_sft_record(
+        {
             "conversations": [
-                {"role": "system", "content": "You are MiniMind.", "tools": json.dumps(tools, ensure_ascii=False)},
-                {"role": "user", "content": f"{prompt} (case {idx})"},
-                {"role": "assistant", "content": "", "tool_calls": json.dumps([call], ensure_ascii=False)},
-                {"role": "tool", "content": obs},
-                {"role": "assistant", "content": final_ans},
+                {"role": "user", "content": f"[{idx}] {q}"},
+                {"role": "assistant", "content": a},
             ]
         }
-    q, a = _DIALOGUE_QA[(idx + rng.randint(0, 3)) % len(_DIALOGUE_QA)]
-    return {
-        "conversations": [
-            {"role": "user", "content": f"[{idx}] {q}"},
-            {"role": "assistant", "content": a},
-        ]
-    }
+    )
 
 
 def build_synthetic_anchor_datasets(
