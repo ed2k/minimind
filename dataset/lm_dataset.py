@@ -1,49 +1,61 @@
-import json
-import pandas as pd
-import numpy as np
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset
 import torch
+import json
 import os
-
+import random
+from datasets import load_dataset, Features, Sequence, Value
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+def pre_processing_chat(conversations, add_system_ratio=0.2):
+    # tool use 数据完整保留不做处理
+    if any(conv.get('tools') for conv in conversations): return conversations
+
+    SYSTEM_PROMPTS = [
+        "你是一个知识丰富的AI，尽力为用户提供准确的信息。",
+        "你是minimind，一个小巧但有用的语言模型。",
+        "你是一个专业的AI助手，请提供有价值的回答。",
+        "你是minimind，请尽力帮助用户解决问题。",
+        "你是一个可靠的AI，请给出准确的回答。",
+        "You are a helpful AI assistant.",
+        "You are minimind, a lightweight intelligent assistant.",
+        "You are a friendly chatbot. Please answer the user's questions carefully.",
+        "You are a knowledgeable AI. Try your best to provide accurate information.",
+        "You are minimind, a small but useful language model."
+    ]
+    # 概率性添加system
+    if conversations[0].get('role') != 'system':
+        if random.random() < add_system_ratio:
+            return [{'role': 'system', 'content': random.choice(SYSTEM_PROMPTS)}] + conversations
+    return conversations
+
+def post_processing_chat(prompt_content, empty_think_ratio=0.2, remove_empty_think=None):
+    # 以80%概率移除空思考标签
+    if '<think>\n\n</think>\n\n' in prompt_content:
+        if remove_empty_think is None:
+            remove_empty_think = random.random() > empty_think_ratio
+        if remove_empty_think:
+            prompt_content = prompt_content.replace('<think>\n\n</think>\n\n', '')
+    return prompt_content
 
 class PretrainDataset(Dataset):
     def __init__(self, data_path, tokenizer, max_length=512):
         super().__init__()
         self.tokenizer = tokenizer
         self.max_length = max_length
-        self.samples = self.load_data(data_path)
-
-    def load_data(self, path):
-        samples = []
-        with open(path, 'r', encoding='utf-8') as f:
-            for line_num, line in enumerate(f, 1):
-                data = json.loads(line.strip())
-                samples.append(data)
-        return samples
+        self.samples = load_dataset('json', data_files=data_path, split='train')
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, index):
         sample = self.samples[index]
-
-        # 构建输入文本
-        encoding = self.tokenizer(
-            str(sample['text']),
-            max_length=self.max_length,
-            padding='max_length',
-            truncation=True,
-            return_tensors='pt'
-        )
-        input_ids = encoding.input_ids.squeeze()
-        loss_mask = (input_ids != self.tokenizer.pad_token_id)
-
-        X = torch.tensor(input_ids[:-1], dtype=torch.long)
-        Y = torch.tensor(input_ids[1:], dtype=torch.long)
-        loss_mask = torch.tensor(loss_mask[1:], dtype=torch.long)
-        return X, Y, loss_mask
+        tokens = self.tokenizer(str(sample['text']), add_special_tokens=False, max_length=self.max_length - 2, truncation=True).input_ids
+        tokens = [self.tokenizer.bos_token_id] + tokens + [self.tokenizer.eos_token_id]
+        input_ids = tokens + [self.tokenizer.pad_token_id] * (self.max_length - len(tokens))
+        input_ids = torch.tensor(input_ids, dtype=torch.long)
+        labels = input_ids.clone()
+        labels[input_ids == self.tokenizer.pad_token_id] = -100
+        return input_ids, labels
 
 
 class SFTDataset(Dataset):
@@ -51,24 +63,24 @@ class SFTDataset(Dataset):
         super().__init__()
         self.tokenizer = tokenizer
         self.max_length = max_length
-        self.samples = self.load_data(jsonl_path)
-        self.bos_id = tokenizer(f'{tokenizer.bos_token}assistant', add_special_tokens=False).input_ids
-        self.eos_id = tokenizer(f'{tokenizer.eos_token}', add_special_tokens=False).input_ids
+        features = Features({'conversations': [{'role': Value('string'), 'content': Value('string'), 'reasoning_content': Value('string'), 'tools': Value('string'), 'tool_calls': Value('string')}]})
+        self.samples = load_dataset('json', data_files=jsonl_path, split='train', features=features)
+        self.bos_id = tokenizer(f'{tokenizer.bos_token}assistant\n', add_special_tokens=False).input_ids
+        self.eos_id = tokenizer(f'{tokenizer.eos_token}\n', add_special_tokens=False).input_ids
 
     def __len__(self):
         return len(self.samples)
 
-    def load_data(self, path):
-        samples = []
-        with open(path, 'r', encoding='utf-8') as f:
-            for line_num, line in enumerate(f, 1):
-                data = json.loads(line.strip())
-                samples.append(data)
-        return samples
-
-    def _create_chat_prompt(self, cs):
-        messages = cs.copy()
-        tools = cs[0]["functions"] if (cs and cs[0]["role"] == "system" and cs[0].get("functions")) else None
+    def create_chat_prompt(self, conversations):
+        messages = []
+        tools = None
+        for message in conversations:
+            message = dict(message)
+            if message.get("role") == "system" and message.get("tools"):
+                tools = json.loads(message["tools"]) if isinstance(message["tools"], str) else message["tools"]
+            if message.get("tool_calls") and isinstance(message["tool_calls"], str):
+                message["tool_calls"] = json.loads(message["tool_calls"])
+            messages.append(message)
         return self.tokenizer.apply_chat_template(
             messages,
             tokenize=False,
@@ -76,8 +88,8 @@ class SFTDataset(Dataset):
             tools=tools
         )
 
-    def _generate_loss_mask(self, input_ids):
-        loss_mask = [0] * len(input_ids)
+    def generate_labels(self, input_ids):
+        labels = [-100] * len(input_ids)
         i = 0
         while i < len(input_ids):
             if input_ids[i:i + len(self.bos_id)] == self.bos_id:
@@ -87,36 +99,27 @@ class SFTDataset(Dataset):
                     if input_ids[end:end + len(self.eos_id)] == self.eos_id:
                         break
                     end += 1
-                for j in range(start + 1, min(end + len(self.eos_id) + 1, self.max_length)):
-                    loss_mask[j] = 1
+                for j in range(start, min(end + len(self.eos_id), self.max_length)):
+                    labels[j] = input_ids[j]
                 i = end + len(self.eos_id) if end < len(input_ids) else len(input_ids)
             else:
                 i += 1
-        return loss_mask
+        return labels
 
     def __getitem__(self, index):
         sample = self.samples[index]
-        # 构建对话提示
-        prompt = self._create_chat_prompt(sample['conversations'])
+        conversations = pre_processing_chat(sample['conversations'])
+        prompt = self.create_chat_prompt(conversations)
+        prompt = post_processing_chat(prompt)
         input_ids = self.tokenizer(prompt).input_ids[:self.max_length]
         input_ids += [self.tokenizer.pad_token_id] * (self.max_length - len(input_ids))
-
-        # 生成动态损失掩码
-        loss_mask = self._generate_loss_mask(input_ids)
-
-        # 构建训练数据
-        X = torch.tensor(input_ids[:-1], dtype=torch.long)
-        Y = torch.tensor(input_ids[1:], dtype=torch.long)
-        loss_mask = torch.tensor(loss_mask[1:], dtype=torch.long)  # 对齐预测位置
-        # # === 打印每个token的掩码情况 ===
-        # print(f"\n--- Sample {index} Token Loss Mask (length: {len(input_ids)}) ---")
-        # for i, (token_id, mask) in enumerate(zip(input_ids, loss_mask)):
-        #     token_str = self.tokenizer.decode([token_id], skip_special_tokens=False)
-        #     token_str = token_str.replace('\n', '\\n').replace('\t', '\\t')  # 处理换行等不可见字符
-        #     print(f"Token {i:3d}: {token_id:5d} -> '{token_str:10s}' | mask: {mask}")
-        # print(f"--- End of Sample {index} ---")
-        # # ================================
-        return X, Y, loss_mask
+        labels = self.generate_labels(input_ids)
+        # # === 调试打印 ===
+        # print(f"\n--- Sample {index} ---")
+        # for i, (x, y) in enumerate(zip(input_ids[:-1], labels[1:])):
+        #     print(f"{i:3d}: X={self.tokenizer.decode([x])!r:16s} ---> Y={self.tokenizer.decode([input_ids[i+1]])!r:16s} label={y}")
+        # # ================
+        return torch.tensor(input_ids, dtype=torch.long), torch.tensor(labels, dtype=torch.long)
 
 
 class DPODataset(Dataset):
@@ -125,22 +128,17 @@ class DPODataset(Dataset):
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.padding = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
-        self.bos_id = tokenizer(f'{tokenizer.bos_token}assistant', add_special_tokens=False).input_ids
-        self.eos_id = tokenizer(f'{tokenizer.eos_token}', add_special_tokens=False).input_ids
-        with open(file_path, 'r', encoding='utf-8') as f:
-            self.data = []
-            for line in f:
-                line = line.strip()
-                obj = json.loads(line)
-                self.data.append(obj)
+        self.bos_id = tokenizer(f'{tokenizer.bos_token}assistant\n', add_special_tokens=False).input_ids
+        self.eos_id = tokenizer(f'{tokenizer.eos_token}\n', add_special_tokens=False).input_ids
+        self.samples = load_dataset('json', data_files=file_path, split='train')
 
     def __len__(self):
-        return len(self.data)
+        return len(self.samples)
 
     def __getitem__(self, index):
-        item = self.data[index]
-        chosen = item['chosen']  # 是一个 list，里面包含若干 {role, content}
-        rejected = item['rejected']  # 同上
+        sample = self.samples[index]
+        chosen = sample['chosen']  # 是一个 list，里面包含若干 {role, content}
+        rejected = sample['rejected']  # 同上
         chosen_prompt = self.tokenizer.apply_chat_template(
             chosen, tokenize=False, add_generation_prompt=False
         )
@@ -148,6 +146,9 @@ class DPODataset(Dataset):
         rejected_prompt = self.tokenizer.apply_chat_template(
             rejected, tokenize=False, add_generation_prompt=False
         )
+        remove_empty_think = random.random() > 0.2
+        chosen_prompt = post_processing_chat(chosen_prompt, remove_empty_think=remove_empty_think)
+        rejected_prompt = post_processing_chat(rejected_prompt, remove_empty_think=remove_empty_think)
         chosen_encoding = self.tokenizer(
             chosen_prompt, truncation=True, max_length=self.max_length, padding='max_length'
         )
@@ -156,10 +157,10 @@ class DPODataset(Dataset):
         )
 
         chosen_input_ids = chosen_encoding['input_ids']
-        chosen_loss_mask = self._generate_loss_mask(chosen_input_ids)
+        chosen_loss_mask = self.generate_loss_mask(chosen_input_ids)
 
         rejected_input_ids = rejected_encoding['input_ids']
-        rejected_loss_mask = self._generate_loss_mask(rejected_input_ids)
+        rejected_loss_mask = self.generate_loss_mask(rejected_input_ids)
         x_chosen = torch.tensor(chosen_input_ids[:-1], dtype=torch.long)
         y_chosen = torch.tensor(chosen_input_ids[1:], dtype=torch.long)
         mask_chosen = torch.tensor(chosen_loss_mask[1:], dtype=torch.long)
@@ -176,7 +177,7 @@ class DPODataset(Dataset):
             'mask_rejected': mask_rejected
         }
 
-    def _generate_loss_mask(self, input_ids):
+    def generate_loss_mask(self, input_ids):
         loss_mask = [0] * len(input_ids)
         i = 0
         while i < len(input_ids):
@@ -187,7 +188,7 @@ class DPODataset(Dataset):
                     if input_ids[end:end + len(self.eos_id)] == self.eos_id:
                         break
                     end += 1
-                for j in range(start + 1, min(end + len(self.eos_id) + 1, self.max_length)):
+                for j in range(start, min(end + len(self.eos_id), self.max_length)):
                     loss_mask[j] = 1
                 i = end + len(self.eos_id) if end < len(input_ids) else len(input_ids)
             else:
@@ -196,48 +197,63 @@ class DPODataset(Dataset):
 
 
 class RLAIFDataset(Dataset):
-    def __init__(self, jsonl_path, tokenizer, max_length=1024):
+    def __init__(self, jsonl_path, tokenizer, max_length=1024, thinking_ratio=0.5):
         super().__init__()
         self.tokenizer = tokenizer
         self.max_length = max_length
-        self.samples = self.load_data(jsonl_path)
+        self.thinking_ratio = thinking_ratio  # 按概率开启 thinking
+        self.samples = load_dataset('json', data_files=jsonl_path, split='train')
         self.bos_id = tokenizer(f'{tokenizer.bos_token}assistant', add_special_tokens=False).input_ids
         self.eos_id = tokenizer(f'{tokenizer.eos_token}', add_special_tokens=False).input_ids
 
     def __len__(self):
         return len(self.samples)
 
-    def load_data(self, path):
-        samples = []
-        with open(path, 'r', encoding='utf-8') as f:
-            for line_num, line in enumerate(f, 1):
-                data = json.loads(line.strip())
-                samples.append(data)
-        return samples
-
-    def _create_chat_prompt(self, conversations):
-        """构建符合ChatML格式的对话"""
-        messages = []
-        answer = ''
-        for i, turn in enumerate(conversations):
-            role = 'user' if i % 2 == 0 else 'assistant'
-            messages.append({"role": role, "content": turn['content']})
-            answer = turn['content']
+    def create_chat_prompt(self, conversations):
+        conversations = pre_processing_chat(conversations)
+        use_thinking = random.random() < self.thinking_ratio
         return self.tokenizer.apply_chat_template(
-            messages[:-1],
+            conversations[:-1],
             tokenize=False,
-            add_generation_prompt=True  # 这里需要True
-        ), answer
-
+            open_thinking=use_thinking,
+            add_generation_prompt=True
+        )
     def __getitem__(self, index):
         sample = self.samples[index]
-        # 构建对话提示
-        prompt, answer = self._create_chat_prompt(sample['conversations'])
+        prompt = self.create_chat_prompt(sample['conversations'])
 
         return {
             'prompt': prompt,
-            'answer': answer
+            'answer': ""
         }
+
+class AgentRLDataset(Dataset):
+    def __init__(self, jsonl_path, tokenizer, max_length=1024):
+        super().__init__()
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.samples = []
+        with open(jsonl_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                self.samples.append(json.loads(line.strip()))
+
+    def __len__(self):
+        return len(self.samples)
+
+    def parse_conversations(self, conversations):
+        messages = []
+        tools = None
+        for message in conversations:
+            message = dict(message)
+            if message.get("role") == "system" and message.get("tools"):
+                tools = json.loads(message["tools"]) if isinstance(message["tools"], str) else message["tools"]
+            messages.append(message)
+        return messages[:-1], tools
+
+    def __getitem__(self, index):
+        sample = self.samples[index]
+        messages, tools = self.parse_conversations(sample['conversations'])
+        return {'messages': messages, 'tools': tools, 'gt': sample['gt']}
 
 
 if __name__ == "__main__":

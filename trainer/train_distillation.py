@@ -4,6 +4,7 @@ import sys
 __package__ = "trainer"
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
+import datasets  # noqa: F401  # Windows pyarrow/torch DLL conflict workaround (issue #771)
 import argparse
 import time
 import warnings
@@ -22,6 +23,8 @@ warnings.filterwarnings('ignore')
 
 
 def distillation_loss(student_logits, teacher_logits, temperature=1.0, reduction='batchmean'):
+    if student_logits.size(0) == 0 and reduction == 'batchmean':
+        return student_logits.sum() * 0.0
     with torch.no_grad():
         teacher_probs = F.softmax(teacher_logits / temperature, dim=-1).detach()
 
@@ -42,38 +45,39 @@ def train_epoch(epoch, loader, iters, teacher_model, lm_config_student, start_st
         teacher_model.eval()
         teacher_model.requires_grad_(False)
 
-    for step, (X, Y, loss_mask) in enumerate(loader, start=start_step + 1):
-        X = X.to(args.device)
-        Y = Y.to(args.device)
-        loss_mask = loss_mask.to(args.device)
+    for step, (input_ids, labels) in enumerate(loader, start=start_step + 1):
+        input_ids = input_ids.to(args.device)
+        labels = labels.to(args.device)
+        loss_mask = (labels[..., 1:] != -100).float()
         lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
 
         # 前向传播（学生模型）
         with autocast_ctx:
-            res = model(X)
-            student_logits = res.logits
+            res = model(input_ids)
+            student_logits = res.logits[..., :-1, :].contiguous()
 
         # 教师模型前向传播（只在eval & no_grad）
         if teacher_model is not None:
             with torch.no_grad():
-                teacher_logits = teacher_model(X).logits
+                teacher_logits = teacher_model(input_ids).logits[..., :-1, :].contiguous()
                 vocab_size_student = student_logits.size(-1)
                 teacher_logits = teacher_logits[..., :vocab_size_student]
 
         # ========== 计算损失 ==========
         # 1) Ground-Truth CE Loss
+        shift_labels = labels[..., 1:].contiguous()
         loss_mask_flat = loss_mask.view(-1)
         ce_loss = F.cross_entropy(
             student_logits.view(-1, student_logits.size(-1)),
-            Y.view(-1),
-            ignore_index=0,
+            shift_labels.view(-1),
+            ignore_index=-100,
             reduction='none'
         )
-        ce_loss = torch.sum(ce_loss * loss_mask_flat) / loss_mask_flat.sum()
-        if lm_config_student.use_moe:
-            ce_loss += res.aux_loss
+        ce_loss_raw = torch.sum(ce_loss * loss_mask_flat) / (loss_mask_flat.sum() + 1e-8)
+        if lm_config_student.use_moe: ce_loss = ce_loss_raw + res.aux_loss
+        else: ce_loss = ce_loss_raw
 
         # 2) Distillation Loss
         if teacher_model is not None:
@@ -90,48 +94,50 @@ def train_epoch(epoch, loader, iters, teacher_model, lm_config_student, start_st
 
         scaler.scale(loss).backward()
 
-        if (step + 1) % args.accumulation_steps == 0:
+        if step % args.accumulation_steps == 0 or step == iters:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
 
-        if step % args.log_interval == 0 or step == iters - 1:
+        if step % args.log_interval == 0 or step == iters:
             spend_time = time.time() - start_time
             current_loss = loss.item() * args.accumulation_steps
+            current_ce_loss = ce_loss_raw.item()
+            current_aux_loss = res.aux_loss.item() if lm_config_student.use_moe else 0.0
             current_lr = optimizer.param_groups[-1]['lr']
-            eta_min = spend_time / (step + 1) * iters // 60 - spend_time // 60
+            eta_min = spend_time / max(step - start_step, 1) * (iters - step) // 60
             
-            Logger(f'Epoch:[{epoch+1}/{args.epochs}]({step}/{iters}) loss:{current_loss:.6f} ce:{ce_loss.item():.4f} distill:{distill_loss.item():.4f} lr:{current_lr:.12f} epoch_Time:{eta_min}min:')
+            Logger(f'Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}), loss: {current_loss:.4f}, ce: {current_ce_loss:.4f}, aux_loss: {current_aux_loss:.4f}, distill: {distill_loss.item():.4f}, learning_rate: {current_lr:.8f}, epoch_time: {eta_min:.3f}min')
             
             if wandb:
                 wandb.log({
                     "loss": current_loss,
-                    "ce_loss": ce_loss.item(),
+                    "ce_loss": current_ce_loss,
+                    "aux_loss": current_aux_loss,
                     "distill_loss": distill_loss.item() if teacher_model is not None else 0.0,
-                    "lr": current_lr,
-                    "epoch_Time": eta_min
+                    "learning_rate": current_lr,
+                    "epoch_time": eta_min
                 })
 
-        if (step % args.save_interval == 0 or step == iters - 1) and is_main_process():
+        if (step % args.save_interval == 0 or step == iters) and is_main_process():
             model.eval()
             moe_suffix = '_moe' if lm_config_student.use_moe else ''
             ckp = f'{args.save_dir}/{args.save_weight}_{lm_config_student.hidden_size}{moe_suffix}.pth'
-            if isinstance(model, torch.nn.parallel.DistributedDataParallel):
-                state_dict = model.module.state_dict()
-            else:
-                state_dict = model.state_dict()
-            state_dict = {k: v.half().cpu() for k, v in state_dict.items()}
-            torch.save(state_dict, ckp)
+            raw_model = model.module if isinstance(model, DistributedDataParallel) else model
+            raw_model = getattr(raw_model, '_orig_mod', raw_model)
+            state_dict = raw_model.state_dict()
+            torch.save({k: v.half().cpu() for k, v in state_dict.items()}, ckp)
             lm_checkpoint(lm_config_student, weight=args.save_weight, model=model, optimizer=optimizer, scaler=scaler, epoch=epoch, step=step, wandb=wandb, save_dir='../checkpoints')
             model.train()
             del state_dict
 
-        del X, Y, loss_mask, res, student_logits, teacher_logits, ce_loss, distill_loss, loss
+        del input_ids, labels, loss_mask, res, student_logits, ce_loss, distill_loss, loss
 
 
 if __name__ == "__main__":
+    # 模拟用moe模型蒸馏dense模型，也可以用更大teacher_hidden_size模型蒸馏更小student_hidden_size的
     parser = argparse.ArgumentParser(description="MiniMind Knowledge Distillation")
     parser.add_argument("--save_dir", type=str, default="../out", help="模型保存目录")
     parser.add_argument('--save_weight', default='full_dist', type=str, help="保存权重的前缀名")
@@ -146,12 +152,13 @@ if __name__ == "__main__":
     parser.add_argument("--log_interval", type=int, default=100, help="日志打印间隔")
     parser.add_argument("--save_interval", type=int, default=100, help="模型保存间隔")
     parser.add_argument("--max_seq_len", type=int, default=340, help="训练的最大截断长度（中文1token≈1.5~1.7字符）")
-    parser.add_argument("--data_path", type=str, default="../dataset/sft_mini_512.jsonl", help="训练数据路径")
-    parser.add_argument('--student_hidden_size', default=512, type=int, help="学生模型隐藏层维度")
+    parser.add_argument("--data_path", type=str, default="../dataset/sft_t2t_mini.jsonl", help="训练数据路径")
+    parser.add_argument('--student_hidden_size', default=768, type=int, help="学生模型隐藏层维度")
     parser.add_argument('--student_num_layers', default=8, type=int, help="学生模型隐藏层数量")
     parser.add_argument('--teacher_hidden_size', default=768, type=int, help="教师模型隐藏层维度")
-    parser.add_argument('--teacher_num_layers', default=16, type=int, help="教师模型隐藏层数量")
-    parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1], help="是否使用MoE架构（0=否，1=是）")
+    parser.add_argument('--teacher_num_layers', default=8, type=int, help="教师模型隐藏层数量")
+    parser.add_argument('--student_use_moe', default=0, type=int, choices=[0, 1], help="学生模型是否使用MoE（0=否，1=是）")
+    parser.add_argument('--teacher_use_moe', default=1, type=int, choices=[0, 1], help="教师模型是否使用MoE（0=否，1=是）")
     parser.add_argument('--from_student_weight', default='full_sft', type=str, help="学生模型基于哪个权重")
     parser.add_argument('--from_teacher_weight', default='full_sft', type=str, help="教师模型基于哪个权重")
     parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1], help="是否自动检测&续训（0=否，1=是）")
@@ -159,6 +166,7 @@ if __name__ == "__main__":
     parser.add_argument('--temperature', default=1.5, type=float, help="蒸馏温度（推荐范围1.0-2.0）")
     parser.add_argument("--use_wandb", action="store_true", help="是否使用wandb")
     parser.add_argument("--wandb_project", type=str, default="MiniMind-Distillation", help="wandb项目名")
+    parser.add_argument("--use_compile", default=0, type=int, choices=[0, 1], help="是否使用torch.compile加速（0=否，1=是）")
     args = parser.parse_args()
 
     # ========== 1. 初始化环境和随机种子 ==========
@@ -168,8 +176,8 @@ if __name__ == "__main__":
     
     # ========== 2. 配置目录、模型参数、检查ckp ==========
     os.makedirs(args.save_dir, exist_ok=True)
-    lm_config_student = MiniMindConfig(hidden_size=args.student_hidden_size, num_hidden_layers=args.student_num_layers, use_moe=bool(args.use_moe))
-    lm_config_teacher = MiniMindConfig(hidden_size=args.teacher_hidden_size, num_hidden_layers=args.teacher_num_layers, use_moe=bool(args.use_moe))
+    lm_config_student = MiniMindConfig(hidden_size=args.student_hidden_size, num_hidden_layers=args.student_num_layers, use_moe=bool(args.student_use_moe))
+    lm_config_teacher = MiniMindConfig(hidden_size=args.teacher_hidden_size, num_hidden_layers=args.teacher_num_layers, use_moe=bool(args.teacher_use_moe))
     ckp_data = lm_checkpoint(lm_config_student, weight=args.save_weight, save_dir='../checkpoints') if args.from_resume==1 else None
     
     # ========== 3. 设置混合精度 ==========
@@ -207,19 +215,27 @@ if __name__ == "__main__":
         start_epoch = ckp_data['epoch']
         start_step = ckp_data.get('step', 0)
     
-    # ========== 7. DDP包模型 ==========
+    # ========== 7. 编译和分布式包装 ==========
+    if args.use_compile == 1:
+        model = torch.compile(model)
+        Logger('torch.compile enabled')
     if dist.is_initialized():
-        model._ddp_params_and_buffers_to_ignore = {"freqs_cos", "freqs_sin"}
         model = DistributedDataParallel(model, device_ids=[local_rank])
     
     # ========== 8. 开始训练 ==========
     for epoch in range(start_epoch, args.epochs):
         train_sampler and train_sampler.set_epoch(epoch)
-        if epoch == start_epoch and start_step > 0: # 第一个epoch且存在检查点
-            batch_sampler = SkipBatchSampler(train_sampler or range(len(train_ds)), args.batch_size, start_step + 1)
-            loader = DataLoader(train_ds, batch_sampler=batch_sampler, num_workers=args.num_workers, pin_memory=True)
+        setup_seed(42 + epoch); indices = torch.randperm(len(train_ds)).tolist()
+        skip = start_step if (epoch == start_epoch and start_step > 0) else 0
+        batch_sampler = SkipBatchSampler(train_sampler or indices, args.batch_size, skip)
+        loader = DataLoader(train_ds, batch_sampler=batch_sampler, num_workers=args.num_workers, pin_memory=True)
+        if skip > 0: 
             Logger(f'Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始')
-            train_epoch(epoch, loader, len(loader) + start_step + 1, teacher_model, lm_config_student, start_step, wandb, args.alpha, args.temperature)
-        else: # 默认从头开始
-            loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=(train_sampler is None), sampler=train_sampler, num_workers=args.num_workers, pin_memory=True)
+            train_epoch(epoch, loader, len(loader) + skip, teacher_model, lm_config_student, start_step, wandb, args.alpha, args.temperature)
+        else:
             train_epoch(epoch, loader, len(loader), teacher_model, lm_config_student, 0, wandb, args.alpha, args.temperature)
+    
+    # ========== 9. 清理分布进程 ==========
+    if dist.is_initialized():
+        dist.barrier()
+        dist.destroy_process_group()

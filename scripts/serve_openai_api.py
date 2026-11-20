@@ -1,5 +1,6 @@
 import argparse
 import json
+import re
 import os
 import sys
 
@@ -14,7 +15,7 @@ from threading import Thread
 from queue import Queue
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from transformers import AutoTokenizer, AutoModelForCausalLM, TextStreamer
 from model.model_minimind import MiniMindConfig, MiniMindForCausalLM
 from model.model_lora import apply_lora, load_lora
@@ -26,7 +27,7 @@ app = FastAPI()
 
 def init_model(args):
     tokenizer = AutoTokenizer.from_pretrained(args.load_from)
-    if 'model' in args.load_from:
+    if os.path.basename(os.path.normpath(args.load_from)) == 'model':
         moe_suffix = '_moe' if args.use_moe else ''
         ckp = f'../{args.save_dir}/{args.weight}_{args.hidden_size}{moe_suffix}.pth'
         model = MiniMindForCausalLM(MiniMindConfig(
@@ -38,22 +39,33 @@ def init_model(args):
         ))
         model.load_state_dict(torch.load(ckp, map_location=device), strict=True)
         if args.lora_weight != 'None':
-            apply_lora(model)
-            load_lora(model, f'../{args.save_dir}/lora/{args.lora_weight}_{args.hidden_size}.pth')
+            apply_lora(model, rank=args.lora_rank)
+            load_lora(model, f'../{args.save_dir}/{args.lora_weight}_{args.hidden_size}{moe_suffix}.pth')
     else:
         model = AutoModelForCausalLM.from_pretrained(args.load_from, trust_remote_code=True)
     print(f'MiniMind模型参数量: {sum(p.numel() for p in model.parameters()) / 1e6:.2f} M(illion)')
-    return model.eval().to(device), tokenizer
+    return model.half().eval().to(device), tokenizer
 
 
 class ChatRequest(BaseModel):
     model: str
     messages: list
-    temperature: float = 0.7
+    temperature: float = Field(default=0.7, ge=0.0, allow_inf_nan=False)
     top_p: float = 0.92
     max_tokens: int = 8192
-    stream: bool = False
-    tools: list = []
+    stream: bool = True
+    tools: list = Field(default_factory=list)
+    open_thinking: bool = False
+    chat_template_kwargs: dict = None
+    
+    def get_open_thinking(self) -> bool:
+        """兼容多种方式开启 thinking"""
+        if self.open_thinking:
+            return True
+        if self.chat_template_kwargs:
+            return self.chat_template_kwargs.get('open_thinking', False) or \
+                   self.chat_template_kwargs.get('enable_thinking', False)
+        return False
 
 
 class CustomStreamer(TextStreamer):
@@ -68,50 +80,126 @@ class CustomStreamer(TextStreamer):
             self.queue.put(None)
 
 
-def generate_stream_response(messages, temperature, top_p, max_tokens):
+def parse_response(text):
+    reasoning_content = None
+    think_match = re.search(r'<think>(.*?)</think>', text, re.DOTALL)
+    if think_match:
+        reasoning_content = think_match.group(1).strip()
+        text = re.sub(r'<think>.*?</think>\s*', '', text, flags=re.DOTALL)
+    elif '</think>' in text:
+        parts = text.split('</think>', 1)
+        reasoning_content = parts[0].strip()
+        text = parts[1].strip() if len(parts) > 1 else ''
+    tool_calls = []
+    for i, m in enumerate(re.findall(r'<tool_call>(.*?)</tool_call>', text, re.DOTALL)):
+        try:
+            call = json.loads(m.strip())
+            tool_calls.append({"id": f"call_{int(time.time())}_{i}", "type": "function", "function": {"name": call.get("name", ""), "arguments": json.dumps(call.get("arguments", {}), ensure_ascii=False)}})
+        except Exception:
+            pass
+    if tool_calls:
+        text = re.sub(r'<tool_call>.*?</tool_call>', '', text, flags=re.DOTALL)
+    return text.strip(), reasoning_content, tool_calls or None
+
+
+def generate_stream_response(messages, temperature, top_p, max_tokens, tools=None, open_thinking=False):
     try:
-        new_prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)[-max_tokens:]
+        new_prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, tools=tools or None, open_thinking=open_thinking)
         inputs = tokenizer(new_prompt, return_tensors="pt", truncation=True).to(device)
 
         queue = Queue()
         streamer = CustomStreamer(tokenizer, queue)
 
         def _generate():
-            model.generate(
-                inputs.input_ids,
-                max_new_tokens=max_tokens,
-                do_sample=True,
-                temperature=temperature,
-                top_p=top_p,
-                attention_mask=inputs.attention_mask,
-                pad_token_id=tokenizer.pad_token_id,
-                eos_token_id=tokenizer.eos_token_id,
-                streamer=streamer
-            )
+            try:
+                model.generate(
+                    inputs.input_ids,
+                    max_new_tokens=max_tokens,
+                    do_sample=temperature > 0,
+                    temperature=temperature,
+                    top_p=top_p,
+                    attention_mask=inputs.attention_mask,
+                    pad_token_id=tokenizer.pad_token_id,
+                    eos_token_id=tokenizer.eos_token_id,
+                    streamer=streamer
+                )
+            except Exception as e:
+                queue.put({"error": str(e)})
+                queue.put(None)
 
         Thread(target=_generate).start()
+
+        pending = ""
+        in_tool_call = False
+        tool_count = 0
+        thinking_ended = not bool(open_thinking)
+        strip_newlines = False
 
         while True:
             text = queue.get()
             if text is None:
-                yield json.dumps({
-                    "choices": [{
-                        "delta": {},
-                        "finish_reason": "stop"
-                    }]
-                }, ensure_ascii=False)
                 break
+            if isinstance(text, dict):
+                yield json.dumps(text, ensure_ascii=False)
+                continue
+            pending += text
 
-            yield json.dumps({
-                "choices": [{"delta": {"content": text}}]
-            }, ensure_ascii=False)
+            while pending:
+                if strip_newlines:
+                    pending = pending.lstrip('\n')
+                    if not pending:
+                        break
+                    strip_newlines = False
+                if in_tool_call:
+                    end = pending.find('</tool_call>')
+                    if end < 0:
+                        break
+                    end += len('</tool_call>')
+                    block, pending = pending[:end], pending[end:]
+                    _, _, tool_calls = parse_response(block)
+                    if tool_calls:
+                        call = tool_calls[0]
+                        call['index'] = tool_count
+                        call['id'] = f"call_{int(time.time())}_{tool_count}"
+                        tool_count += 1
+                        yield json.dumps({"choices": [{"delta": {"tool_calls": [call]}}]}, ensure_ascii=False)
+                    else:
+                        yield json.dumps({"choices": [{"delta": {"content": block}}]}, ensure_ascii=False)
+                    in_tool_call = False
+                    continue
+
+                marker = '<tool_call>' if thinking_ended else '</think>'
+                field = 'content' if thinking_ended else 'reasoning_content'
+                pos = pending.find(marker)
+                if pos < 0:
+                    keep = next((n for n in range(len(marker) - 1, 0, -1)
+                                 if pending.endswith(marker[:n])), 0)
+                    end = len(pending) - keep
+                    if end:
+                        yield json.dumps({"choices": [{"delta": {field: pending[:end]}}]}, ensure_ascii=False)
+                        pending = pending[end:]
+                    break
+                if pos:
+                    yield json.dumps({"choices": [{"delta": {field: pending[:pos]}}]}, ensure_ascii=False)
+                pending = pending[pos:]
+                if thinking_ended:
+                    in_tool_call = True
+                else:
+                    pending = pending[len(marker):]
+                    thinking_ended = True
+                    strip_newlines = True
+
+        if pending:
+            field = 'content' if thinking_ended else 'reasoning_content'
+            yield json.dumps({"choices": [{"delta": {field: pending}}]}, ensure_ascii=False)
+        yield json.dumps({"choices": [{"delta": {}, "finish_reason": "tool_calls" if tool_count else "stop"}]}, ensure_ascii=False)
 
     except Exception as e:
         yield json.dumps({"error": str(e)})
 
 
 @app.post("/v1/chat/completions")
-async def chat_completions(request: ChatRequest):
+def chat_completions(request: ChatRequest):
     try:
         if request.stream:
             return StreamingResponse(
@@ -119,7 +207,9 @@ async def chat_completions(request: ChatRequest):
                     messages=request.messages,
                     temperature=request.temperature,
                     top_p=request.top_p,
-                    max_tokens=request.max_tokens
+                    max_tokens=request.max_tokens,
+                    tools=request.tools,
+                    open_thinking=request.get_open_thinking()
                 )),
                 media_type="text/event-stream"
             )
@@ -127,14 +217,16 @@ async def chat_completions(request: ChatRequest):
             new_prompt = tokenizer.apply_chat_template(
                 request.messages,
                 tokenize=False,
-                add_generation_prompt=True
-            )[-request.max_tokens:]
+                add_generation_prompt=True,
+                tools=request.tools or None,
+                open_thinking=request.get_open_thinking()
+            )
             inputs = tokenizer(new_prompt, return_tensors="pt", truncation=True).to(device)
             with torch.no_grad():
                 generated_ids = model.generate(
                     inputs["input_ids"],
-                    max_length=inputs["input_ids"].shape[1] + request.max_tokens,
-                    do_sample=True,
+                    max_new_tokens=request.max_tokens,
+                    do_sample=request.temperature > 0,
                     attention_mask=inputs["attention_mask"],
                     pad_token_id=tokenizer.pad_token_id,
                     eos_token_id=tokenizer.eos_token_id,
@@ -142,6 +234,12 @@ async def chat_completions(request: ChatRequest):
                     temperature=request.temperature
                 )
                 answer = tokenizer.decode(generated_ids[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+            content, reasoning_content, tool_calls = parse_response(answer)
+            message = {"role": "assistant", "content": content}
+            if reasoning_content:
+                message["reasoning_content"] = reasoning_content
+            if tool_calls:
+                message["tool_calls"] = tool_calls
             return {
                 "id": f"chatcmpl-{int(time.time())}",
                 "object": "chat.completion",
@@ -150,8 +248,8 @@ async def chat_completions(request: ChatRequest):
                 "choices": [
                     {
                         "index": 0,
-                        "message": {"role": "assistant", "content": answer},
-                        "finish_reason": "stop"
+                        "message": message,
+                        "finish_reason": "tool_calls" if tool_calls else "stop"
                     }
                 ]
             }
@@ -165,8 +263,9 @@ if __name__ == "__main__":
     parser.add_argument('--save_dir', default='out', type=str, help="模型权重目录")
     parser.add_argument('--weight', default='full_sft', type=str, help="权重名称前缀（pretrain, full_sft, dpo, reason, ppo_actor, grpo, spo）")
     parser.add_argument('--lora_weight', default='None', type=str, help="LoRA权重名称（None表示不使用，可选：lora_identity, lora_medical）")
-    parser.add_argument('--hidden_size', default=512, type=int, help="隐藏层维度（512=Small-26M, 640=MoE-145M, 768=Base-104M）")
-    parser.add_argument('--num_hidden_layers', default=8, type=int, help="隐藏层数量（Small/MoE=8, Base=16）")
+    parser.add_argument('--lora_rank', default=16, type=int, help="LoRA rank，需与训练时一致（默认16）")
+    parser.add_argument('--hidden_size', default=768, type=int, help="隐藏层维度")
+    parser.add_argument('--num_hidden_layers', default=8, type=int, help="隐藏层数量")
     parser.add_argument('--max_seq_len', default=8192, type=int, help="最大序列长度")
     parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1], help="是否使用MoE架构（0=否，1=是）")
     parser.add_argument('--inference_rope_scaling', default=False, action='store_true', help="启用RoPE位置编码外推（4倍，仅解决位置编码问题）")
