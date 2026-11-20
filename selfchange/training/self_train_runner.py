@@ -1,0 +1,253 @@
+from __future__ import annotations
+
+import json
+import os
+import re
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+from selfchange.kernel.budgets import ComputeProfile
+from selfchange.kernel.integrity import atomic_write_text
+from selfchange.kernel.sandbox import run_sandboxed
+
+
+@dataclass
+class TrainingRunResult:
+    """Telemetry returned by a single bounded self-training execution."""
+
+    stage: str
+    ok: bool
+    exit_code: int
+    output_weight_path: str | None
+    resume_ckpt_path: str | None
+    final_loss: float | None
+    oom_detected: bool
+    nan_detected: bool
+    timed_out: bool
+    duration_sec: float
+    log_tail: str
+    dry_run: bool = False
+
+
+def detect_log_anomalies(log_text: str) -> tuple[bool, bool]:
+    """Detect OOM and NaN/Inf loss signatures from training log output."""
+    lower = (log_text or "").lower()
+    oom = "out of memory" in lower or "memoryerror" in lower
+    nan = bool(re.search(r"\bloss:\s*(nan|inf)\b", lower)) or "grad_norm: inf" in lower
+    return oom, nan
+
+
+def _extract_last_loss(log_text: str) -> float | None:
+    matches = re.findall(r"\bloss:\s*([-+]?\d+(?:\.\d+)?)", log_text or "", flags=re.IGNORECASE)
+    if not matches:
+        return None
+    try:
+        return float(matches[-1])
+    except ValueError:
+        return None
+
+
+def promote_lora_adapter(
+    base_weight: Path,
+    lora_weight: Path,
+    merged_out: Path,
+    hidden_size: int,
+    num_hidden_layers: int,
+    use_moe: bool = False,
+    lora_rank: int = 16,
+    target_all_linear: bool = False,
+) -> Path:
+    """Atomically merge a verified LoRA adapter into base weights using model/model_lora.py."""
+    import torch  # type: ignore[import-not-found]
+    from model.model_lora import merge_lora  # type: ignore[import-not-found]
+    from model.model_minimind import MiniMindConfig, MiniMindForCausalLM  # type: ignore[import-not-found]
+    from selfchange.training.model_loader import apply_extended_lora
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    cfg = MiniMindConfig(hidden_size=hidden_size, num_hidden_layers=num_hidden_layers, use_moe=bool(use_moe))
+    model = MiniMindForCausalLM(cfg).to(device)
+    model.load_state_dict(torch.load(str(base_weight), map_location=device), strict=False)
+    apply_extended_lora(model, rank=lora_rank, target_all_linear=target_all_linear)
+
+    merged_out = Path(merged_out)
+    merged_out.parent.mkdir(parents=True, exist_ok=True)
+    tmp_out = merged_out.with_name(f".{merged_out.name}.{os.getpid()}.tmp")
+    try:
+        merge_lora(model, str(lora_weight), str(tmp_out))
+        os.replace(tmp_out, merged_out)
+    finally:
+        if tmp_out.exists():
+            tmp_out.unlink(missing_ok=True)
+    return merged_out
+
+
+def build_trainer_command(
+    stage: str,
+    repo_root: Path,
+    data_path: Path,
+    save_dir: Path,
+    save_weight: str,
+    from_weight: str,
+    profile: ComputeProfile,
+    training_cfg: dict,
+    from_resume: bool = False,
+) -> tuple[list[str], Path]:
+    """Construct profile-aware trainer command and expected output checkpoint path."""
+    repo_root = Path(repo_root).resolve()
+    save_dir = Path(save_dir).resolve()
+    data_path = Path(data_path).resolve()
+    moe_suffix = "_moe" if profile.use_moe else ""
+    out_weight = save_dir / f"{save_weight}_{profile.hidden_size}{moe_suffix}.pth"
+
+    lr = str(training_cfg.get("learning_rate", 5e-5))
+    bs = str(training_cfg.get("batch_size", profile.batch_size))
+    seq = str(min(profile.max_seq_len, int(training_cfg.get("max_seq_len", profile.max_seq_len))))
+    epochs = str(training_cfg.get("epochs", 1))
+    grad_clip = str(training_cfg.get("grad_clip", 1.0))
+    acc = str(training_cfg.get("accumulation_steps", 1))
+    resume_flag = "1" if from_resume else "0"
+
+    common = [
+        "--save_dir", str(save_dir),
+        "--epochs", epochs,
+        "--batch_size", bs,
+        "--device", profile.device,
+        "--dtype", profile.dtype,
+        "--num_workers", str(profile.num_workers),
+        "--accumulation_steps", acc,
+        "--grad_clip", grad_clip,
+        "--hidden_size", str(profile.hidden_size),
+        "--num_hidden_layers", str(profile.num_hidden_layers),
+        "--max_seq_len", seq,
+        "--use_moe", "1" if profile.use_moe else "0",
+        "--data_path", str(data_path),
+        "--from_weight", from_weight,
+        "--from_resume", resume_flag,
+    ]
+
+    if stage == "pretrain":
+        cmd = [sys.executable, str(repo_root / "trainer" / "train_pretrain.py"), "--save_weight", save_weight, "--learning_rate", lr, *common]
+    elif stage == "full_sft":
+        cmd = [sys.executable, str(repo_root / "trainer" / "train_full_sft.py"), "--save_weight", save_weight, "--learning_rate", lr, *common]
+    elif stage == "lora":
+        rank = str(training_cfg.get("lora_rank", 16))
+        cmd = [sys.executable, str(repo_root / "trainer" / "train_lora.py"), "--lora_name", save_weight, "--lora_rank", rank, "--learning_rate", lr, *common]
+    elif stage == "dpo":
+        dpo_lr = str(training_cfg.get("dpo_learning_rate", training_cfg.get("learning_rate", 4e-8)))
+        beta = str(training_cfg.get("dpo_beta", 0.15))
+        cmd = [sys.executable, str(repo_root / "trainer" / "train_dpo.py"), "--save_weight", save_weight, "--learning_rate", dpo_lr, "--beta", beta, *common]
+    elif stage == "rlvr":
+        rl_lr = str(training_cfg.get("rl_learning_rate", 3e-7))
+        kl_beta = str(training_cfg.get("kl_beta", 0.1))
+        cmd = [
+            sys.executable,
+            str(repo_root / "selfchange" / "training" / "train_self_agent.py"),
+            "--profile", profile.name,
+            "--save_dir", str(save_dir),
+            "--save_weight", save_weight,
+            "--from_weight", from_weight,
+            "--learning_rate", rl_lr,
+            "--beta", kl_beta,
+            "--data_path", str(data_path),
+            "--from_resume", resume_flag,
+        ]
+    else:
+        raise ValueError(f"Unsupported training stage {stage!r}")
+    return cmd, out_weight
+
+
+def run_training_stage(
+    stage: str,
+    repo_root: Path,
+    workspace_dir: Path,
+    data_path: Path,
+    profile: ComputeProfile,
+    training_cfg: dict,
+    from_weight: str = "full_sft",
+    save_weight: str = "cand",
+    from_resume: bool = False,
+    dry_run: bool = False,
+) -> TrainingRunResult:
+    """Execute one bounded training stage or dry-run validation inside workspace budgets."""
+    t0 = time.monotonic()
+    repo_root = Path(repo_root).resolve()
+    workspace_dir = Path(workspace_dir).resolve()
+    data_path = Path(data_path).resolve()
+    candidates_dir = workspace_dir / "models" / "candidates"
+    logs_dir = workspace_dir / "logs"
+    candidates_dir.mkdir(parents=True, exist_ok=True)
+    logs_dir.mkdir(parents=True, exist_ok=True)
+
+    cmd, expected_out = build_trainer_command(
+        stage=stage,
+        repo_root=repo_root,
+        data_path=data_path,
+        save_dir=candidates_dir,
+        save_weight=save_weight,
+        from_weight=from_weight,
+        profile=profile,
+        training_cfg=training_cfg,
+        from_resume=from_resume,
+    )
+    train_log = logs_dir / "train.log"
+
+    if not data_path.is_file() or data_path.stat().st_size == 0:
+        msg = f"Training data missing or empty: {data_path}\n"
+        atomic_write_text(train_log, msg)
+        return TrainingRunResult(stage, False, 2, None, None, None, False, False, False, 0.0, msg, dry_run=dry_run)
+
+    if dry_run:
+        atomic_write_text(
+            expected_out,
+            json.dumps({"dry_run": True, "stage": stage, "from_weight": from_weight, "data_path": str(data_path)}, indent=2) + "\n",
+        )
+        log_line = f"[DRY-RUN] stage={stage} loss: 1.2500 saved={expected_out.name}\n"
+        atomic_write_text(train_log, log_line)
+        return TrainingRunResult(
+            stage=stage,
+            ok=True,
+            exit_code=0,
+            output_weight_path=str(expected_out),
+            resume_ckpt_path=None,
+            final_loss=1.25,
+            oom_detected=False,
+            nan_detected=False,
+            timed_out=False,
+            duration_sec=round(time.monotonic() - t0, 4),
+            log_tail=log_line,
+            dry_run=True,
+        )
+
+    cwd = repo_root / "trainer" if stage in ("pretrain", "full_sft", "lora", "dpo") else repo_root
+    res = run_sandboxed(
+        cmd,
+        cwd=cwd,
+        timeout_sec=float(profile.subprocess_timeout_sec),
+        memory_limit_mb=profile.max_subprocess_memory_mb,
+        file_size_limit_mb=profile.max_file_size_mb,
+        extra_env={"PYTHONPATH": str(repo_root)},
+    )
+    combined_log = (res.stdout + "\n" + res.stderr).strip()
+    tail_lines = "\n".join(combined_log.splitlines()[-40:])
+    atomic_write_text(train_log, tail_lines + "\n")
+
+    oom, nan = detect_log_anomalies(combined_log)
+    final_loss = _extract_last_loss(combined_log)
+    ok = (not res.timed_out) and res.returncode == 0 and (not oom) and (not nan)
+    resume_guess = repo_root / "checkpoints" / f"{save_weight}_{profile.hidden_size}{'_moe' if profile.use_moe else ''}_resume.pth"
+    return TrainingRunResult(
+        stage=stage,
+        ok=ok,
+        exit_code=res.returncode,
+        output_weight_path=str(expected_out) if expected_out.is_file() else None,
+        resume_ckpt_path=str(resume_guess) if resume_guess.is_file() else None,
+        final_loss=final_loss,
+        oom_detected=oom,
+        nan_detected=nan,
+        timed_out=res.timed_out,
+        duration_sec=res.duration_sec,
+        log_tail=tail_lines,
+        dry_run=False,
+    )
