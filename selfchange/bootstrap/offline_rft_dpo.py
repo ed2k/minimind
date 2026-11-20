@@ -14,7 +14,11 @@ from selfchange.kernel.verifier import compute_rlvr_reward
 from selfchange.mutable.agent_loop import run_agent_episode
 from selfchange.mutable.data_curator import build_dpo_pairs, curate_rft_samples, mix_with_anchor
 from selfchange.mutable.recovery_policy import propose_line_fix
-from selfchange.training.self_train_runner import run_training_stage
+from selfchange.training.self_train_runner import (
+    promote_lora_adapter,
+    run_training_stage,
+    stage_from_weight_for_trainer,
+)
 
 
 def _scripted_rollout_model_factory(fname: str, broken_src: str, err_type: str, target_line: int, succeed: bool):
@@ -146,7 +150,30 @@ def run_offline_rft_dpo_round(
             dry_run=dry_run,
         )
         if rft_res.ok:
-            curr_weight = rft_save
+            if not dry_run and rft_res.output_weight_path:
+                base_pth = stage_from_weight_for_trainer(curr_weight, repo_root, workspace_dir, profile)
+                if base_pth is not None:
+                    moe_suffix = "_moe" if profile.use_moe else ""
+                    merged_name = f"offline_rft_r{round_idx}_merged"
+                    merged_path = (
+                        workspace_dir
+                        / "models"
+                        / "candidates"
+                        / f"{merged_name}_{profile.hidden_size}{moe_suffix}.pth"
+                    )
+                    promote_lora_adapter(
+                        base_weight=base_pth,
+                        lora_weight=Path(rft_res.output_weight_path),
+                        merged_out=merged_path,
+                        hidden_size=profile.hidden_size,
+                        num_hidden_layers=profile.num_hidden_layers,
+                        use_moe=profile.use_moe,
+                    )
+                    curr_weight = merged_name
+                else:
+                    curr_weight = rft_save
+            else:
+                curr_weight = rft_save
 
     if dpo_pairs:
         dpo_save = f"offline_dpo_r{round_idx}"
@@ -177,12 +204,42 @@ def run_offline_rft_dpo_round(
     }
 
 
+def _make_minimind_rollout_factory(model_path: Path, tokenizer_path: Path, profile: ComputeProfile):
+    from selfchange.training.model_loader import generate_agent_reply, load_minimind_model
+
+    model, tokenizer = load_minimind_model(model_path, tokenizer_path, profile)
+    eos_tok = tokenizer.eos_token or "<|im_end|>"
+    pad_tok = tokenizer.pad_token or "<|endoftext|>"
+
+    def _factory(_task_idx: int, _r_idx: int, _fname: str, _broken_src: str):
+        def _model(messages: list[dict], tools: list[dict]) -> str:
+            raw = generate_agent_reply(
+                model,
+                tokenizer,
+                messages,
+                tools,
+                max_new_tokens=min(160, profile.max_gen_len),
+                temperature=0.7,
+                top_p=0.9,
+                open_thinking=True,
+            )
+            return raw.replace(eos_tok, "").replace(pad_tok, "").strip()
+
+        return _model
+
+    return _factory
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Stage 1.5 offline rejection sampling + contrastive DPO")
     parser.add_argument("--worktree", type=Path, default=Path("."))
     parser.add_argument("--repo-root", type=Path, default=Path("."))
     parser.add_argument("--workspace-dir", type=Path, default=Path("selfchange/workspace"))
     parser.add_argument("--work-dir", type=Path, default=Path("selfchange/workspace/offline_rft_dpo"))
+    parser.add_argument("--backend", choices=["scripted", "minimind"], default="scripted")
+    parser.add_argument("--model-path", type=Path, default=None)
+    parser.add_argument("--tokenizer-path", type=Path, default=Path("model"))
+    parser.add_argument("--from-weight", type=str, default="warmstart_rung3")
     parser.add_argument("--rounds", type=int, default=1)
     parser.add_argument("--num-tasks", type=int, default=16)
     parser.add_argument("--num-rollouts", type=int, default=4)
@@ -191,10 +248,22 @@ def main() -> int:
     args = parser.parse_args()
 
     profile = get_profile(args.profile)
+    factory = None
+    if args.backend == "minimind":
+        if args.model_path is None:
+            raise ValueError("--model-path is required when --backend minimind")
+        factory = _make_minimind_rollout_factory(args.model_path, args.tokenizer_path, profile)
+
     outputs: list[dict] = []
-    curr = "warmstart_rung3"
+    curr = args.from_weight
     for r in range(1, args.rounds + 1):
-        trajs = collect_offline_rollouts(args.worktree, num_tasks=args.num_tasks, num_rollouts=args.num_rollouts, seed=42 + r)
+        trajs = collect_offline_rollouts(
+            args.worktree,
+            model_fn_factory=factory,
+            num_tasks=args.num_tasks,
+            num_rollouts=args.num_rollouts,
+            seed=42 + r,
+        )
         res = run_offline_rft_dpo_round(
             trajs,
             repo_root=args.repo_root,

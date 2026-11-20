@@ -13,6 +13,8 @@ from selfchange.bootstrap.offline_rft_dpo import collect_offline_rollouts, run_o
 from selfchange.bootstrap.setup_base import build_anchor_split, setup_micro_model
 from selfchange.bootstrap.warmstart_sft import run_warmstart_curriculum
 from selfchange.kernel.budgets import get_profile
+from selfchange.training.model_loader import normalize_messages_for_template
+from selfchange.training.self_train_runner import stage_from_weight_for_trainer
 from selfchange.training.train_self_agent import compute_group_advantages
 
 
@@ -147,6 +149,34 @@ class TestBootstrapPipeline(unittest.TestCase):
         nb = json.loads(nb_path.read_text(encoding="utf-8"))
         self.assertEqual(nb.get("nbformat"), 4)
         self.assertGreaterEqual(len(nb.get("cells", [])), 5)
+        joined_src = "\n".join("".join(c.get("source", [])) for c in nb["cells"])
+        self.assertIn("-b mychanges", joined_src)
+        self.assertIn("--backend minimind", joined_src)
+
+    def test_stage_weight_and_normalize_messages(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            repo = tmp_path / "repo"
+            ws = tmp_path / "ws"
+            profile = get_profile("local_intel_cpu")
+            cand = ws / "models" / "candidates" / f"warmstart_rung3_{profile.hidden_size}.pth"
+            cand.parent.mkdir(parents=True, exist_ok=True)
+            cand.write_bytes(b"fake-ckpt")
+
+            staged = stage_from_weight_for_trainer("warmstart_rung3", repo, ws, profile)
+            self.assertIsNotNone(staged)
+            self.assertTrue((repo / "out" / f"warmstart_rung3_{profile.hidden_size}.pth").is_file())
+
+            raw_msgs = [
+                {"role": "system", "content": "Sys", "tools": json.dumps([{"type": "function", "function": {"name": "foo"}}]), "tool_calls": None},
+                {"role": "assistant", "content": "", "tool_calls": json.dumps([{"name": "foo", "arguments": {}}]), "reasoning_content": None},
+            ]
+            norm, tools = normalize_messages_for_template(raw_msgs)
+            self.assertIsInstance(tools, list)
+            self.assertEqual(tools[0]["function"]["name"], "foo")
+            self.assertNotIn("tools", norm[0])
+            self.assertIsInstance(norm[1]["tool_calls"], list)
+            self.assertNotIn("reasoning_content", norm[1])
 
 
 if __name__ == "__main__":

@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
+import signal
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -10,7 +13,6 @@ from pathlib import Path
 
 from selfchange.kernel.budgets import ComputeProfile
 from selfchange.kernel.integrity import atomic_write_text
-from selfchange.kernel.sandbox import run_sandboxed
 
 
 @dataclass
@@ -47,6 +49,49 @@ def _extract_last_loss(log_text: str) -> float | None:
         return float(matches[-1])
     except ValueError:
         return None
+
+
+def stage_from_weight_for_trainer(
+    from_weight: str,
+    repo_root: Path,
+    workspace_dir: Path,
+    profile: ComputeProfile,
+) -> Path | None:
+    """Locate from_weight across workspace/out and stage into repo_root/out for trainer/*.py."""
+    if not from_weight or from_weight == "none":
+        return None
+    repo_root = Path(repo_root).resolve()
+    workspace_dir = Path(workspace_dir).resolve()
+    moe_suffix = "_moe" if profile.use_moe else ""
+    filename = f"{from_weight}_{profile.hidden_size}{moe_suffix}.pth"
+
+    search_candidates = [
+        repo_root / "out" / filename,
+        workspace_dir / "models" / "candidates" / filename,
+        workspace_dir / "models" / "base" / filename,
+    ]
+    if from_weight == "full_sft":
+        search_candidates.append(workspace_dir / "models" / "base" / f"minimind3_{profile.hidden_size}{moe_suffix}.pth")
+
+    found: Path | None = None
+    for cand in search_candidates:
+        if cand.is_file():
+            found = cand
+            break
+    if found is None:
+        return None
+
+    target_out = repo_root / "out" / filename
+    if found.resolve() != target_out.resolve():
+        target_out.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target_out.with_name(f".{target_out.name}.{os.getpid()}.tmp")
+        try:
+            shutil.copy2(found, tmp)
+            os.replace(tmp, target_out)
+        finally:
+            if tmp.exists():
+                tmp.unlink(missing_ok=True)
+    return target_out
 
 
 def promote_lora_adapter(
@@ -220,34 +265,56 @@ def run_training_stage(
             dry_run=True,
         )
 
+    stage_from_weight_for_trainer(from_weight, repo_root, workspace_dir, profile)
+
     cwd = repo_root / "trainer" if stage in ("pretrain", "full_sft", "lora", "dpo") else repo_root
-    res = run_sandboxed(
+    trainer_env = os.environ.copy()
+    trainer_env["PYTHONPATH"] = str(repo_root) + (os.pathsep + trainer_env["PYTHONPATH"] if trainer_env.get("PYTHONPATH") else "")
+    trainer_env["PYTHONUNBUFFERED"] = "1"
+
+    t_proc0 = time.monotonic()
+    proc = subprocess.Popen(
         cmd,
-        cwd=cwd,
-        timeout_sec=float(profile.subprocess_timeout_sec),
-        memory_limit_mb=profile.max_subprocess_memory_mb,
-        file_size_limit_mb=profile.max_file_size_mb,
-        extra_env={"PYTHONPATH": str(repo_root)},
+        cwd=str(cwd),
+        env=trainer_env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
     )
-    combined_log = (res.stdout + "\n" + res.stderr).strip()
+    timed_out = False
+    try:
+        stdout, stderr = proc.communicate(timeout=float(profile.subprocess_timeout_sec))
+        returncode = proc.returncode
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        stdout, stderr = proc.communicate()
+        returncode = proc.returncode if proc.returncode is not None else -9
+
+    duration = round(time.monotonic() - t_proc0, 4)
+    combined_log = ((stdout or "") + "\n" + (stderr or "")).strip()
     tail_lines = "\n".join(combined_log.splitlines()[-40:])
     atomic_write_text(train_log, tail_lines + "\n")
 
     oom, nan = detect_log_anomalies(combined_log)
     final_loss = _extract_last_loss(combined_log)
-    ok = (not res.timed_out) and res.returncode == 0 and (not oom) and (not nan)
+    ok = (not timed_out) and returncode == 0 and (not oom) and (not nan)
     resume_guess = repo_root / "checkpoints" / f"{save_weight}_{profile.hidden_size}{'_moe' if profile.use_moe else ''}_resume.pth"
     return TrainingRunResult(
         stage=stage,
         ok=ok,
-        exit_code=res.returncode,
+        exit_code=returncode,
         output_weight_path=str(expected_out) if expected_out.is_file() else None,
         resume_ckpt_path=str(resume_guess) if resume_guess.is_file() else None,
         final_loss=final_loss,
         oom_detected=oom,
         nan_detected=nan,
-        timed_out=res.timed_out,
-        duration_sec=res.duration_sec,
+        timed_out=timed_out,
+        duration_sec=duration,
         log_tail=tail_lines,
         dry_run=False,
     )

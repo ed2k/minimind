@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from selfchange.kernel.budgets import ComputeProfile
@@ -80,6 +81,27 @@ def load_minimind_model(
     return model.to(device=profile.device, dtype=dtype).eval(), tokenizer
 
 
+def normalize_messages_for_template(conversations: list[dict]) -> tuple[list[dict], list[dict] | None]:
+    """Normalize SFTDataset JSON-string tools/tool_calls into Jinja-ready structures."""
+    messages: list[dict] = []
+    tools: list[dict] | None = None
+    for raw in conversations:
+        msg = dict(raw)
+        if msg.get("role") == "system" and msg.get("tools"):
+            raw_tools = msg.pop("tools")
+            tools = json.loads(raw_tools) if isinstance(raw_tools, str) else raw_tools
+        elif "tools" in msg and msg["tools"] is None:
+            msg.pop("tools")
+        if msg.get("tool_calls") and isinstance(msg["tool_calls"], str):
+            msg["tool_calls"] = json.loads(msg["tool_calls"])
+        elif "tool_calls" in msg and msg["tool_calls"] is None:
+            msg.pop("tool_calls")
+        if "reasoning_content" in msg and msg["reasoning_content"] is None:
+            msg.pop("reasoning_content")
+        messages.append(msg)
+    return messages, tools
+
+
 def generate_agent_reply(
     model,
     tokenizer,
@@ -93,17 +115,19 @@ def generate_agent_reply(
     """Render chat template and decode only newly generated response tokens."""
     import torch  # type: ignore[import-not-found]
 
+    norm_messages, extracted_tools = normalize_messages_for_template(messages)
+    effective_tools = tools if tools is not None else extracted_tools
     prompt_text = tokenizer.apply_chat_template(
-        messages,
+        norm_messages,
         tokenize=False,
         add_generation_prompt=True,
-        tools=tools or None,
+        tools=effective_tools or None,
         open_thinking=open_thinking,
     )
     inputs = tokenizer(prompt_text, return_tensors="pt", truncation=True).to(model.device)
     do_sample = temperature > 0.0
     gen_kwargs = {
-        "inputs": inputs["input_ids"],
+        "input_ids": inputs["input_ids"],
         "attention_mask": inputs["attention_mask"],
         "max_new_tokens": max_new_tokens,
         "do_sample": do_sample,

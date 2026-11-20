@@ -164,10 +164,19 @@ def _minimind_eval(
     num_tasks: int,
 ) -> tuple[dict, dict, dict]:
     import torch  # type: ignore[import-not-found]
-    from selfchange.training.model_loader import generate_agent_reply, load_minimind_model
+    from selfchange.training.model_loader import (
+        generate_agent_reply,
+        load_minimind_model,
+        normalize_messages_for_template,
+    )
 
     profile = get_profile(profile_name)
     model, tokenizer = load_minimind_model(model_path, tokenizer_path, profile)
+    eos_tok = tokenizer.eos_token or "<|im_end|>"
+    pad_tok = tokenizer.pad_token or "<|endoftext|>"
+
+    def _strip_special(text: str) -> str:
+        return text.replace(eos_tok, "").replace(pad_tok, "").strip()
 
     # Tier 1: held-out dialogue loss / PPL if heldout_path is provided
     losses: list[float] = []
@@ -175,7 +184,13 @@ def _minimind_eval(
         samples = [json.loads(ln) for ln in heldout_path.read_text(encoding="utf-8").splitlines() if ln.strip()][:32]
         with torch.no_grad():
             for sample in samples:
-                text = tokenizer.apply_chat_template(sample["conversations"], tokenize=False, add_generation_prompt=False)
+                norm_msgs, sample_tools = normalize_messages_for_template(sample["conversations"])
+                text = tokenizer.apply_chat_template(
+                    norm_msgs,
+                    tokenize=False,
+                    add_generation_prompt=False,
+                    tools=sample_tools or None,
+                )
                 enc = tokenizer(text, return_tensors="pt", truncation=True, max_length=profile.max_seq_len).to(profile.device)
                 out = model(enc["input_ids"], labels=enc["input_ids"])
                 if out.loss is not None and torch.isfinite(out.loss):
@@ -185,18 +200,21 @@ def _minimind_eval(
 
     # Tier 2: real MiniMind tool-call generation on compact fault prompts
     prompts = [
-        [{"role": "system", "content": "Diagnose OOM.", "tools": SELFCHANGE_TOOLS[:3]}, {"role": "user", "content": "fault=oom batch_size=8"}],
-        [{"role": "system", "content": "Diagnose NaN.", "tools": SELFCHANGE_TOOLS[:3]}, {"role": "user", "content": "fault=nan_loss lr=0.0002"}],
-        [{"role": "system", "content": "Read file.", "tools": SELFCHANGE_TOOLS[:5]}, {"role": "user", "content": "fault=syntax_or_test_error file=oom_helper.py line=1"}],
-        [{"role": "system", "content": "Rollback.", "tools": SELFCHANGE_TOOLS}, {"role": "user", "content": "fault=corrupt_checkpoint ancestor=anc_1"}],
+        ([{"role": "system", "content": "Diagnose OOM."}, {"role": "user", "content": "fault=oom batch_size=8"}], SELFCHANGE_TOOLS[:3]),
+        ([{"role": "system", "content": "Diagnose NaN."}, {"role": "user", "content": "fault=nan_loss lr=0.0002"}], SELFCHANGE_TOOLS[:3]),
+        ([{"role": "system", "content": "Read file."}, {"role": "user", "content": "fault=syntax_or_test_error file=oom_helper.py line=1"}], SELFCHANGE_TOOLS[:5]),
+        ([{"role": "system", "content": "Rollback."}, {"role": "user", "content": "fault=corrupt_checkpoint ancestor=anc_1"}], SELFCHANGE_TOOLS),
     ]
-    json_ok = schema_ok = tag_ok = eos_ok = 0
+    json_ok = schema_ok = tag_ok = eos_ok = non_empty = 0
     reps: list[float] = []
-    for msgs in prompts:
-        reply = generate_agent_reply(model, tokenizer, msgs, SELFCHANGE_TOOLS, max_new_tokens=96, temperature=0.0, top_p=1.0)
-        reps.append(compute_rep_penalty(reply))
-        if reply.strip():
+    for msgs, tools_arg in prompts:
+        raw_reply = generate_agent_reply(model, tokenizer, msgs, tools_arg, max_new_tokens=96, temperature=0.0, top_p=1.0)
+        if eos_tok in raw_reply:
             eos_ok += 1
+        reply = _strip_special(raw_reply)
+        reps.append(compute_rep_penalty(reply))
+        if reply:
+            non_empty += 1
         calls, errs = parse_tool_calls(reply)
         if errs == 0:
             tag_ok += 1
@@ -211,7 +229,7 @@ def _minimind_eval(
         "python_ppl": ppl,
         "eos_rate": round(eos_ok / len(prompts), 4),
         "mean_rep_penalty": round(sum(reps) / len(reps), 4),
-        "empty_rate": round(1.0 - eos_ok / len(prompts), 4),
+        "empty_rate": round(1.0 - non_empty / len(prompts), 4),
     }
     tier2 = {
         "json_parse_rate": round(json_ok / len(prompts), 4),
@@ -228,7 +246,7 @@ def _minimind_eval(
         broken_src, _fix = inject_ast_bug(clean_src, i % 5)
         numbered = "\n".join(f"{ln_no + 1}: {ln}" for ln_no, ln in enumerate(broken_src.splitlines()))
         msgs = [
-            {"role": "system", "content": "Fix bug with replace_line_range.", "tools": [SELFCHANGE_TOOLS[5]]},
+            {"role": "system", "content": "Fix bug with replace_line_range."},
             {"role": "user", "content": f"{fname}:\n{numbered}"},
         ]
         attempts = [generate_agent_reply(model, tokenizer, msgs, [SELFCHANGE_TOOLS[5]], 96, 0.0, 1.0)]
@@ -237,7 +255,8 @@ def _minimind_eval(
 
         solved_any = False
         valid_any = False
-        for k, rep in enumerate(attempts):
+        for k, raw_rep in enumerate(attempts):
+            rep = _strip_special(raw_rep)
             calls, _ = parse_tool_calls(rep)
             if not calls or calls[0]["name"] != "replace_line_range":
                 continue

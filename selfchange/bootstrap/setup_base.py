@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
+import shutil
 from pathlib import Path
 
 from selfchange.kernel.integrity import atomic_write_text
@@ -163,6 +165,7 @@ def download_minimind3(
     source: str = "huggingface",
     model_id: str = "jingyaogong/minimind-3",
     convert_to_pth: bool = True,
+    repo_root: Path | None = None,
 ) -> dict:
     """Download pretrained MiniMind-3 weights for Colab and optionally export native PyTorch .pth."""
     output_dir = Path(output_dir)
@@ -181,6 +184,7 @@ def download_minimind3(
         raise ValueError(f"Unsupported download source {source!r}")
 
     pth_path: str | None = None
+    out_full_sft_path: str | None = None
     if convert_to_pth:
         import torch  # type: ignore[import-not-found]
         from transformers import AutoModelForCausalLM  # type: ignore[import-not-found]
@@ -190,12 +194,26 @@ def download_minimind3(
         torch.save({k: v.cpu().half() for k, v in model.state_dict().items()}, out_pth)
         pth_path = str(out_pth)
 
+        if repo_root is not None:
+            out_dir = Path(repo_root).resolve() / "out"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            staged = out_dir / "full_sft_768.pth"
+            tmp = staged.with_name(f".{staged.name}.{os.getpid()}.tmp")
+            try:
+                shutil.copy2(out_pth, tmp)
+                os.replace(tmp, staged)
+            finally:
+                if tmp.exists():
+                    tmp.unlink(missing_ok=True)
+            out_full_sft_path = str(staged)
+
     meta = {
         "mode": "colab",
         "source": source,
         "model_id": model_id,
         "hf_dir": str(hf_dir),
         "weight_path": pth_path,
+        "staged_out_path": out_full_sft_path,
     }
     atomic_write_text(output_dir / "model_meta.json", json.dumps(meta, indent=2) + "\n")
     return meta
@@ -204,6 +222,7 @@ def download_minimind3(
 def main() -> int:
     parser = argparse.ArgumentParser(description="Setup base model and anchor datasets for selfchange")
     parser.add_argument("--mode", choices=["micro", "colab"], default="micro")
+    parser.add_argument("--repo-root", type=Path, default=Path("."))
     parser.add_argument("--output-dir", type=Path, default=Path("selfchange/workspace/models/base"))
     parser.add_argument("--source", choices=["huggingface", "modelscope"], default="huggingface")
     parser.add_argument("--model-id", type=str, default="jingyaogong/minimind-3")
@@ -214,15 +233,23 @@ def main() -> int:
     if args.mode == "micro":
         res = setup_micro_model(args.output_dir, seed=args.seed)
     else:
-        res = download_minimind3(args.output_dir, source=args.source, model_id=args.model_id)
+        res = download_minimind3(
+            args.output_dir,
+            source=args.source,
+            model_id=args.model_id,
+            repo_root=args.repo_root,
+        )
+        data_dir = args.output_dir / "data"
         if args.source_sft is not None and args.source_sft.is_file():
             split_res = build_anchor_split(
                 args.source_sft,
-                args.output_dir / "data" / "anchor_sft.jsonl",
-                args.output_dir / "data" / "heldout_eval.jsonl",
+                data_dir / "anchor_sft.jsonl",
+                data_dir / "heldout_eval.jsonl",
                 seed=args.seed,
             )
             res.update(split_res)
+        else:
+            res.update(build_synthetic_anchor_datasets(data_dir, train_count=400, heldout_count=60, seed=args.seed))
     print(json.dumps(res, indent=2))
     return 0
 
