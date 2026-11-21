@@ -214,6 +214,120 @@ def make_minimind_proposer(
     return MiniMindProposerSession(model_path, tokenizer_path, profile).propose
 
 
+def compute_baseline_quality(card: dict) -> float:
+    """Compute weighted [0, 1] quality score across all 4 capability tiers."""
+    t1 = card.get("tier1_language", {})
+    t2 = card.get("tier2_toolcall", {})
+    t3 = card.get("tier3_code_edit", {})
+    t4 = card.get("tier4_drills", {})
+    t1_s = 0.5 * float(t1.get("eos_rate", 0.0)) + 0.5 * max(0.0, 1.0 - 2.0 * float(t1.get("mean_rep_penalty", 0.5)))
+    t2_s = (
+        float(t2.get("json_parse_rate", 0.0))
+        + float(t2.get("schema_validity_rate", 0.0))
+        + float(t2.get("tag_balance_rate", 0.0))
+    ) / 3.0
+    t3_s = (
+        0.2 * float(t3.get("ast_valid_rate", 0.0))
+        + 0.4 * float(t3.get("pass_at_1", 0.0))
+        + 0.4 * float(t3.get("pass_at_4", 0.0))
+    )
+    t4_s = float(t4.get("pass_rate", 0.0))
+    return round(0.15 * t1_s + 0.25 * t2_s + 0.45 * t3_s + 0.15 * t4_s, 4)
+
+
+def _read_json_safe(path: Path) -> dict | None:
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def assess_run_improvement(
+    workspace_dir: Path,
+    start_champion: LineageNode | None,
+    end_champion: LineageNode | None,
+    min_delta: float = 1e-4,
+    resumed: bool = False,
+) -> dict:
+    """Decide whether fine-tuned weights should be persisted based on verified improvement."""
+    workspace_dir = Path(workspace_dir).resolve()
+    untouched = _read_json_safe(workspace_dir / "baseline_untouched.json")
+    prepared = _read_json_safe(workspace_dir / "baseline_prepared.json")
+    untouched_q = compute_baseline_quality(untouched) if untouched else None
+    prepared_q = compute_baseline_quality(prepared) if prepared else None
+
+    prepared_improved = False
+    if untouched is not None and prepared is not None and untouched_q is not None and prepared_q is not None:
+        eos_ok = float(prepared.get("tier1_language", {}).get("eos_rate", 0.0)) >= (
+            float(untouched.get("tier1_language", {}).get("eos_rate", 0.0)) - 0.05
+        )
+        schema_ok = float(prepared.get("tier2_toolcall", {}).get("schema_validity_rate", 0.0)) >= (
+            float(untouched.get("tier2_toolcall", {}).get("schema_validity_rate", 0.0)) - 0.05
+        )
+        prepared_improved = (prepared_q > untouched_q + min_delta) and eos_ok and schema_ok
+    if resumed and start_champion is not None:
+        prepared_improved = False
+
+    if end_champion is None:
+        cycle_improved = False
+    elif start_champion is None:
+        cycle_improved = True
+    else:
+        cap_improved = (
+            end_champion.eval_score > start_champion.eval_score + min_delta
+            or end_champion.survival_score > start_champion.survival_score + min_delta
+            or end_champion.self_repair_score > start_champion.self_repair_score + min_delta
+        )
+        cap_non_regressed = (
+            end_champion.eval_score >= start_champion.eval_score - min_delta
+            and end_champion.survival_score >= start_champion.survival_score - min_delta
+            and end_champion.self_repair_score >= start_champion.self_repair_score - min_delta
+        )
+        artifact_changed = (
+            end_champion.weight_path != start_champion.weight_path
+            or end_champion.commit_sha != start_champion.commit_sha
+        )
+        cycle_improved = bool(
+            cap_improved
+            or (artifact_changed and cap_non_regressed and end_champion.total_score > start_champion.total_score + min_delta)
+        )
+
+    raw_weight = end_champion.weight_path if end_champion else None
+    resolved_weight: Path | None = None
+    if raw_weight:
+        cand_w = Path(raw_weight)
+        resolved_weight = cand_w if cand_w.is_absolute() else (workspace_dir / cand_w)
+    has_weight = bool(resolved_weight is not None and resolved_weight.is_file())
+
+    improved = bool(cycle_improved or prepared_improved)
+    persist_weights = bool(improved and has_weight)
+    if persist_weights:
+        reason = "autonomous_cycle_improved" if cycle_improved else "bootstrap_prepared_improved"
+    elif improved:
+        reason = "improved_but_no_weight_file"
+    else:
+        reason = "no_improvement_over_baseline"
+
+    return {
+        "improved": improved,
+        "persist_weights": persist_weights,
+        "reason": reason,
+        "resumed": resumed,
+        "cycle_improved": cycle_improved,
+        "prepared_improved": prepared_improved,
+        "champion_weight_path": str(resolved_weight) if resolved_weight else None,
+        "start_eval_score": start_champion.eval_score if start_champion else None,
+        "end_eval_score": end_champion.eval_score if end_champion else None,
+        "start_total_score": start_champion.total_score if start_champion else None,
+        "end_total_score": end_champion.total_score if end_champion else None,
+        "untouched_quality": untouched_q,
+        "prepared_quality": prepared_q,
+    }
+
+
 def generate_run_report(workspace_dir: Path) -> Path:
     """Write a concise Markdown report summarizing session config, baselines, lineage, and training."""
     workspace_dir = Path(workspace_dir).resolve()
@@ -251,6 +365,12 @@ def generate_run_report(workspace_dir: Path) -> Path:
                 f"- **Eval With Model**: `{session_info.get('eval_with_model')}` | **Anchor Path**: `{session_info.get('anchor_path')}`",
             ]
         )
+        dec = session_info.get("persistence_decision")
+        if isinstance(dec, dict):
+            lines.append(
+                f"- **Weight Persistence**: `persist_weights={dec.get('persist_weights')}` | "
+                f"`improved={dec.get('improved')}` | reason=`{dec.get('reason')}`"
+            )
 
     baseline_entries = [
         ("Untouched", workspace_dir / "baseline_untouched.json"),
@@ -342,6 +462,7 @@ def launch_colab_session(
     anchor_path: Path | None = None,
     eval_with_model: bool = False,
     extra_eval_fn=None,
+    persist_only_if_improved: bool = True,
 ) -> dict:
     """Re-entrant Colab session bootstrap: restore Drive -> run cycles -> report -> sync Drive."""
     repo_root = Path(repo_root).resolve()
@@ -417,6 +538,7 @@ def launch_colab_session(
         "anchor_path": str(resolved_anchor) if resolved_anchor else None,
         "require_model": require_model,
         "dry_run": dry_run,
+        "persist_only_if_improved": persist_only_if_improved,
     }
     atomic_write_text(workspace_dir / "session_info.json", json.dumps(session_info, indent=2, ensure_ascii=False) + "\n")
 
@@ -474,10 +596,26 @@ def launch_colab_session(
             )
         )
 
-    def _on_cycle_end(_st, _out) -> None:
+    start_champion = runner.registry.get_champion()
+
+    def _persist_and_sync() -> dict:
+        decision = assess_run_improvement(
+            workspace_dir,
+            start_champion=start_champion,
+            end_champion=runner.registry.get_champion(),
+            resumed=bool(restore_info.get("restored")),
+        )
+        session_info["updated_at"] = datetime.now(timezone.utc).isoformat()
+        session_info["persistence_decision"] = decision
+        atomic_write_text(
+            workspace_dir / "session_info.json",
+            json.dumps(session_info, indent=2, ensure_ascii=False) + "\n",
+        )
         generate_run_report(workspace_dir)
         if drive_sync is not None:
-            drive_sync.sync_to_drive(repo_root / "selfchange" / "mutable")
+            sync_weights = True if not persist_only_if_improved else bool(decision["persist_weights"])
+            drive_sync.sync_to_drive(repo_root / "selfchange" / "mutable", include_weights=sync_weights)
+        return decision
 
     sup = Supervisor(
         repo_root=repo_root,
@@ -487,14 +625,13 @@ def launch_colab_session(
         kernel_dir=kdir,
         manifest_path=mpath,
         register_signals=False,
-        on_cycle_end=_on_cycle_end,
+        on_cycle_end=lambda _st, _out: _persist_and_sync(),
     )
     sup.load_state()
     final_state = sup.run(max_cycles=max_cycles)
 
-    report_path = generate_run_report(workspace_dir)
-    if drive_sync is not None:
-        drive_sync.sync_to_drive(repo_root / "selfchange" / "mutable")
+    persistence_decision = _persist_and_sync()
+    report_path = workspace_dir / "report.md"
     champ = runner.registry.get_champion()
     return {
         "restore": restore_info,
@@ -502,6 +639,7 @@ def launch_colab_session(
         "active_model_path": str(resolved_model) if resolved_model else None,
         "model_source": model_source,
         "eval_with_model": bool(extra_eval_fn is not None),
+        "persistence_decision": persistence_decision,
         "state": asdict(final_state),
         "champion": champ.to_dict() if champ else None,
         "report_path": str(report_path),
@@ -522,6 +660,7 @@ def main() -> int:
     parser.add_argument("--train-every-n-cycles", type=int, default=3)
     parser.add_argument("--require-model", action="store_true")
     parser.add_argument("--eval-with-model", action="store_true")
+    parser.add_argument("--always-persist-weights", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -539,6 +678,7 @@ def main() -> int:
         require_model=args.require_model,
         anchor_path=args.anchor_path,
         eval_with_model=args.eval_with_model,
+        persist_only_if_improved=not args.always_persist_weights,
     )
     print(json.dumps(res, indent=2))
     return 0

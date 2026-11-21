@@ -12,6 +12,12 @@ from selfchange.bootstrap.midtrain_code import build_midtrain_corpus
 from selfchange.bootstrap.offline_rft_dpo import collect_offline_rollouts, run_offline_rft_dpo_round
 from selfchange.bootstrap.setup_base import build_anchor_split, setup_micro_model
 from selfchange.bootstrap.warmstart_sft import run_warmstart_curriculum
+from selfchange.colab.run_colab_cli import (
+    build_remote_phase_scripts,
+    inspect_resume_seed,
+    persist_improved_weights_from_colab,
+    run_colab_cli_pipeline,
+)
 from selfchange.kernel.budgets import get_profile
 from selfchange.training.model_loader import normalize_messages_for_template, restore_open_thinking_prefix
 from selfchange.training.self_train_runner import (
@@ -216,6 +222,203 @@ class TestBootstrapPipeline(unittest.TestCase):
             self.assertEqual(restore_open_thinking_prefix("check</think>\nok", True), "<think>\ncheck</think>\nok")
             self.assertEqual(restore_open_thinking_prefix("<think>\ncheck</think>", True), "<think>\ncheck</think>")
             self.assertEqual(restore_open_thinking_prefix("plain reply", False), "plain reply")
+
+    def test_run_colab_cli_conditional_persistence_and_script_generation(self) -> None:
+        import ast
+
+        scripts = build_remote_phase_scripts(branch="mychanges", total_traces=120, max_cycles=3)
+        self.assertEqual(set(scripts.keys()), {"step1_setup.py", "step2_bootstrap.py", "step3_autonomous.py"})
+        for src in scripts.values():
+            ast.parse(src)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            diag_no = tmp_path / "diag_no"
+            diag_no.mkdir()
+            (diag_no / "session_info.json").write_text(
+                json.dumps({"persistence_decision": {"improved": False, "persist_weights": False, "reason": "no_improvement_over_baseline", "champion_weight_path": "/content/w.pth"}}),
+                encoding="utf-8",
+            )
+            (diag_no / "manifest.json").write_text(
+                json.dumps({"weight_rel_map": {"weights/w_768.pth": "models/candidates/w_768.pth"}}),
+                encoding="utf-8",
+            )
+            called_cmds: list[list[str]] = []
+
+            def _mock_run(cmd, **_kwargs):
+                called_cmds.append(cmd)
+                if len(cmd) >= 5 and cmd[:2] == ["colab", "download"]:
+                    Path(cmd[5]).write_bytes(b"PT_GOOD")
+                return type("Proc", (), {"returncode": 0, "stdout": "{}"})()
+
+            res_no = persist_improved_weights_from_colab(
+                session="sess",
+                diagnostics_dir=diag_no,
+                promoted_dir=tmp_path / "promoted_no",
+                run_id="run_1",
+                run_cmd=_mock_run,
+            )
+            self.assertFalse(res_no["persisted"])
+            self.assertEqual(called_cmds, [])
+
+            diag_yes = tmp_path / "diag_yes"
+            diag_yes.mkdir()
+            (diag_yes / "session_info.json").write_text(
+                json.dumps({"persistence_decision": {"improved": True, "persist_weights": True, "reason": "autonomous_cycle_improved", "champion_weight_path": "/content/w_768.pth"}}),
+                encoding="utf-8",
+            )
+            (diag_yes / "manifest.json").write_text(
+                json.dumps({"weight_rel_map": {"weights/w_768.pth": "models/candidates/w_768.pth"}}),
+                encoding="utf-8",
+            )
+            promoted_yes = tmp_path / "promoted_yes"
+            res_yes = persist_improved_weights_from_colab(
+                session="sess",
+                diagnostics_dir=diag_yes,
+                promoted_dir=promoted_yes,
+                run_id="run_2",
+                run_cmd=_mock_run,
+            )
+            self.assertTrue(res_yes["persisted"])
+            self.assertEqual(len(called_cmds), 1)
+            self.assertEqual(called_cmds[0][:3], ["colab", "download", "-s"])
+            self.assertTrue((promoted_yes / "run_2" / "w_768.pth").is_file())
+            self.assertTrue((promoted_yes / "latest_champion.json").is_file())
+
+    def test_run_colab_cli_resume_seeding_and_skip_bootstrap(self) -> None:
+        import ast
+        import tarfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            ws = tmp_path / "ws"
+            promoted = ws / "promoted_models"
+            self.assertEqual(inspect_resume_seed(promoted)["mode"], "none")
+
+            # Seed prior diagnostics + promoted binary weight -> full_mirror mode
+            diag = tmp_path / "prev_diag"
+            (diag / "logs").mkdir(parents=True)
+            (diag / "archive.jsonl").write_text('{"node_id": "n1"}\n', encoding="utf-8")
+            (diag / "champion.json").write_text('{"champion": {"node_id": "n1"}}\n', encoding="utf-8")
+            (diag / "logs" / "train.log").write_text("loss: 0.2\n", encoding="utf-8")
+            (diag / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "files": {
+                            "archive.jsonl": "h1",
+                            "champion.json": "h2",
+                            "logs/train.log": "h3",
+                            "weights/cand_768.pth": "h4",
+                        },
+                        "weight_rel_map": {"weights/cand_768.pth": "models/candidates/cand_768.pth"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (promoted / "run_prev").mkdir(parents=True)
+            w_prev = promoted / "run_prev" / "cand_768.pth"
+            w_prev.write_bytes(b"PT_PREV")
+            (promoted / "latest_champion.json").write_text(
+                json.dumps(
+                    {
+                        "run_id": "run_prev",
+                        "diagnostics_dir": str(diag),
+                        "primary_weight": str(w_prev),
+                        "weights": [str(w_prev)],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            plan_full = inspect_resume_seed(promoted)
+            self.assertEqual(plan_full["mode"], "full_mirror")
+            self.assertEqual(len(plan_full["weight_uploads"]), 1)
+
+            def _make_mock_runner():
+                recorded: list[list[str]] = []
+
+                def _mock_run(cmd, **_kwargs):
+                    recorded.append(cmd)
+                    if len(cmd) >= 5 and cmd[:2] == ["colab", "exec"] and cmd[-2] == "-f":
+                        ast.parse(Path(cmd[-1]).read_text(encoding="utf-8"))
+                    if len(cmd) >= 5 and cmd[:2] == ["colab", "download"] and cmd[4] == "/content/run_diagnostics.tar.gz":
+                        out_tar = Path(cmd[5])
+                        out_tar.parent.mkdir(parents=True, exist_ok=True)
+                        stub_dir = tmp_path / "stub_tar"
+                        stub_dir.mkdir(exist_ok=True)
+                        (stub_dir / "session_info.json").write_text(
+                            json.dumps({"persistence_decision": {"improved": False, "persist_weights": False, "reason": "no_improvement_over_baseline"}}),
+                            encoding="utf-8",
+                        )
+                        with tarfile.open(out_tar, "w:gz") as tf:
+                            tf.add(stub_dir / "session_info.json", arcname="session_info.json")
+                    return type("Proc", (), {"returncode": 0, "stdout": "{}"})()
+
+                return recorded, _mock_run
+
+            # 1) resume=True, skip_bootstrap_on_resume=True -> uploads seed tar + .pth, skips step2_bootstrap.py, stops VM
+            cmds1, runner1 = _make_mock_runner()
+            res1 = run_colab_cli_pipeline(
+                session="sess1",
+                workspace_dir=ws,
+                resume=True,
+                skip_bootstrap_on_resume=True,
+                run_cmd=runner1,
+            )
+            self.assertTrue(res1["bootstrap_skipped"])
+            self.assertTrue(res1["resume_seed"]["seeded"])
+            self.assertEqual(res1["resume_seed"]["mode"], "full_mirror")
+            uploads1 = [c for c in cmds1 if c[:2] == ["colab", "upload"]]
+            self.assertTrue(any(c[5] == "/content/seed_mirror_state.tar.gz" for c in uploads1))
+            self.assertTrue(any(c[5] == "/content/drive_mirror/weights/cand_768.pth" for c in uploads1))
+            exec_scripts1 = [Path(c[-1]).name for c in cmds1 if c[:2] == ["colab", "exec"] and c[-2] == "-f"]
+            self.assertEqual(exec_scripts1, ["step1_setup.py", "step_unpack_seed.py", "step3_autonomous.py"])
+            self.assertEqual(cmds1[-1], ["colab", "stop", "-s", "sess1"])
+
+            # 2) resume=True, skip_bootstrap_on_resume=False -> seeds VM AND still runs step2_bootstrap.py
+            cmds2, runner2 = _make_mock_runner()
+            res2 = run_colab_cli_pipeline(
+                session="sess2",
+                workspace_dir=ws,
+                resume=True,
+                skip_bootstrap_on_resume=False,
+                run_cmd=runner2,
+            )
+            self.assertFalse(res2["bootstrap_skipped"])
+            self.assertTrue(res2["resume_seed"]["seeded"])
+            exec_scripts2 = [Path(c[-1]).name for c in cmds2 if c[:2] == ["colab", "exec"] and c[-2] == "-f"]
+            self.assertEqual(exec_scripts2, ["step1_setup.py", "step_unpack_seed.py", "step2_bootstrap.py", "step3_autonomous.py"])
+
+            # 3) resume=False -> no uploads, runs full step1 -> step2 -> step3
+            cmds3, runner3 = _make_mock_runner()
+            res3 = run_colab_cli_pipeline(
+                session="sess3",
+                workspace_dir=ws,
+                resume=False,
+                run_cmd=runner3,
+            )
+            self.assertFalse(res3["bootstrap_skipped"])
+            self.assertEqual([c for c in cmds3 if c[:2] == ["colab", "upload"]], [])
+            exec_scripts3 = [Path(c[-1]).name for c in cmds3 if c[:2] == ["colab", "exec"] and c[-2] == "-f"]
+            self.assertEqual(exec_scripts3, ["step1_setup.py", "step2_bootstrap.py", "step3_autonomous.py"])
+
+            # 4) Missing manifest falls back cleanly to weight_only seeding with explicit --model-path in step3
+            (diag / "manifest.json").unlink()
+            plan_wo = inspect_resume_seed(promoted)
+            self.assertEqual(plan_wo["mode"], "weight_only")
+            cmds4, runner4 = _make_mock_runner()
+            res4 = run_colab_cli_pipeline(
+                session="sess4",
+                workspace_dir=ws,
+                resume=True,
+                skip_bootstrap_on_resume=True,
+                run_cmd=runner4,
+            )
+            self.assertEqual(res4["resume_seed"]["mode"], "weight_only")
+            uploads4 = [c for c in cmds4 if c[:2] == ["colab", "upload"]]
+            self.assertTrue(any(c[5].endswith("/cand_768.pth") for c in uploads4))
+            step3_file = [Path(c[-1]) for c in cmds4 if c[:2] == ["colab", "exec"] and Path(c[-1]).name == "step3_autonomous.py"][0]
+            self.assertIn("--model-path", step3_file.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

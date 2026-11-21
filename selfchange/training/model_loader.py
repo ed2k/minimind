@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
 from selfchange.kernel.budgets import ComputeProfile
+from selfchange.kernel.integrity import atomic_write_text
 
 _ALL_TARGET_SUFFIXES = ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj")
 
@@ -17,6 +19,85 @@ def resolve_torch_dtype(profile: ComputeProfile):
     if profile.dtype == "bfloat16" and "cuda" in profile.device:
         return torch.bfloat16
     return torch.float32
+
+
+def estimate_minimind_params(
+    hidden_size: int = 768,
+    num_hidden_layers: int = 8,
+    intermediate_size: int | None = None,
+    num_attention_heads: int = 8,
+    num_key_value_heads: int = 4,
+    vocab_size: int = 6400,
+    use_moe: bool = False,
+    num_experts: int = 4,
+    tie_word_embeddings: bool = True,
+) -> dict:
+    """Compute exact parameter count and memory footprint for any MiniMindConfig shape without PyTorch."""
+    eff_inter = intermediate_size if intermediate_size is not None else math.ceil(hidden_size * math.pi / 64) * 64
+    head_dim = hidden_size // num_attention_heads
+    embed = vocab_size * hidden_size
+    lm_head = 0 if tie_word_embeddings else vocab_size * hidden_size
+    attn_layer = (
+        hidden_size * (num_attention_heads * head_dim)
+        + 2 * hidden_size * (num_key_value_heads * head_dim)
+        + (num_attention_heads * head_dim) * hidden_size
+        + 2 * head_dim
+    )
+    block_norms = 2 * hidden_size
+    mlp_single = 3 * hidden_size * eff_inter
+    if use_moe:
+        router = hidden_size * num_experts
+        mlp_layer = router + num_experts * mlp_single
+        mlp_active = router + mlp_single
+    else:
+        mlp_layer = mlp_single
+        mlp_active = mlp_single
+    total = embed + lm_head + num_hidden_layers * (attn_layer + block_norms + mlp_layer) + hidden_size
+    active = embed + lm_head + num_hidden_layers * (attn_layer + block_norms + mlp_active) + hidden_size
+    attn_total = num_hidden_layers * attn_layer
+    mlp_total = num_hidden_layers * mlp_layer
+    return {
+        "hidden_size": hidden_size,
+        "num_hidden_layers": num_hidden_layers,
+        "intermediate_size": eff_inter,
+        "num_attention_heads": num_attention_heads,
+        "num_key_value_heads": num_key_value_heads,
+        "vocab_size": vocab_size,
+        "use_moe": bool(use_moe),
+        "total_params": total,
+        "active_params": active,
+        "fp32_mb": round(total * 4 / 1e6, 2),
+        "fp16_mb": round(total * 2 / 1e6, 2),
+        "int8_mb": round(total / 1e6, 2),
+        "int4_mb": round(total * 0.55 / 1e6, 2),
+        "embed_ratio": round(embed / max(1, total), 4),
+        "attn_ratio": round(attn_total / max(1, total), 4),
+        "mlp_ratio": round(mlp_total / max(1, total), 4),
+    }
+
+
+def save_model_config(path: Path, arch: dict) -> Path:
+    """Persist compact MiniMind architecture config atomically alongside checkpoints."""
+    target = Path(path)
+    atomic_write_text(target, json.dumps(arch, indent=2, ensure_ascii=False) + "\n")
+    return target
+
+
+def load_model_config(path_or_weight: Path | None) -> dict | None:
+    """Resolve model architecture metadata from an explicit JSON, sibling .config.json, or model_config.json."""
+    if path_or_weight is None:
+        return None
+    p = Path(path_or_weight)
+    candidates = [p] if p.suffix == ".json" else [p.with_suffix(".config.json"), p.parent / "model_config.json"]
+    for cand in candidates:
+        if cand.is_file():
+            try:
+                data = json.loads(cand.read_text(encoding="utf-8"))
+                if isinstance(data, dict) and "hidden_size" in data:
+                    return data
+            except Exception:
+                pass
+    return None
 
 
 def apply_extended_lora(
@@ -55,19 +136,38 @@ def load_minimind_model(
     lora_path: Path | None = None,
     lora_rank: int = 16,
     target_all_linear: bool = False,
+    intermediate_size: int | None = None,
+    num_attention_heads: int | None = None,
+    num_key_value_heads: int | None = None,
+    model_config: dict | None = None,
+    quantize_int8: bool = False,
 ):
-    """Load MiniMindForCausalLM and AutoTokenizer with profile-safe device and precision."""
+    """Load MiniMindForCausalLM and AutoTokenizer with profile-safe device, custom widths, and optional INT8."""
     import torch  # type: ignore[import-not-found]
     from transformers import AutoTokenizer  # type: ignore[import-not-found]
     from model.model_lora import load_lora  # type: ignore[import-not-found]
     from model.model_minimind import MiniMindConfig, MiniMindForCausalLM  # type: ignore[import-not-found]
 
+    eff_cfg = dict(model_config) if model_config else (load_model_config(weight_path) or {})
+    hs = hidden_size if hidden_size is not None else int(eff_cfg.get("hidden_size", profile.hidden_size))
+    nl = num_hidden_layers if num_hidden_layers is not None else int(eff_cfg.get("num_hidden_layers", profile.num_hidden_layers))
+    um = bool(use_moe) if use_moe is not None else bool(eff_cfg.get("use_moe", profile.use_moe))
+    inter = intermediate_size if intermediate_size is not None else eff_cfg.get("intermediate_size")
+    nh = num_attention_heads if num_attention_heads is not None else eff_cfg.get("num_attention_heads")
+    nkv = num_key_value_heads if num_key_value_heads is not None else eff_cfg.get("num_key_value_heads")
+
+    extra_kwargs = {
+        k: int(v)
+        for k, v in [("intermediate_size", inter), ("num_attention_heads", nh), ("num_key_value_heads", nkv)]
+        if v is not None
+    }
     tokenizer = AutoTokenizer.from_pretrained(str(tokenizer_path))
     cfg = MiniMindConfig(
-        hidden_size=profile.hidden_size if hidden_size is None else hidden_size,
-        num_hidden_layers=profile.num_hidden_layers if num_hidden_layers is None else num_hidden_layers,
-        use_moe=profile.use_moe if use_moe is None else bool(use_moe),
+        hidden_size=hs,
+        num_hidden_layers=nl,
+        use_moe=um,
         max_seq_len=profile.max_total_len,
+        **extra_kwargs,
     )
     model = MiniMindForCausalLM(cfg)
     if weight_path is not None and Path(weight_path).is_file():
@@ -78,7 +178,13 @@ def load_minimind_model(
         load_lora(model, str(lora_path))
 
     dtype = resolve_torch_dtype(profile)
-    return model.to(device=profile.device, dtype=dtype).eval(), tokenizer
+    model = model.to(device=profile.device, dtype=dtype).eval()
+    if quantize_int8 and "cpu" in profile.device:
+        try:
+            model = torch.ao.quantization.quantize_dynamic(model, {torch.nn.Linear}, dtype=torch.qint8)
+        except Exception:
+            pass
+    return model, tokenizer
 
 
 def normalize_messages_for_template(conversations: list[dict]) -> tuple[list[dict], list[dict] | None]:

@@ -13,6 +13,7 @@ from pathlib import Path
 
 from selfchange.kernel.budgets import ComputeProfile
 from selfchange.kernel.integrity import atomic_write_text
+from selfchange.training.model_loader import estimate_minimind_params, load_model_config, save_model_config
 
 
 @dataclass
@@ -119,20 +120,36 @@ def write_dpo_jsonl(path: Path, rows: list[dict]) -> int:
     return len(formatted)
 
 
+def _resolve_arch(profile: ComputeProfile, model_config: dict | None = None) -> dict:
+    cfg = dict(model_config) if model_config else {}
+    return estimate_minimind_params(
+        hidden_size=int(cfg.get("hidden_size", profile.hidden_size)),
+        num_hidden_layers=int(cfg.get("num_hidden_layers", profile.num_hidden_layers)),
+        intermediate_size=int(cfg["intermediate_size"]) if cfg.get("intermediate_size") is not None else None,
+        num_attention_heads=int(cfg.get("num_attention_heads", 8)),
+        num_key_value_heads=int(cfg.get("num_key_value_heads", 4)),
+        use_moe=bool(cfg.get("use_moe", profile.use_moe)),
+    )
+
+
 def stage_from_weight_for_trainer(
     from_weight: str,
     repo_root: Path,
     workspace_dir: Path,
     profile: ComputeProfile,
     from_weight_path: Path | None = None,
+    model_config: dict | None = None,
 ) -> Path | None:
     """Locate from_weight across explicit path/workspace/out and stage into repo_root/out for trainer/*.py."""
     if not from_weight or from_weight == "none":
         return None
     repo_root = Path(repo_root).resolve()
     workspace_dir = Path(workspace_dir).resolve()
-    moe_suffix = "_moe" if profile.use_moe else ""
-    filename = f"{from_weight}_{profile.hidden_size}{moe_suffix}.pth"
+    eff_cfg = model_config or (load_model_config(from_weight_path) if from_weight_path else None) or {}
+    hs = int(eff_cfg.get("hidden_size", profile.hidden_size))
+    um = bool(eff_cfg.get("use_moe", profile.use_moe))
+    moe_suffix = "_moe" if um else ""
+    filename = f"{from_weight}_{hs}{moe_suffix}.pth"
 
     search_candidates: list[Path] = []
     if from_weight_path is not None:
@@ -145,7 +162,7 @@ def stage_from_weight_for_trainer(
         ]
     )
     if from_weight == "full_sft":
-        search_candidates.append(workspace_dir / "models" / "base" / f"minimind3_{profile.hidden_size}{moe_suffix}.pth")
+        search_candidates.append(workspace_dir / "models" / "base" / f"minimind3_{hs}{moe_suffix}.pth")
 
     found: Path | None = None
     for cand in search_candidates:
@@ -177,6 +194,10 @@ def promote_lora_adapter(
     use_moe: bool = False,
     lora_rank: int = 16,
     target_all_linear: bool = False,
+    intermediate_size: int | None = None,
+    num_attention_heads: int | None = None,
+    num_key_value_heads: int | None = None,
+    model_config: dict | None = None,
 ) -> Path:
     """Atomically merge a verified LoRA adapter into base weights using model/model_lora.py."""
     import torch  # type: ignore[import-not-found]
@@ -184,8 +205,21 @@ def promote_lora_adapter(
     from model.model_minimind import MiniMindConfig, MiniMindForCausalLM  # type: ignore[import-not-found]
     from selfchange.training.model_loader import apply_extended_lora
 
+    eff_cfg = dict(model_config) if model_config else (load_model_config(base_weight) or {})
+    hs = int(eff_cfg.get("hidden_size", hidden_size))
+    nl = int(eff_cfg.get("num_hidden_layers", num_hidden_layers))
+    um = bool(eff_cfg.get("use_moe", use_moe))
+    inter = intermediate_size if intermediate_size is not None else eff_cfg.get("intermediate_size")
+    nh = num_attention_heads if num_attention_heads is not None else eff_cfg.get("num_attention_heads")
+    nkv = num_key_value_heads if num_key_value_heads is not None else eff_cfg.get("num_key_value_heads")
+    extra_kwargs = {
+        k: int(v)
+        for k, v in [("intermediate_size", inter), ("num_attention_heads", nh), ("num_key_value_heads", nkv)]
+        if v is not None
+    }
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    cfg = MiniMindConfig(hidden_size=hidden_size, num_hidden_layers=num_hidden_layers, use_moe=bool(use_moe))
+    cfg = MiniMindConfig(hidden_size=hs, num_hidden_layers=nl, use_moe=um, **extra_kwargs)
     model = MiniMindForCausalLM(cfg).to(device)
     model.load_state_dict(torch.load(str(base_weight), map_location=device), strict=False)
     apply_extended_lora(model, rank=lora_rank, target_all_linear=target_all_linear)
@@ -199,6 +233,17 @@ def promote_lora_adapter(
     finally:
         if tmp_out.exists():
             tmp_out.unlink(missing_ok=True)
+    save_model_config(
+        merged_out.with_suffix(".config.json"),
+        estimate_minimind_params(
+            hidden_size=hs,
+            num_hidden_layers=nl,
+            intermediate_size=cfg.intermediate_size,
+            num_attention_heads=cfg.num_attention_heads,
+            num_key_value_heads=cfg.num_key_value_heads,
+            use_moe=um,
+        ),
+    )
     return merged_out
 
 
@@ -212,13 +257,19 @@ def build_trainer_command(
     profile: ComputeProfile,
     training_cfg: dict,
     from_resume: bool = False,
+    model_config: dict | None = None,
 ) -> tuple[list[str], Path]:
     """Construct profile-aware trainer command and expected output checkpoint path."""
     repo_root = Path(repo_root).resolve()
     save_dir = Path(save_dir).resolve()
     data_path = Path(data_path).resolve()
-    moe_suffix = "_moe" if profile.use_moe else ""
-    out_weight = save_dir / f"{save_weight}_{profile.hidden_size}{moe_suffix}.pth"
+
+    raw_cfg = model_config if model_config is not None else (training_cfg.get("model_config") if isinstance(training_cfg.get("model_config"), dict) else None)
+    hs = int(raw_cfg["hidden_size"]) if (raw_cfg and raw_cfg.get("hidden_size") is not None) else profile.hidden_size
+    nl = int(raw_cfg["num_hidden_layers"]) if (raw_cfg and raw_cfg.get("num_hidden_layers") is not None) else profile.num_hidden_layers
+    um = bool(raw_cfg.get("use_moe", profile.use_moe)) if raw_cfg else profile.use_moe
+    moe_suffix = "_moe" if um else ""
+    out_weight = save_dir / f"{save_weight}_{hs}{moe_suffix}.pth"
 
     lr = str(training_cfg.get("learning_rate", 5e-5))
     bs = str(training_cfg.get("batch_size", profile.batch_size))
@@ -227,6 +278,57 @@ def build_trainer_command(
     grad_clip = str(training_cfg.get("grad_clip", 1.0))
     acc = str(training_cfg.get("accumulation_steps", 1))
     resume_flag = "1" if from_resume else "0"
+
+    if stage == "distill":
+        t_cfg = training_cfg.get("teacher_config") if isinstance(training_cfg.get("teacher_config"), dict) else {}
+        t_hs = str(int(t_cfg.get("hidden_size", profile.hidden_size)))
+        t_nl = str(int(t_cfg.get("num_hidden_layers", profile.num_hidden_layers)))
+        t_um = "1" if bool(t_cfg.get("use_moe", profile.use_moe)) else "0"
+        from_student = str(training_cfg.get("from_student_weight", from_weight if from_weight else "none"))
+        from_teacher = str(training_cfg.get("from_teacher_weight", "full_sft"))
+        alpha = str(training_cfg.get("distill_alpha", 0.5))
+        temp = str(training_cfg.get("distill_temperature", 1.5))
+        cmd = [
+            sys.executable,
+            str(repo_root / "trainer" / "train_distillation.py"),
+            "--save_dir", str(save_dir),
+            "--save_weight", save_weight,
+            "--epochs", epochs,
+            "--batch_size", bs,
+            "--learning_rate", lr,
+            "--device", profile.device,
+            "--dtype", profile.dtype,
+            "--num_workers", str(profile.num_workers),
+            "--accumulation_steps", acc,
+            "--grad_clip", grad_clip,
+            "--max_seq_len", seq,
+            "--data_path", str(data_path),
+            "--student_hidden_size", str(hs),
+            "--student_num_layers", str(nl),
+            "--student_use_moe", "1" if um else "0",
+            "--teacher_hidden_size", t_hs,
+            "--teacher_num_layers", t_nl,
+            "--teacher_use_moe", t_um,
+            "--from_student_weight", from_student,
+            "--from_teacher_weight", from_teacher,
+            "--from_resume", resume_flag,
+            "--alpha", alpha,
+            "--temperature", temp,
+        ]
+        if raw_cfg:
+            if raw_cfg.get("intermediate_size") is not None:
+                cmd.extend(["--student_intermediate_size", str(int(raw_cfg["intermediate_size"]))])
+            if raw_cfg.get("num_attention_heads") is not None:
+                cmd.extend(["--student_num_attention_heads", str(int(raw_cfg["num_attention_heads"]))])
+            if raw_cfg.get("num_key_value_heads") is not None:
+                cmd.extend(["--student_num_key_value_heads", str(int(raw_cfg["num_key_value_heads"]))])
+        if t_cfg.get("intermediate_size") is not None:
+            cmd.extend(["--teacher_intermediate_size", str(int(t_cfg["intermediate_size"]))])
+        if t_cfg.get("num_attention_heads") is not None:
+            cmd.extend(["--teacher_num_attention_heads", str(int(t_cfg["num_attention_heads"]))])
+        if t_cfg.get("num_key_value_heads") is not None:
+            cmd.extend(["--teacher_num_key_value_heads", str(int(t_cfg["num_key_value_heads"]))])
+        return cmd, out_weight
 
     common = [
         "--save_dir", str(save_dir),
@@ -237,14 +339,21 @@ def build_trainer_command(
         "--num_workers", str(profile.num_workers),
         "--accumulation_steps", acc,
         "--grad_clip", grad_clip,
-        "--hidden_size", str(profile.hidden_size),
-        "--num_hidden_layers", str(profile.num_hidden_layers),
+        "--hidden_size", str(hs),
+        "--num_hidden_layers", str(nl),
         "--max_seq_len", seq,
-        "--use_moe", "1" if profile.use_moe else "0",
+        "--use_moe", "1" if um else "0",
         "--data_path", str(data_path),
         "--from_weight", from_weight,
         "--from_resume", resume_flag,
     ]
+    if raw_cfg:
+        if raw_cfg.get("intermediate_size") is not None:
+            common.extend(["--intermediate_size", str(int(raw_cfg["intermediate_size"]))])
+        if raw_cfg.get("num_attention_heads") is not None:
+            common.extend(["--num_attention_heads", str(int(raw_cfg["num_attention_heads"]))])
+        if raw_cfg.get("num_key_value_heads") is not None:
+            common.extend(["--num_key_value_heads", str(int(raw_cfg["num_key_value_heads"]))])
 
     if stage == "pretrain":
         cmd = [sys.executable, str(repo_root / "trainer" / "train_pretrain.py"), "--save_weight", save_weight, "--learning_rate", lr, *common]
@@ -289,8 +398,9 @@ def run_training_stage(
     from_resume: bool = False,
     dry_run: bool = False,
     from_weight_path: Path | None = None,
+    model_config: dict | None = None,
 ) -> TrainingRunResult:
-    """Execute one bounded training stage or dry-run validation inside workspace budgets."""
+    """Execute one bounded training stage (gated by continuous data review) or dry-run validation."""
     t0 = time.monotonic()
     repo_root = Path(repo_root).resolve()
     workspace_dir = Path(workspace_dir).resolve()
@@ -299,6 +409,11 @@ def run_training_stage(
     logs_dir = workspace_dir / "logs"
     candidates_dir.mkdir(parents=True, exist_ok=True)
     logs_dir.mkdir(parents=True, exist_ok=True)
+
+    eff_arch = dict(model_config) if model_config is not None else (
+        dict(training_cfg["model_config"]) if isinstance(training_cfg.get("model_config"), dict) else None
+    )
+    resolved_arch = _resolve_arch(profile, eff_arch)
 
     cmd, expected_out = build_trainer_command(
         stage=stage,
@@ -310,6 +425,7 @@ def run_training_stage(
         profile=profile,
         training_cfg=training_cfg,
         from_resume=from_resume,
+        model_config=eff_arch,
     )
     train_log = logs_dir / "train.log"
 
@@ -318,11 +434,50 @@ def run_training_stage(
         atomic_write_text(train_log, msg)
         return TrainingRunResult(stage, False, 2, None, None, None, False, False, False, 0.0, msg, dry_run=dry_run)
 
+    enforce_data_gate = bool(training_cfg.get("enforce_data_gate", not dry_run))
+    if enforce_data_gate and stage in ("pretrain", "full_sft", "lora", "dpo", "distill"):
+        from selfchange.bootstrap.data_quality import review_and_record_dataset
+
+        seq_int = min(profile.max_seq_len, int(training_cfg.get("max_seq_len", profile.max_seq_len)))
+        fmt = "dpo" if stage == "dpo" else ("pretrain" if stage == "pretrain" else "sft")
+        heldout_raw = training_cfg.get("heldout_path")
+        review = review_and_record_dataset(
+            data_path=data_path,
+            workspace_dir=workspace_dir,
+            dataset_format=fmt,
+            max_seq_len=seq_int,
+            heldout_path=Path(heldout_raw) if heldout_raw else None,
+            cycle_tag=f"{stage}_{save_weight}",
+        )
+        if not review.get("passed", False):
+            failed_str = ", ".join(review.get("failed_checks", [])) or "unknown_data_quality_failure"
+            msg = f"[DATA-GATE-BLOCKED] stage={stage} data={data_path.name} failed={failed_str}\n"
+            atomic_write_text(train_log, msg)
+            return TrainingRunResult(
+                stage=stage,
+                ok=False,
+                exit_code=3,
+                output_weight_path=None,
+                resume_ckpt_path=None,
+                final_loss=None,
+                oom_detected=False,
+                nan_detected=False,
+                timed_out=False,
+                duration_sec=round(time.monotonic() - t0, 4),
+                log_tail=msg,
+                dry_run=dry_run,
+            )
+
     if dry_run:
         atomic_write_text(
             expected_out,
-            json.dumps({"dry_run": True, "stage": stage, "from_weight": from_weight, "data_path": str(data_path)}, indent=2) + "\n",
+            json.dumps(
+                {"dry_run": True, "stage": stage, "from_weight": from_weight, "data_path": str(data_path), "model_config": resolved_arch},
+                indent=2,
+            )
+            + "\n",
         )
+        save_model_config(expected_out.with_suffix(".config.json"), resolved_arch)
         log_line = f"[DRY-RUN] stage={stage} loss: 1.2500 saved={expected_out.name}\n"
         atomic_write_text(train_log, log_line)
         return TrainingRunResult(
@@ -340,9 +495,18 @@ def run_training_stage(
             dry_run=True,
         )
 
-    stage_from_weight_for_trainer(from_weight, repo_root, workspace_dir, profile, from_weight_path=from_weight_path)
+    if stage == "distill":
+        t_cfg = training_cfg.get("teacher_config") if isinstance(training_cfg.get("teacher_config"), dict) else None
+        t_path = Path(training_cfg["teacher_weight_path"]) if training_cfg.get("teacher_weight_path") else None
+        from_teacher = str(training_cfg.get("from_teacher_weight", "full_sft"))
+        stage_from_weight_for_trainer(from_teacher, repo_root, workspace_dir, profile, from_weight_path=t_path, model_config=t_cfg)
+        from_student = str(training_cfg.get("from_student_weight", from_weight if from_weight else "none"))
+        if from_student != "none":
+            stage_from_weight_for_trainer(from_student, repo_root, workspace_dir, profile, from_weight_path=from_weight_path, model_config=eff_arch)
+    else:
+        stage_from_weight_for_trainer(from_weight, repo_root, workspace_dir, profile, from_weight_path=from_weight_path, model_config=eff_arch)
 
-    cwd = repo_root / "trainer" if stage in ("pretrain", "full_sft", "lora", "dpo") else repo_root
+    cwd = repo_root / "trainer" if stage in ("pretrain", "full_sft", "lora", "dpo", "distill") else repo_root
     trainer_env = os.environ.copy()
     trainer_env["PYTHONPATH"] = str(repo_root) + (os.pathsep + trainer_env["PYTHONPATH"] if trainer_env.get("PYTHONPATH") else "")
     trainer_env["PYTHONUNBUFFERED"] = "1"
@@ -378,7 +542,11 @@ def run_training_stage(
     oom, nan = detect_log_anomalies(combined_log)
     final_loss = _extract_last_loss(combined_log)
     ok = (not timed_out) and returncode == 0 and (not oom) and (not nan)
-    resume_guess = repo_root / "checkpoints" / f"{save_weight}_{profile.hidden_size}{'_moe' if profile.use_moe else ''}_resume.pth"
+    if expected_out.is_file():
+        save_model_config(expected_out.with_suffix(".config.json"), resolved_arch)
+    hs = int(resolved_arch["hidden_size"])
+    moe_s = "_moe" if resolved_arch["use_moe"] else ""
+    resume_guess = repo_root / "checkpoints" / f"{save_weight}_{hs}{moe_s}_resume.pth"
     return TrainingRunResult(
         stage=stage,
         ok=ok,

@@ -9,6 +9,7 @@ import tempfile
 import time
 from pathlib import Path
 
+from selfchange.bootstrap.data_quality import score_thinking_turn
 from selfchange.bootstrap.generate_traces import _CLEAN_FIXTURES, inject_ast_bug
 from selfchange.kernel.budgets import ComputeProfile, get_profile
 from selfchange.kernel.fault_drills import run_drill_suite
@@ -99,8 +100,16 @@ def check_bootstrap_ready_gate(
         recs.append("Keep L1 replace_line_range primary instead of verbatim patch_file_replace.")
     if t3["pass_at_4"] < 0.10:
         recs.append("pass@4 < 10%: run Stage 0.5 mid-training + Stage 1 3-rung SFT before RL.")
-    elif t3["pass_at_4"] >= 0.40 and t3["pass_at_1"] < 0.30:
+    if t3["pass_at_4"] >= 0.40 and t3["pass_at_1"] < 0.30:
         recs.append("pass@4 >= 40% while pass@1 < 30%: run Stage 1.5 offline RFT + DPO sharpening.")
+
+    t35 = scorecard.get("tier3_5_thinking")
+    if isinstance(t35, dict):
+        if t35.get("observation_grounding_rate", 1.0) < 0.85:
+            failed.append(f"think_grounding={t35['observation_grounding_rate']:.3f} < 0.85")
+            recs.append("Upgrade SFT traces to 4-step grounded CoT + Contrastive Thinking DPO.")
+        if t35.get("think_action_consistency_rate", 1.0) < 0.90:
+            failed.append(f"think_consistency={t35['think_action_consistency_rate']:.3f} < 0.90")
 
     if t3["pass_at_1"] < BOOTSTRAP_READY_THRESHOLDS["min_code_pass_at_1"]:
         failed.append(f"code_pass_at_1={t3['pass_at_1']:.3f} < 0.40")
@@ -119,30 +128,58 @@ def check_bootstrap_ready_gate(
     return len(failed) == 0, failed, recs
 
 
-def _scripted_tool_eval() -> dict:
-    prompts = [
-        '<tool_call>{"name": "get_system_state", "arguments": {}}</tool_call>',
-        '<think>Inspect train log for root cause.</think><tool_call>{"name": "read_log_tail", "arguments": {"log_name": "train.log", "lines": 20}}</tool_call>',
-        '<tool_call>{"name": "patch_config", "arguments": {"updates": {"training": {"batch_size": 1}}}}</tool_call>',
-        '<tool_call>{"name": "replace_line_range", "arguments": {"path": "oom_helper.py", "start_line": 2, "end_line": 2, "lines": ["    return max(1, batch_size // div)"]}}</tool_call>',
+def _scripted_tool_eval() -> tuple[dict, dict]:
+    probes = [
+        (
+            "fault=healthy profile=local_intel_cpu",
+            '<think>\nObserve: fault=healthy profile=local_intel_cpu. Plan: call get_system_state.\n</think><tool_call>{"name": "get_system_state", "arguments": {}}</tool_call>',
+        ),
+        (
+            "fault=nan_loss train.log step=20",
+            '<think>\nObserve: fault=nan_loss train.log step=20. Plan: call read_log_tail.\n</think><tool_call>{"name": "read_log_tail", "arguments": {"log_name": "train.log", "lines": 20}}</tool_call>',
+        ),
+        (
+            "fault=oom batch_size=2",
+            '<think>\nObserve: fault=oom batch_size=2. Plan: call patch_config batch_size=1.\n</think><tool_call>{"name": "patch_config", "arguments": {"updates": {"training": {"batch_size": 1}}}}</tool_call>',
+        ),
+        (
+            "oom_helper.py:\n1: def compute_step(batch_size: int, div: int = 2) -> int:\n2:     return min(1, batch_size // div)",
+            '<think>\nObserve: oom_helper.py line 2 uses min instead of max. Plan: call replace_line_range line 2.\n</think><tool_call>{"name": "replace_line_range", "arguments": {"path": "oom_helper.py", "start_line": 2, "end_line": 2, "lines": ["    return max(1, batch_size // div)"]}}</tool_call>',
+        ),
     ]
     parsed_ok = 0
     schema_ok = 0
-    for txt in prompts:
+    ground_ok = 0
+    consist_ok = 0
+    think_chars: list[int] = []
+    for ctx, txt in probes:
         calls, errs = parse_tool_calls(txt)
         if calls and errs == 0:
             parsed_ok += 1
             ok, _ = validate_tool_call(calls[0]["name"], calls[0]["arguments"])
             if ok:
                 schema_ok += 1
-    total = len(prompts)
-    return {
+        ts = score_thinking_turn(ctx, txt)
+        if ts["grounded"]:
+            ground_ok += 1
+        if ts["action_consistent"]:
+            consist_ok += 1
+        think_chars.append(ts["think_chars"])
+    total = len(probes)
+    tier2 = {
         "json_parse_rate": parsed_ok / total,
         "schema_validity_rate": schema_ok / total,
         "tag_balance_rate": 1.0,
         "hallucinated_tool_rate": 0.0,
         "copy_fidelity_rate": 1.0,
     }
+    tier3_5 = {
+        "observation_grounding_rate": round(ground_ok / total, 4),
+        "think_action_consistency_rate": round(consist_ok / total, 4),
+        "mean_think_chars": round(sum(think_chars) / max(1, len(think_chars)), 1),
+        "thinking_efficiency": round((schema_ok / total) / max(0.25, (sum(think_chars) / max(1, len(think_chars))) / 250.0), 4),
+    }
+    return tier2, tier3_5
 
 
 def _scripted_code_edit_eval(num_tasks: int = 20) -> dict:
@@ -193,7 +230,7 @@ def _run_tool_and_code_probes(
     num_code_tasks: int,
     system_prefix: str | None = None,
     sample_pass4: bool = True,
-) -> tuple[dict, dict, dict]:
+) -> tuple[dict, dict, dict, dict, float]:
     from selfchange.training.model_loader import generate_agent_reply
 
     eos_tok = tokenizer.eos_token or "<|im_end|>"
@@ -210,9 +247,18 @@ def _run_tool_and_code_probes(
         ([{"role": "system", "content": f"{prefix}Rollback."}, {"role": "user", "content": "fault=corrupt_checkpoint ancestor=anc_1"}], _tools_by_names(["get_archive_summary", "rollback_to_ancestor"])),
     ]
     json_ok = schema_ok = tag_ok = eos_ok = non_empty = 0
+    think_total = think_ground_ok = think_consist_ok = gen_tokens = 0
+    gen_sec = 0.0
+    think_chars: list[int] = []
     reps: list[float] = []
     for msgs, tools_arg in prompts:
+        t_g0 = time.monotonic()
         raw_reply = generate_agent_reply(model, tokenizer, msgs, tools_arg, max_new_tokens=96, temperature=0.0, top_p=1.0)
+        gen_sec += max(1e-4, time.monotonic() - t_g0)
+        try:
+            gen_tokens += len(tokenizer(raw_reply, add_special_tokens=False).input_ids)
+        except Exception:
+            gen_tokens += max(1, int(len(raw_reply) / 2.8))
         if eos_tok in raw_reply:
             eos_ok += 1
         reply = _strip_special(raw_reply)
@@ -227,6 +273,13 @@ def _run_tool_and_code_probes(
             ok, _ = validate_tool_call(calls[0]["name"], calls[0]["arguments"])
             if ok:
                 schema_ok += 1
+        ts = score_thinking_turn(msgs[-1]["content"], reply)
+        think_total += 1
+        if ts["grounded"]:
+            think_ground_ok += 1
+        if ts["action_consistent"]:
+            think_consist_ok += 1
+        think_chars.append(ts["think_chars"])
 
     tier1_rates = {
         "eos_rate": round(eos_ok / len(prompts), 4),
@@ -252,7 +305,22 @@ def _run_tool_and_code_probes(
             {"role": "system", "content": f"{prefix}Fix bug with replace_line_range."},
             {"role": "user", "content": f"{fname}:\n{numbered}"},
         ]
-        attempts = [generate_agent_reply(model, tokenizer, msgs, code_tools, 96, 0.0, 1.0)]
+        t_g0 = time.monotonic()
+        g_first = generate_agent_reply(model, tokenizer, msgs, code_tools, 96, 0.0, 1.0)
+        gen_sec += max(1e-4, time.monotonic() - t_g0)
+        try:
+            gen_tokens += len(tokenizer(g_first, add_special_tokens=False).input_ids)
+        except Exception:
+            gen_tokens += max(1, int(len(g_first) / 2.8))
+        ts_c = score_thinking_turn(msgs[-1]["content"], _strip_special(g_first))
+        think_total += 1
+        if ts_c["grounded"]:
+            think_ground_ok += 1
+        if ts_c["action_consistent"]:
+            think_consist_ok += 1
+        think_chars.append(ts_c["think_chars"])
+
+        attempts = [g_first]
         if sample_pass4:
             for _ in range(3):
                 attempts.append(generate_agent_reply(model, tokenizer, msgs, code_tools, 96, 0.7, 0.9))
@@ -290,7 +358,16 @@ def _run_tool_and_code_probes(
         "pass_at_1": round(pass1 / denom, 4),
         "pass_at_4": round(pass4 / denom, 4),
     }
-    return tier1_rates, tier2, tier3
+    mean_tc = round(sum(think_chars) / max(1, len(think_chars)), 1)
+    solve_avg = 0.5 * (tier2["schema_validity_rate"] + tier3["pass_at_1"])
+    tier3_5 = {
+        "observation_grounding_rate": round(think_ground_ok / max(1, think_total), 4),
+        "think_action_consistency_rate": round(think_consist_ok / max(1, think_total), 4),
+        "mean_think_chars": mean_tc,
+        "thinking_efficiency": round(solve_avg / max(0.25, mean_tc / 250.0), 4),
+    }
+    tok_s = round(gen_tokens / max(1e-4, gen_sec), 2)
+    return tier1_rates, tier2, tier3, tier3_5, tok_s
 
 
 def evaluate_minimind_candidate(
@@ -303,7 +380,7 @@ def evaluate_minimind_candidate(
     """Run lightweight greedy MiniMind-3 probes for Verifier Gate 3 candidate scoring."""
     _ = profile
     sys_prompt = _extract_worktree_system_prompt(Path(worktree_dir))
-    t1_rates, tier2, tier3 = _run_tool_and_code_probes(
+    t1_rates, tier2, tier3, tier3_5, _tok_s = _run_tool_and_code_probes(
         model,
         tokenizer,
         num_code_tasks=num_code_tasks,
@@ -327,6 +404,8 @@ def evaluate_minimind_candidate(
         "pass_at_1": tier3["pass_at_1"],
         "eos_rate": t1_rates["eos_rate"],
         "mean_rep_penalty": t1_rates["mean_rep_penalty"],
+        "observation_grounding_rate": tier3_5["observation_grounding_rate"],
+        "think_action_consistency_rate": tier3_5["think_action_consistency_rate"],
     }
 
 
@@ -336,12 +415,20 @@ def _minimind_eval(
     profile_name: str | None,
     heldout_path: Path | None,
     num_tasks: int,
-) -> tuple[dict, dict, dict]:
+    model_config: dict | None = None,
+    quantize_int8: bool = False,
+) -> tuple[dict, dict, dict, dict, float]:
     import torch  # type: ignore[import-not-found]
     from selfchange.training.model_loader import load_minimind_model, normalize_messages_for_template
 
     profile = get_profile(profile_name)
-    model, tokenizer = load_minimind_model(model_path, tokenizer_path, profile)
+    model, tokenizer = load_minimind_model(
+        model_path,
+        tokenizer_path,
+        profile,
+        model_config=model_config,
+        quantize_int8=quantize_int8,
+    )
 
     losses: list[float] = []
     if heldout_path is not None and heldout_path.is_file():
@@ -362,13 +449,13 @@ def _minimind_eval(
     mean_loss = sum(losses) / len(losses) if losses else 2.5
     ppl = round(math.exp(min(20.0, mean_loss)), 4)
 
-    t1_rates, tier2, tier3 = _run_tool_and_code_probes(model, tokenizer, num_code_tasks=num_tasks, sample_pass4=True)
+    t1_rates, tier2, tier3, tier3_5, tok_s = _run_tool_and_code_probes(model, tokenizer, num_code_tasks=num_tasks, sample_pass4=True)
     tier1 = {
         "dialogue_ppl": ppl,
         "python_ppl": ppl,
         **t1_rates,
     }
-    return tier1, tier2, tier3
+    return tier1, tier2, tier3, tier3_5, tok_s
 
 
 def _resolve_eval_model_path(repo_root: Path, profile_name: str | None, requested: Path | None) -> Path | None:
@@ -380,6 +467,7 @@ def _resolve_eval_model_path(repo_root: Path, profile_name: str | None, requeste
     repo_root = Path(repo_root).resolve()
     ws = repo_root / "selfchange" / "workspace"
     candidates = [
+        ws / "promoted_models" / f"champion_{hs}{moe_suffix}.pth",
         ws / "models" / "candidates" / f"offline_dpo_r1_{hs}{moe_suffix}.pth",
         ws / "models" / "candidates" / f"offline_rft_r1_merged_{hs}{moe_suffix}.pth",
         ws / "models" / "candidates" / f"warmstart_rung3_{hs}{moe_suffix}.pth",
@@ -404,11 +492,14 @@ def evaluate_baseline(
     num_code_tasks: int = 20,
     drill_seeds: list[int] | None = None,
     base_ppl: float | None = None,
+    model_config: dict | None = None,
+    quantize_int8: bool = False,
 ) -> dict:
-    """Compute the 5-Tier Baseline Scorecard and Step 6 Bootstrap-Ready Gate."""
+    """Compute the Baseline Scorecard (including Tier 3.5 thinking) and Step 6 Bootstrap-Ready Gate."""
     t0 = time.monotonic()
     profile = get_profile(profile_name)
     worktree_dir = Path(worktree_dir).resolve()
+    cpu_decode_tok_s = 0.0
 
     if backend == "scripted":
         tier1 = {
@@ -418,12 +509,21 @@ def evaluate_baseline(
             "mean_rep_penalty": 0.0,
             "empty_rate": 0.0,
         }
-        tier2 = _scripted_tool_eval()
+        tier2, tier3_5 = _scripted_tool_eval()
         tier3 = _scripted_code_edit_eval(num_tasks=num_code_tasks)
+        cpu_decode_tok_s = 100.0
     elif backend == "minimind":
         if model_path is None or tokenizer_path is None:
             raise ValueError("model_path and tokenizer_path are required for backend='minimind'")
-        tier1, tier2, tier3 = _minimind_eval(model_path, tokenizer_path, profile.name, heldout_path, num_code_tasks)
+        tier1, tier2, tier3, tier3_5, cpu_decode_tok_s = _minimind_eval(
+            model_path,
+            tokenizer_path,
+            profile.name,
+            heldout_path,
+            num_code_tasks,
+            model_config=model_config,
+            quantize_int8=quantize_int8,
+        )
     else:
         raise ValueError(f"Unknown backend {backend!r}")
 
@@ -444,6 +544,7 @@ def evaluate_baseline(
         "device": profile.device,
         "dtype": profile.dtype,
         "eval_duration_sec": elapsed,
+        "cpu_decode_tok_s": cpu_decode_tok_s,
         "max_total_len": profile.max_total_len,
     }
 
@@ -452,6 +553,7 @@ def evaluate_baseline(
         "tier1_language": tier1,
         "tier2_toolcall": tier2,
         "tier3_code_edit": tier3,
+        "tier3_5_thinking": tier3_5,
         "tier4_drills": tier4,
         "tier5_hardware": tier5,
     }
@@ -463,13 +565,15 @@ def evaluate_baseline(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="5-Tier Baseline Scorecard & Bootstrap-Ready Gate")
+    parser = argparse.ArgumentParser(description="Baseline Scorecard (Tiers 1-5 + Tier 3.5 Thinking) & Bootstrap Gate")
     parser.add_argument("--worktree", type=Path, default=Path("."))
     parser.add_argument("--backend", choices=["scripted", "minimind"], default="scripted")
     parser.add_argument("--model-path", type=Path, default=None)
     parser.add_argument("--tokenizer-path", type=Path, default=Path("model"))
     parser.add_argument("--heldout-path", type=Path, default=None)
     parser.add_argument("--profile", type=str, default=None)
+    parser.add_argument("--model-config", type=Path, default=None)
+    parser.add_argument("--quantize-int8", action="store_true")
     parser.add_argument("--num-code-tasks", type=int, default=20)
     parser.add_argument("--output", type=Path, default=None)
     args = parser.parse_args()
@@ -480,6 +584,10 @@ def main() -> int:
         if resolved_model is None or not resolved_model.is_file():
             raise FileNotFoundError(f"Could not find MiniMind checkpoint for evaluation (requested={args.model_path})")
 
+    cfg_dict = None
+    if args.model_config is not None and args.model_config.is_file():
+        cfg_dict = json.loads(args.model_config.read_text(encoding="utf-8"))
+
     scorecard = evaluate_baseline(
         worktree_dir=args.worktree,
         backend=args.backend,
@@ -488,6 +596,8 @@ def main() -> int:
         profile_name=args.profile,
         heldout_path=args.heldout_path,
         num_code_tasks=args.num_code_tasks,
+        model_config=cfg_dict,
+        quantize_int8=args.quantize_int8,
     )
     if resolved_model is not None:
         scorecard["evaluated_model_path"] = str(resolved_model)

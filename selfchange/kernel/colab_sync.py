@@ -68,8 +68,9 @@ class ColabDriveSync:
         self,
         mutable_dir: Path | None = None,
         keep_top_k_weights: int = 2,
+        include_weights: bool = True,
     ) -> dict:
-        """Mirror workspace state, verified weights, and mutable snapshot to Drive atomically."""
+        """Mirror workspace state, optional verified weights, and mutable snapshot to Drive atomically."""
         self.drive_mirror_dir.mkdir(parents=True, exist_ok=True)
         files_sha: dict[str, str] = {}
         weight_rel_map: dict[str, str] = {}
@@ -81,7 +82,6 @@ class ColabDriveSync:
                 self._copy_atomic(src, dst)
                 files_sha[fname] = compute_file_sha256(dst)
 
-        # Mirror champion, previous champion, and top-K archive weights
         weights_to_mirror: list[Path] = []
         champ_id: str | None = None
         champ_file = self.local_workspace / "champion.json"
@@ -92,34 +92,48 @@ class ColabDriveSync:
             if champ_node.get("weight_path"):
                 weights_to_mirror.append(Path(champ_node["weight_path"]))
 
-        archive_file = self.local_workspace / "archive.jsonl"
-        if archive_file.is_file():
-            nodes = [json.loads(ln) for ln in archive_file.read_text(encoding="utf-8").splitlines() if ln.strip()]
-            eligible = [n for n in nodes if n.get("status") != "rejected" and n.get("weight_path")]
-            for n in sorted(eligible, key=lambda x: float(x.get("total_score", 0.0)), reverse=True)[: max(1, keep_top_k_weights)]:
-                weights_to_mirror.append(Path(n["weight_path"]))
-
-        mirrored_weight_names: set[str] = set()
+        weights_persisted = False
         weights_dir = self.drive_mirror_dir / "weights"
-        for wpath in weights_to_mirror:
-            resolved_w = wpath.resolve()
-            if not resolved_w.is_file() or resolved_w.name in mirrored_weight_names:
-                continue
-            mirrored_weight_names.add(resolved_w.name)
-            rel_drive = f"weights/{resolved_w.name}"
-            dst_w = self.drive_mirror_dir / rel_drive
-            self._copy_atomic(resolved_w, dst_w)
-            files_sha[rel_drive] = compute_file_sha256(dst_w)
-            try:
-                local_rel = resolved_w.relative_to(self.local_workspace).as_posix()
-            except ValueError:
-                local_rel = f"models/candidates/{resolved_w.name}"
-            weight_rel_map[rel_drive] = local_rel
+        if include_weights:
+            archive_file = self.local_workspace / "archive.jsonl"
+            if archive_file.is_file():
+                nodes = [json.loads(ln) for ln in archive_file.read_text(encoding="utf-8").splitlines() if ln.strip()]
+                eligible = [n for n in nodes if n.get("status") != "rejected" and n.get("weight_path")]
+                for n in sorted(eligible, key=lambda x: float(x.get("total_score", 0.0)), reverse=True)[: max(1, keep_top_k_weights)]:
+                    weights_to_mirror.append(Path(n["weight_path"]))
 
-        if weights_dir.is_dir():
-            for existing in list(weights_dir.glob("*.pth")):
-                if existing.name not in mirrored_weight_names:
-                    existing.unlink(missing_ok=True)
+            mirrored_weight_names: set[str] = set()
+            for wpath in weights_to_mirror:
+                resolved_w = wpath.resolve()
+                if not resolved_w.is_file() or resolved_w.name in mirrored_weight_names:
+                    continue
+                mirrored_weight_names.add(resolved_w.name)
+                rel_drive = f"weights/{resolved_w.name}"
+                dst_w = self.drive_mirror_dir / rel_drive
+                self._copy_atomic(resolved_w, dst_w)
+                files_sha[rel_drive] = compute_file_sha256(dst_w)
+                try:
+                    local_rel = resolved_w.relative_to(self.local_workspace).as_posix()
+                except ValueError:
+                    local_rel = f"models/candidates/{resolved_w.name}"
+                weight_rel_map[rel_drive] = local_rel
+
+            if weights_dir.is_dir():
+                for existing in list(weights_dir.glob("*.pth")):
+                    if existing.name not in mirrored_weight_names:
+                        existing.unlink(missing_ok=True)
+            weights_persisted = bool(weight_rel_map)
+        elif self.manifest_path.is_file():
+            try:
+                prev_manifest = json.loads(self.manifest_path.read_text(encoding="utf-8"))
+                prev_files = prev_manifest.get("files", {})
+                for rel_drive, rel_local in prev_manifest.get("weight_rel_map", {}).items():
+                    existing_w = self.drive_mirror_dir / rel_drive
+                    if existing_w.is_file():
+                        weight_rel_map[rel_drive] = rel_local
+                        files_sha[rel_drive] = prev_files.get(rel_drive) or compute_file_sha256(existing_w)
+            except (json.JSONDecodeError, OSError):
+                pass
 
         if mutable_dir is not None and Path(mutable_dir).is_dir():
             tar_dst = self.drive_mirror_dir / "mutable_snapshot.tar.gz"
@@ -130,6 +144,7 @@ class ColabDriveSync:
             "synced_at": _utc_now(),
             "source_workspace": str(self.local_workspace),
             "champion_id": champ_id,
+            "weights_persisted": weights_persisted,
             "files": files_sha,
             "weight_rel_map": weight_rel_map,
         }

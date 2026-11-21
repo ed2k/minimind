@@ -2,8 +2,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
+import tempfile
 from pathlib import Path
 
+from selfchange.bootstrap.data_quality import (
+    _build_direct_code_edit_sample,
+    audit_training_dataset,
+    collect_code_fixtures,
+)
 from selfchange.bootstrap.generate_traces import generate_traces
 from selfchange.kernel.budgets import get_profile
 from selfchange.kernel.integrity import atomic_write_text
@@ -24,11 +31,15 @@ def prepare_curriculum_datasets(
     max_seq_len: int = 768,
     anchor_ratio: float = 0.30,
     seed: int = 42,
+    repo_root: Path | None = None,
+    use_diverse_code_fixtures: bool = True,
 ) -> dict:
-    """Generate progressive Rung 1 -> Rung 2 -> Rung 3 datasets blended with anchor SFT."""
+    """Generate progressive Rung 1 -> Rung 2 -> Rung 3 datasets blended with anchor SFT and quality audits."""
     work_dir = Path(work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
     anchors = _load_jsonl(anchor_jsonl) if anchor_jsonl is not None else []
+    fixtures = collect_code_fixtures(repo_root) if (repo_root is not None and use_diverse_code_fixtures) else []
+    rng = random.Random(seed + 777)
 
     counts = {
         "1": max(20, int(total_traces * 0.25)),
@@ -47,14 +58,33 @@ def prepare_curriculum_datasets(
             real_ast_subprocesses=4 if rung_id == "3" else 0,
         )
         op_rows = _load_jsonl(raw_path)
+        if rung_id == "3" and fixtures:
+            direct_target = max(4, len(op_rows) // 2)
+            direct_rows: list[dict] = []
+            with tempfile.TemporaryDirectory() as tmp:
+                wt_dir = Path(tmp)
+                for i in range(direct_target * 3):
+                    if len(direct_rows) >= direct_target:
+                        break
+                    sample = _build_direct_code_edit_sample(fixtures[i % len(fixtures)], rng, wt_dir)
+                    if sample is not None:
+                        direct_rows.append(sample)
+            if direct_rows:
+                op_rows = op_rows[: max(0, len(op_rows) - len(direct_rows))] + direct_rows
+                rng.shuffle(op_rows)
+
         mixed_rows = mix_with_anchor(op_rows, anchors, anchor_ratio=anchor_ratio)
         mixed_path = work_dir / f"curriculum_rung{rung_id}.jsonl"
         written = write_sft_jsonl(mixed_path, mixed_rows)
+        audit = audit_training_dataset(mixed_path, dataset_format="sft", max_seq_len=max_seq_len, max_exec_checks=20)
         outputs[f"rung{rung_id}"] = {
             "raw_path": str(raw_path),
             "mixed_path": str(mixed_path),
             "op_count": len(op_rows),
             "mixed_count": written,
+            "quality_passed": audit["passed"],
+            "quality_score": audit["quality_score"],
+            "quality_failed_checks": audit["failed_checks"],
             **gen_stats,
         }
     return outputs
@@ -80,6 +110,7 @@ def run_warmstart_curriculum(
         total_traces=total_traces,
         max_seq_len=max(profile.max_seq_len, profile.max_total_len),
         seed=seed,
+        repo_root=repo_root,
     )
     results: list[dict] = []
     current_from = from_weight

@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from selfchange.colab.colab_launcher import launch_colab_session, resolve_model_checkpoint
+from selfchange.colab.colab_launcher import assess_run_improvement, launch_colab_session, resolve_model_checkpoint
 from selfchange.kernel.autonomous_cycle import AutonomousCycleRunner, CycleConfig
 from selfchange.kernel.budgets import get_profile
 from selfchange.kernel.colab_sync import ColabDriveSync
@@ -192,6 +192,156 @@ class TestEndToEndAutonomousLoop(unittest.TestCase):
             self.assertTrue((drive_dir / "session_info.json").is_file())
             self.assertTrue((drive_dir / "logs" / "train_history.jsonl").is_file())
             self.assertIn("MiniMind SelfChange Autonomous Run Report", Path(session_res["report_path"]).read_text(encoding="utf-8"))
+
+    def test_persist_weights_only_when_improved_and_preserves_existing_drive_weights(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp).resolve()
+            ws = tmp_path / "ws"
+            ws.mkdir()
+            cand_w = ws / "models" / "candidates" / "cand_128.pth"
+            cand_w.parent.mkdir(parents=True, exist_ok=True)
+            cand_w.write_bytes(b"PT_BASE")
+
+            n0 = LineageNode(
+                node_id="bootstrap_0",
+                parent_id=None,
+                commit_sha="aaa111",
+                weight_path=str(cand_w),
+                survival_score=1.0,
+                eval_score=0.6465,
+                self_repair_score=1.0,
+                efficiency_score=0.97,
+                total_score=0.8915,
+                status="bootstrap",
+                hypothesis="init",
+                created_at="2026-11-20T00:00:00Z",
+            )
+            # Same weight, same commit, same eval_score — only efficiency jitter: must NOT persist
+            n_jitter = LineageNode(
+                node_id="cand_c0010",
+                parent_id="bootstrap_0",
+                commit_sha="aaa111",
+                weight_path=str(cand_w),
+                survival_score=1.0,
+                eval_score=0.6465,
+                self_repair_score=1.0,
+                efficiency_score=0.99,
+                total_score=0.8930,
+                status="champion",
+                hypothesis="noop",
+                created_at="2026-11-20T00:01:00Z",
+            )
+            (ws / "baseline_untouched.json").write_text(
+                json.dumps({"tier1_language": {"eos_rate": 1.0, "mean_rep_penalty": 0.03}, "tier2_toolcall": {"json_parse_rate": 1.0, "schema_validity_rate": 1.0, "tag_balance_rate": 1.0}, "tier3_code_edit": {"ast_valid_rate": 0.0, "pass_at_1": 0.0, "pass_at_4": 0.0}, "tier4_drills": {"pass_rate": 1.0}}),
+                encoding="utf-8",
+            )
+            (ws / "baseline_prepared.json").write_text(
+                json.dumps({"tier1_language": {"eos_rate": 0.5, "mean_rep_penalty": 0.14}, "tier2_toolcall": {"json_parse_rate": 0.5, "schema_validity_rate": 0.5, "tag_balance_rate": 0.5}, "tier3_code_edit": {"ast_valid_rate": 0.0, "pass_at_1": 0.0, "pass_at_4": 0.0}, "tier4_drills": {"pass_rate": 1.0}}),
+                encoding="utf-8",
+            )
+            dec_no = assess_run_improvement(ws, n0, n_jitter)
+            self.assertFalse(dec_no["improved"])
+            self.assertFalse(dec_no["persist_weights"])
+            self.assertEqual(dec_no["reason"], "no_improvement_over_baseline")
+
+            # On resumed run with identical start/end champion, stale baseline_prepared improvement must NOT re-trigger persist
+            (ws / "baseline_prepared.json").write_text(
+                json.dumps({"tier1_language": {"eos_rate": 1.0, "mean_rep_penalty": 0.01}, "tier2_toolcall": {"json_parse_rate": 1.0, "schema_validity_rate": 1.0, "tag_balance_rate": 1.0}, "tier3_code_edit": {"ast_valid_rate": 0.5, "pass_at_1": 0.5, "pass_at_4": 0.5}, "tier4_drills": {"pass_rate": 1.0}}),
+                encoding="utf-8",
+            )
+            dec_fresh_prep = assess_run_improvement(ws, n0, n_jitter, resumed=False)
+            self.assertTrue(dec_fresh_prep["persist_weights"])
+            dec_resumed_stale = assess_run_improvement(ws, n0, n_jitter, resumed=True)
+            self.assertFalse(dec_resumed_stale["improved"])
+            self.assertFalse(dec_resumed_stale["persist_weights"])
+
+            # Better eval_score -> MUST persist
+            n_better = LineageNode(**{**n0.to_dict(), "node_id": "cand_c0002", "eval_score": 0.80, "total_score": 0.94, "status": "champion"})
+            dec_yes = assess_run_improvement(ws, n0, n_better)
+            self.assertTrue(dec_yes["improved"])
+            self.assertTrue(dec_yes["persist_weights"])
+            self.assertEqual(dec_yes["reason"], "autonomous_cycle_improved")
+
+            # ColabDriveSync: initial sync persists cand_128.pth; later include_weights=False preserves prior cand_128.pth and skips cand_new.pth
+            drive = tmp_path / "drive"
+            (ws / "champion.json").write_text(json.dumps({"champion": n0.to_dict()}), encoding="utf-8")
+            (ws / "report.md").write_text("# Run 1\n", encoding="utf-8")
+            sync = ColabDriveSync(ws, drive)
+            m1 = sync.sync_to_drive(include_weights=True)
+            self.assertTrue(m1["weights_persisted"])
+            self.assertTrue((drive / "weights" / "cand_128.pth").is_file())
+
+            cand_new = ws / "models" / "candidates" / "cand_new_128.pth"
+            cand_new.write_bytes(b"PT_UNIMPROVED")
+            n_unimproved = LineageNode(**{**n_jitter.to_dict(), "weight_path": str(cand_new)})
+            (ws / "champion.json").write_text(json.dumps({"champion": n_unimproved.to_dict()}), encoding="utf-8")
+            (ws / "report.md").write_text("# Run 2\n", encoding="utf-8")
+            m2 = sync.sync_to_drive(include_weights=False)
+            self.assertFalse(m2["weights_persisted"])
+            self.assertFalse((drive / "weights" / "cand_new_128.pth").exists())
+            self.assertTrue((drive / "weights" / "cand_128.pth").is_file())
+            self.assertIn("weights/cand_128.pth", m2["weight_rel_map"])
+            res_restore = ColabDriveSync(tmp_path / "ws_restored", drive).restore_from_drive(verify_checksums=True)
+            self.assertTrue(res_restore["restored"])
+
+            # End-to-end launch_colab_session with persist_only_if_improved=True:
+            # 1) no-op proposer matching start champion -> skips persisting weights
+            repo2 = tmp_path / "repo2"
+            repo2.mkdir()
+            _init_repo_with_mutable(repo2, self.live_mutable_dir)
+            ws2 = tmp_path / "ws2"
+            drive2 = tmp_path / "drive2"
+            (ws2 / "models" / "candidates").mkdir(parents=True)
+            w2 = ws2 / "models" / "candidates" / "cand_128.pth"
+            w2.write_bytes(b"PT_BASE")
+            head_sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo2, capture_output=True, text=True, check=True).stdout.strip()
+            kdir = self._copy_valid_kernel(tmp_path)
+            manifest = kdir / KERNEL_MANIFEST_FILENAME
+            from selfchange.kernel.registry import LineageRegistry
+
+            reg2 = LineageRegistry(ws2)
+            reg2.register_node(LineageNode("bootstrap_0", None, head_sha, str(w2), 1.0, 0.70, 1.0, 0.90, 0.90, "bootstrap", "init", "2026-11-20T00:00:00Z"))
+
+            def _noop_proposer(ctx: CycleContext, _h: WorktreeHandle, ex: WorktreeToolExecutor) -> dict:
+                ex.dispatch("submit_candidate", {"hypothesis": f"noop cycle {ctx.cycle_index}"})
+                return {"task_id": f"n_{ctx.cycle_index}", "task_family": "noop", "observed_before_edit": True, "first_edit_valid": True, "tool_calls": [], "turn_outputs": ["<think>ok</think>"], "messages": [{"role": "user", "content": "q"}, {"role": "assistant", "content": "ok"}], "final_text": "ok"}
+
+            flat_res = launch_colab_session(
+                repo_root=repo2,
+                workspace_dir=ws2,
+                drive_dir=drive2,
+                profile_name="local_intel_cpu",
+                max_cycles=1,
+                train_every_n_cycles=0,
+                dry_run=False,
+                kernel_dir=kdir,
+                manifest_path=manifest,
+                proposer_fn=_noop_proposer,
+                extra_eval_fn=lambda _wt, _wp: 0.40,
+                persist_only_if_improved=True,
+            )
+            self.assertFalse(flat_res["persistence_decision"]["persist_weights"])
+            self.assertFalse(json.loads((drive2 / "manifest.json").read_text(encoding="utf-8"))["weights_persisted"])
+            self.assertFalse((drive2 / "weights" / "cand_128.pth").exists())
+
+            # 2) improved extra_eval_fn -> mirrors weight cleanly
+            up_res = launch_colab_session(
+                repo_root=repo2,
+                workspace_dir=ws2,
+                drive_dir=drive2,
+                profile_name="local_intel_cpu",
+                max_cycles=1,
+                train_every_n_cycles=0,
+                dry_run=False,
+                kernel_dir=kdir,
+                manifest_path=manifest,
+                proposer_fn=_noop_proposer,
+                extra_eval_fn=lambda _wt, _wp: 0.65,
+                persist_only_if_improved=True,
+            )
+            self.assertTrue(up_res["persistence_decision"]["persist_weights"])
+            self.assertTrue(json.loads((drive2 / "manifest.json").read_text(encoding="utf-8"))["weights_persisted"])
+            self.assertTrue((drive2 / "weights" / "cand_128.pth").is_file())
 
     def test_drive_sync_and_restore_diagnostics(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -1,0 +1,847 @@
+from __future__ import annotations
+
+import argparse
+import json
+import subprocess
+import tarfile
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Callable
+
+from selfchange.kernel.integrity import atomic_write_text
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def build_remote_phase_scripts(
+    repo_url: str = "https://github.com/ed2k/minimind.git",
+    branch: str = "mychanges",
+    total_traces: int = 3000,
+    warmstart_stage: str = "full_sft",
+    max_cycles: int = 10,
+    autonomy_level: int = 1,
+    always_persist_weights: bool = False,
+    lightweight_setup: bool = False,
+    explicit_model_path: str | None = None,
+) -> dict[str, str]:
+    """Build the 3 remote Colab Python driver scripts matching run_selfchange.ipynb."""
+    persist_flag = '        "--always-persist-weights",\n' if always_persist_weights else ""
+    model_flag = (
+        f'        "--model-path",\n        {explicit_model_path!r},\n'
+        if explicit_model_path
+        else ""
+    )
+
+    if lightweight_setup:
+        setup_tail = """    run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from pathlib import Path; "
+                "from selfchange.bootstrap.setup_base import build_synthetic_anchor_datasets; "
+                "build_synthetic_anchor_datasets(Path('selfchange/workspace/models/base/data'), train_count=400, heldout_count=60, seed=42)"
+            ),
+        ],
+        cwd=str(repo),
+    )"""
+    else:
+        setup_tail = """    run(
+        [
+            sys.executable,
+            "-m",
+            "selfchange.bootstrap.setup_base",
+            "--mode",
+            "colab",
+            "--repo-root",
+            ".",
+            "--output-dir",
+            "selfchange/workspace/models/base",
+        ],
+        cwd=str(repo),
+    )
+    run(
+        [
+            sys.executable,
+            "-m",
+            "selfchange.bootstrap.eval_baseline",
+            "--worktree",
+            ".",
+            "--backend",
+            "minimind",
+            "--model-path",
+            "selfchange/workspace/models/base/minimind3_768.pth",
+            "--tokenizer-path",
+            "model",
+            "--heldout-path",
+            "selfchange/workspace/models/base/data/heldout_eval.jsonl",
+            "--output",
+            "selfchange/workspace/baseline_untouched.json",
+        ],
+        cwd=str(repo),
+        check=False,
+    )"""
+
+    step1 = f"""import os
+import subprocess
+import sys
+from pathlib import Path
+
+
+def run(cmd: list[str], cwd: str | None = None, check: bool = True) -> int:
+    print(f"+ {{' '.join(cmd)}}", flush=True)
+    proc = subprocess.run(cmd, cwd=cwd)
+    if check and proc.returncode != 0:
+        raise SystemExit(proc.returncode)
+    return proc.returncode
+
+
+def main() -> None:
+    run(["nvidia-smi"], check=False)
+    repo = Path("/content/minimind")
+    branch = {branch!r}
+    repo_url = {repo_url!r}
+    if (repo / ".git").is_dir():
+        run(["git", "fetch", "origin", branch], cwd=str(repo))
+        run(["git", "checkout", branch], cwd=str(repo))
+        run(["git", "pull", "--ff-only", "origin", branch], cwd=str(repo))
+    else:
+        run(["git", "clone", "--depth", "1", "-b", branch, repo_url, str(repo)], cwd="/content")
+
+    run(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "-q",
+            "install",
+            "transformers==4.57.6",
+            "datasets==3.6.0",
+            "huggingface_hub",
+            "safetensors",
+            "accelerate",
+        ],
+        cwd=str(repo),
+    )
+    os.chdir(repo)
+    run([sys.executable, "-m", "selfchange.kernel.supervisor", "--check-only"], cwd=str(repo))
+{setup_tail}
+
+
+if __name__ == "__main__":
+    main()
+"""
+
+    step2 = f"""import os
+import subprocess
+import sys
+from pathlib import Path
+
+
+def run(cmd: list[str], cwd: Path, check: bool = True) -> int:
+    print(f"+ {{' '.join(cmd)}}", flush=True)
+    proc = subprocess.run(cmd, cwd=str(cwd))
+    if check and proc.returncode != 0:
+        log_path = cwd / "selfchange" / "workspace" / "logs" / "train.log"
+        if log_path.is_file():
+            print(log_path.read_text(encoding="utf-8"), flush=True)
+        raise SystemExit(proc.returncode)
+    return proc.returncode
+
+
+def main() -> None:
+    repo = Path("/content/minimind")
+    os.chdir(repo)
+    run(
+        [
+            sys.executable,
+            "-m",
+            "selfchange.bootstrap.warmstart_sft",
+            "--work-dir",
+            "selfchange/workspace/bootstrap_data",
+            "--anchor-jsonl",
+            "selfchange/workspace/models/base/data/anchor_sft.jsonl",
+            "--total-traces",
+            {str(int(total_traces))!r},
+            "--stage",
+            {warmstart_stage!r},
+        ],
+        cwd=repo,
+    )
+    run(
+        [
+            sys.executable,
+            "-m",
+            "selfchange.bootstrap.offline_rft_dpo",
+            "--backend",
+            "minimind",
+            "--model-path",
+            "auto",
+            "--tokenizer-path",
+            "model",
+            "--anchor-jsonl",
+            "selfchange/workspace/models/base/data/anchor_sft.jsonl",
+            "--from-weight",
+            "warmstart_rung3",
+            "--rounds",
+            "1",
+            "--num-tasks",
+            "24",
+            "--num-rollouts",
+            "4",
+        ],
+        cwd=repo,
+    )
+    run(
+        [
+            sys.executable,
+            "-m",
+            "selfchange.bootstrap.eval_baseline",
+            "--worktree",
+            ".",
+            "--backend",
+            "minimind",
+            "--model-path",
+            "auto",
+            "--tokenizer-path",
+            "model",
+            "--heldout-path",
+            "selfchange/workspace/models/base/data/heldout_eval.jsonl",
+            "--output",
+            "selfchange/workspace/baseline_prepared.json",
+        ],
+        cwd=repo,
+        check=False,
+    )
+
+
+if __name__ == "__main__":
+    main()
+"""
+
+    step3 = f"""import os
+import subprocess
+import sys
+import tarfile
+from pathlib import Path
+
+
+def _pack_diagnostics(repo: Path, drive_mirror: Path, tar_out: Path) -> None:
+    ws = repo / "selfchange" / "workspace"
+    added: set[str] = set()
+    with tarfile.open(tar_out, "w:gz") as tf:
+        if drive_mirror.is_dir():
+            for item in sorted(drive_mirror.rglob("*")):
+                if not item.is_file() or item.suffix == ".pth":
+                    continue
+                rel = item.relative_to(drive_mirror).as_posix()
+                tf.add(item, arcname=rel)
+                added.add(rel)
+
+        fallbacks = [
+            "report.md",
+            "session_info.json",
+            "baseline_untouched.json",
+            "baseline_prepared.json",
+            "logs/train.log",
+            "logs/train_history.jsonl",
+            "logs/fatal_report.json",
+            "archive.jsonl",
+            "champion.json",
+            "supervisor_state.json",
+            "HEARTBEAT.json",
+            "trajectories.jsonl",
+        ]
+        for rel in fallbacks:
+            if rel in added:
+                continue
+            src = ws / rel
+            if src.is_file():
+                tf.add(src, arcname=rel)
+                added.add(rel)
+
+
+def main() -> None:
+    repo = Path("/content/minimind")
+    ws = repo / "selfchange" / "workspace"
+    drive_mirror = Path("/content/drive_mirror")
+    tar_out = Path("/content/run_diagnostics.tar.gz")
+    os.chdir(repo)
+    cmd = [
+        sys.executable,
+        "-m",
+        "selfchange.colab.colab_launcher",
+        "--drive-dir",
+        str(drive_mirror),
+        "--require-model",
+        "--eval-with-model",
+        "--max-cycles",
+        {str(int(max_cycles))!r},
+        "--autonomy-level",
+        {str(int(autonomy_level))!r},
+{model_flag}{persist_flag}    ]
+    proc = subprocess.run(cmd, cwd=str(repo))
+    report = ws / "report.md"
+    if report.is_file():
+        print(report.read_text(encoding="utf-8"), flush=True)
+    _pack_diagnostics(repo, drive_mirror, tar_out)
+    if proc.returncode != 0:
+        raise SystemExit(proc.returncode)
+
+
+if __name__ == "__main__":
+    main()
+"""
+    return {"step1_setup.py": step1, "step2_bootstrap.py": step2, "step3_autonomous.py": step3}
+
+
+def build_minimal_cpu_search_script(
+    repo_url: str = "https://github.com/ed2k/minimind.git",
+    branch: str = "mychanges",
+    rungs: str | None = None,
+    max_rungs: int = 4,
+    total_traces: int = 600,
+    always_persist_weights: bool = True,
+) -> dict[str, str]:
+    """Build remote scripts that prepare the 64M teacher and bracket-search for the minimal CPU model."""
+    base_scripts = build_remote_phase_scripts(
+        repo_url=repo_url,
+        branch=branch,
+        total_traces=total_traces,
+        always_persist_weights=always_persist_weights,
+        lightweight_setup=False,
+    )
+    rungs_flag = f'        "--rungs",\n        {rungs!r},\n' if rungs else ""
+    step2_search = f"""import json
+import os
+import shutil
+import subprocess
+import sys
+import tarfile
+from pathlib import Path
+
+
+def run(cmd: list[str], cwd: str | None = None, check: bool = True) -> int:
+    print(f"+ {{' '.join(cmd)}}", flush=True)
+    proc = subprocess.run(cmd, cwd=cwd)
+    if check and proc.returncode != 0:
+        raise SystemExit(proc.returncode)
+    return proc.returncode
+
+
+def main() -> None:
+    repo = Path("/content/minimind")
+    ws = repo / "selfchange" / "workspace"
+    drive_mirror = Path("/content/drive_mirror")
+    os.chdir(repo)
+
+    # 1) Specialize 64M teacher via Stage 1 warm-start before distillation search
+    run(
+        [
+            sys.executable,
+            "-m",
+            "selfchange.bootstrap.warmstart_sft",
+            "--repo-root",
+            ".",
+            "--workspace-dir",
+            "selfchange/workspace",
+            "--anchor-jsonl",
+            "selfchange/workspace/models/base/data/anchor_sft.jsonl",
+            "--total-traces",
+            {str(int(total_traces))!r},
+            "--stage",
+            "full_sft",
+        ],
+        cwd=str(repo),
+    )
+
+    teacher_w = ws / "models" / "candidates" / "warmstart_rung3_768.pth"
+    if not teacher_w.is_file():
+        teacher_w = ws / "models" / "base" / "minimind3_768.pth"
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "selfchange.bootstrap.search_minimal_cpu",
+        "--repo-root",
+        ".",
+        "--workspace-dir",
+        "selfchange/workspace",
+        "--teacher-weight",
+        "warmstart_rung3",
+        "--teacher-weight-path",
+        str(teacher_w),
+        "--sft-count",
+        {str(max(120, int(total_traces)))!r},
+        "--max-rungs",
+        {str(int(max_rungs))!r},
+{rungs_flag}    ]
+    proc = subprocess.run(cmd, cwd=str(repo))
+
+    rep_file = ws / "search_frontier_report.json"
+    rep = json.loads(rep_file.read_text(encoding="utf-8")) if rep_file.is_file() else {{}}
+    champ = rep.get("pareto_champion") or {{}}
+    latest_meta = ws / "promoted_models" / "latest_champion.json"
+    latest = json.loads(latest_meta.read_text(encoding="utf-8")) if latest_meta.is_file() else {{}}
+
+    drive_mirror.mkdir(parents=True, exist_ok=True)
+    w_dir = drive_mirror / "weights"
+    w_dir.mkdir(parents=True, exist_ok=True)
+    weight_rel_map = {{}}
+    cw = latest.get("champion_weight_path")
+    if cw and Path(cw).is_file():
+        dst_w = w_dir / Path(cw).name
+        shutil.copy2(cw, dst_w)
+        weight_rel_map[f"weights/{{Path(cw).name}}"] = str(cw)
+        for extra in (Path(cw).with_suffix(".config.json"), ws / "promoted_models" / "model_config.json"):
+            if extra.is_file():
+                shutil.copy2(extra, drive_mirror / extra.name)
+
+    session_info = {{
+        "persistence_decision": {{
+            "persist_weights": bool(champ) or {str(bool(always_persist_weights))},
+            "reason": f"pareto_champion_{{champ.get('rung_id', 'none')}}",
+            "champion_weight_path": cw,
+        }},
+        "pareto_champion": champ,
+    }}
+    (drive_mirror / "session_info.json").write_text(json.dumps(session_info, indent=2), encoding="utf-8")
+    (drive_mirror / "manifest.json").write_text(json.dumps({{"weight_rel_map": weight_rel_map, "files": {{}}}}, indent=2), encoding="utf-8")
+    for fn in ("search_frontier_report.json", "search_frontier_report.md"):
+        if (ws / fn).is_file():
+            shutil.copy2(ws / fn, drive_mirror / fn)
+
+    with tarfile.open("/content/run_diagnostics.tar.gz", "w:gz") as tf:
+        for p in sorted(drive_mirror.iterdir()):
+            if p.is_file():
+                tf.add(p, arcname=p.name)
+    if proc.returncode != 0:
+        raise SystemExit(proc.returncode)
+
+
+if __name__ == "__main__":
+    main()
+"""
+    return {"step1_setup.py": base_scripts["step1_setup.py"], "step2_search_minimal_cpu.py": step2_search}
+
+
+def _ensure_gdrive_folder(folder_name: str, run_cmd: Callable) -> str | None:
+    search = run_cmd(
+        ["gdrive", "readonly", "search", "--json", "--name-exact", folder_name],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if getattr(search, "returncode", 1) == 0 and getattr(search, "stdout", ""):
+        try:
+            data = json.loads(search.stdout)
+            items = data if isinstance(data, list) else data.get("files", [])
+            for item in items:
+                if item.get("mimeType") == "application/vnd.google-apps.folder" and item.get("id"):
+                    return str(item["id"])
+        except json.JSONDecodeError:
+            pass
+
+    created = run_cmd(
+        ["gdrive", "mutate", "mkdir", "--json", folder_name],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if getattr(created, "returncode", 1) == 0 and getattr(created, "stdout", ""):
+        try:
+            obj = json.loads(created.stdout)
+            if isinstance(obj, dict) and obj.get("id"):
+                return str(obj["id"])
+        except json.JSONDecodeError:
+            pass
+    return None
+
+
+def persist_improved_weights_from_colab(
+    session: str,
+    diagnostics_dir: Path,
+    promoted_dir: Path,
+    run_id: str,
+    always_persist: bool = False,
+    upload_drive: bool = False,
+    run_cmd: Callable = subprocess.run,
+) -> dict:
+    """Persist promoted .pth weights from the Colab VM locally/Drive iff the run improved."""
+    diagnostics_dir = Path(diagnostics_dir).resolve()
+    promoted_dir = Path(promoted_dir).resolve()
+    session_file = diagnostics_dir / "session_info.json"
+    manifest_file = diagnostics_dir / "manifest.json"
+
+    session_info = json.loads(session_file.read_text(encoding="utf-8")) if session_file.is_file() else {}
+    manifest = json.loads(manifest_file.read_text(encoding="utf-8")) if manifest_file.is_file() else {}
+    decision = session_info.get("persistence_decision") or {}
+
+    should_persist = bool(always_persist or decision.get("persist_weights"))
+    if not should_persist:
+        return {
+            "persisted": False,
+            "reason": decision.get("reason", "no_improvement_over_baseline"),
+            "local_weights": [],
+            "drive_uploaded": [],
+        }
+
+    remote_weights: list[str] = []
+    for rel_drive in manifest.get("weight_rel_map", {}):
+        rpath = f"/content/drive_mirror/{rel_drive}"
+        if rpath not in remote_weights:
+            remote_weights.append(rpath)
+    champ_w = decision.get("champion_weight_path")
+    if not remote_weights and champ_w:
+        remote_weights.append(str(champ_w))
+
+    if not remote_weights:
+        return {
+            "persisted": False,
+            "reason": "no_weight_paths_in_manifest",
+            "local_weights": [],
+            "drive_uploaded": [],
+        }
+
+    run_weights_dir = promoted_dir / run_id
+    run_weights_dir.mkdir(parents=True, exist_ok=True)
+    downloaded: list[str] = []
+    for rpath in remote_weights:
+        local_dst = run_weights_dir / Path(rpath).name
+        run_cmd(["colab", "download", "-s", session, rpath, str(local_dst)], check=True)
+        downloaded.append(str(local_dst))
+    for cfg_name in ("model_config.json", f"{Path(downloaded[0]).stem}.config.json"):
+        diag_cfg = diagnostics_dir / cfg_name
+        if diag_cfg.is_file():
+            shutil.copy2(diag_cfg, run_weights_dir / cfg_name)
+            shutil.copy2(diag_cfg, promoted_dir / cfg_name)
+
+    champ_meta = {
+        "run_id": run_id,
+        "persisted_at": _utc_now(),
+        "reason": decision.get("reason") or ("always_persist" if always_persist else "improved"),
+        "decision": decision,
+        "diagnostics_dir": str(diagnostics_dir),
+        "primary_weight": downloaded[0],
+        "weights": downloaded,
+    }
+    atomic_write_text(promoted_dir / "latest_champion.json", json.dumps(champ_meta, indent=2, ensure_ascii=False) + "\n")
+
+    drive_uploaded: list[str] = []
+    if upload_drive:
+        folder_id = _ensure_gdrive_folder("minimind_selfchange", run_cmd)
+        if folder_id:
+            for item in [*downloaded, str(diagnostics_dir / "report.md"), str(diagnostics_dir / "manifest.json")]:
+                if Path(item).is_file():
+                    up = run_cmd(["gdrive", "mutate", "upload", item, "--parent", folder_id], check=False)
+                    if getattr(up, "returncode", 1) == 0:
+                        drive_uploaded.append(item)
+
+    return {
+        "persisted": True,
+        "reason": champ_meta["reason"],
+        "local_weights": downloaded,
+        "latest_champion_json": str(promoted_dir / "latest_champion.json"),
+        "drive_uploaded": drive_uploaded,
+    }
+
+
+def inspect_resume_seed(promoted_dir: Path) -> dict:
+    """Inspect promoted_models/latest_champion.json and decide how to seed the next Colab VM."""
+    promoted_dir = Path(promoted_dir).resolve()
+    latest_file = promoted_dir / "latest_champion.json"
+    if not latest_file.is_file():
+        return {"mode": "none", "reason": "no_latest_champion"}
+    try:
+        data = json.loads(latest_file.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {"mode": "none", "reason": "invalid_latest_champion"}
+
+    cand_paths: list[Path] = []
+    for raw in [*(data.get("weights") or []), data.get("primary_weight")]:
+        if raw:
+            p = Path(raw)
+            if p.is_file() and p not in cand_paths:
+                cand_paths.append(p)
+    run_id = data.get("run_id")
+    if run_id and (promoted_dir / str(run_id)).is_dir():
+        for p in sorted((promoted_dir / str(run_id)).glob("*.pth")):
+            if p not in cand_paths:
+                cand_paths.append(p)
+
+    if not cand_paths:
+        return {"mode": "none", "reason": "missing_weight_files"}
+
+    local_by_name = {p.name: p for p in cand_paths}
+    primary_pth = cand_paths[0]
+    diag_raw = data.get("diagnostics_dir")
+    diag_dir = Path(diag_raw) if diag_raw else None
+    manifest_file = (diag_dir / "manifest.json") if diag_dir else None
+
+    if diag_dir is not None and manifest_file is not None and manifest_file.is_file():
+        try:
+            manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+            files_map = manifest.get("files", {})
+            weight_rel_map = manifest.get("weight_rel_map", {})
+            non_weight_rels = [rel for rel in files_map if rel not in weight_rel_map]
+            non_weights_ok = all((diag_dir / rel).is_file() for rel in non_weight_rels)
+            weight_uploads: list[tuple[str, str]] = []
+            weights_ok = bool(weight_rel_map)
+            for rel_drive in weight_rel_map:
+                matched = local_by_name.get(Path(rel_drive).name)
+                if matched is None:
+                    weights_ok = False
+                    break
+                weight_uploads.append((str(matched), f"/content/drive_mirror/{rel_drive}"))
+            if non_weights_ok and weights_ok:
+                return {
+                    "mode": "full_mirror",
+                    "run_id": run_id,
+                    "diagnostics_dir": str(diag_dir),
+                    "non_weight_files": non_weight_rels,
+                    "weight_uploads": weight_uploads,
+                    "primary_weight": str(primary_pth),
+                }
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    return {
+        "mode": "weight_only",
+        "run_id": run_id,
+        "primary_weight": str(primary_pth),
+        "remote_model_path": f"/content/minimind/selfchange/workspace/models/candidates/{primary_pth.name}",
+    }
+
+
+def seed_colab_vm_from_promoted(
+    session: str,
+    seed_plan: dict,
+    work_dir: Path,
+    run_cmd: Callable = subprocess.run,
+) -> dict:
+    """Upload persisted local mirror state and/or .pth weights to the newly provisioned Colab VM."""
+    mode = seed_plan.get("mode", "none")
+    if mode == "none":
+        return {"seeded": False, "mode": "none", "uploaded_files": []}
+
+    work_dir = Path(work_dir).resolve()
+    work_dir.mkdir(parents=True, exist_ok=True)
+    uploaded: list[str] = []
+
+    if mode == "full_mirror":
+        diag_dir = Path(seed_plan["diagnostics_dir"])
+        tar_path = work_dir / "seed_mirror_state.tar.gz"
+        with tarfile.open(tar_path, "w:gz") as tf:
+            tf.add(diag_dir / "manifest.json", arcname="manifest.json")
+            for rel in seed_plan["non_weight_files"]:
+                tf.add(diag_dir / rel, arcname=rel)
+
+        remote_tar = "/content/seed_mirror_state.tar.gz"
+        run_cmd(["colab", "upload", "-s", session, str(tar_path), remote_tar], check=True)
+        uploaded.append(remote_tar)
+
+        unpack_script = work_dir / "step_unpack_seed.py"
+        unpack_src = """import shutil
+import tarfile
+from pathlib import Path
+
+mirror = Path("/content/drive_mirror")
+if mirror.exists():
+    shutil.rmtree(mirror)
+mirror.mkdir(parents=True, exist_ok=True)
+with tarfile.open("/content/seed_mirror_state.tar.gz", "r:gz") as tf:
+    tf.extractall(mirror, filter="data")
+(mirror / "weights").mkdir(parents=True, exist_ok=True)
+print(f"Seeded {mirror} with {len(list(mirror.rglob('*')))} entries", flush=True)
+"""
+        atomic_write_text(unpack_script, unpack_src)
+        run_cmd(["colab", "exec", "-s", session, "--timeout", "120", "-f", str(unpack_script)], check=True)
+
+        for local_w, remote_w in seed_plan["weight_uploads"]:
+            run_cmd(["colab", "upload", "-s", session, local_w, remote_w], check=True)
+            uploaded.append(remote_w)
+        return {"seeded": True, "mode": "full_mirror", "uploaded_files": uploaded}
+
+    # weight_only fallback
+    remote_w = str(seed_plan["remote_model_path"])
+    prep_script = work_dir / "step_prep_weight_dir.py"
+    prep_src = f"""from pathlib import Path
+
+target = Path({remote_w!r}).parent
+target.mkdir(parents=True, exist_ok=True)
+print(f"Prepared weight dir {{target}}", flush=True)
+"""
+    atomic_write_text(prep_script, prep_src)
+    run_cmd(["colab", "exec", "-s", session, "--timeout", "60", "-f", str(prep_script)], check=True)
+    run_cmd(["colab", "upload", "-s", session, str(seed_plan["primary_weight"]), remote_w], check=True)
+    uploaded.append(remote_w)
+    return {"seeded": True, "mode": "weight_only", "uploaded_files": uploaded}
+
+
+def run_colab_cli_pipeline(
+    session: str = "minimind-selfchange",
+    gpu: str = "T4",
+    branch: str = "mychanges",
+    repo_url: str = "https://github.com/ed2k/minimind.git",
+    workspace_dir: Path = Path("selfchange/workspace"),
+    max_cycles: int = 10,
+    autonomy_level: int = 1,
+    total_traces: int = 3000,
+    warmstart_stage: str = "full_sft",
+    always_persist_weights: bool = False,
+    upload_drive: bool = False,
+    keep_vm: bool = False,
+    resume: bool = True,
+    skip_bootstrap_on_resume: bool = True,
+    run_cmd: Callable = subprocess.run,
+    mode: str = "autonomous",
+    search_rungs: str | None = None,
+    search_max_rungs: int = 4,
+) -> dict:
+    """Provision a Colab GPU VM, run autonomous loop or minimal-CPU Pareto search, persist if improved, and stop VM."""
+    workspace_dir = Path(workspace_dir).resolve()
+    run_id = datetime.now(timezone.utc).strftime("run_%Y%m%d_%H%M%S")
+    run_dir = workspace_dir / "colab_runs" / run_id
+    scripts_dir = run_dir / "scripts"
+    diag_dir = run_dir / "diagnostics"
+    promoted_dir = workspace_dir / "promoted_models"
+
+    if mode == "search_minimal_cpu":
+        will_resume = False
+        skip_bootstrap = False
+        scripts = build_minimal_cpu_search_script(
+            repo_url=repo_url,
+            branch=branch,
+            rungs=search_rungs,
+            max_rungs=search_max_rungs,
+            total_traces=total_traces,
+            always_persist_weights=always_persist_weights or True,
+        )
+        seed_plan = {"mode": "none", "reason": "minimal_cpu_search"}
+    else:
+        seed_plan = inspect_resume_seed(promoted_dir) if resume else {"mode": "none", "reason": "resume_disabled"}
+        will_resume = seed_plan["mode"] != "none"
+        skip_bootstrap = bool(will_resume and skip_bootstrap_on_resume)
+        lightweight_setup = bool(seed_plan["mode"] == "full_mirror" and skip_bootstrap)
+        explicit_model_path = seed_plan.get("remote_model_path") if seed_plan["mode"] == "weight_only" else None
+
+        scripts = build_remote_phase_scripts(
+            repo_url=repo_url,
+            branch=branch,
+            total_traces=total_traces,
+            warmstart_stage=warmstart_stage,
+            max_cycles=max_cycles,
+            autonomy_level=autonomy_level,
+            always_persist_weights=always_persist_weights,
+            lightweight_setup=lightweight_setup,
+            explicit_model_path=explicit_model_path,
+        )
+    for name, content in scripts.items():
+        atomic_write_text(scripts_dir / name, content)
+
+    run_cmd(["colab", "new", "-s", session, "--gpu", gpu], check=True)
+    run_error: str | None = None
+    seed_result: dict = {"seeded": False, "mode": seed_plan["mode"], "uploaded_files": []}
+    persistence: dict = {"persisted": False, "reason": "not_evaluated", "local_weights": []}
+
+    try:
+        run_cmd(["colab", "exec", "-s", session, "--timeout", "900", "-f", str(scripts_dir / "step1_setup.py")], check=True)
+        if mode == "search_minimal_cpu":
+            proc = run_cmd(["colab", "exec", "-s", session, "--timeout", "2400", "-f", str(scripts_dir / "step2_search_minimal_cpu.py")], check=False)
+            if getattr(proc, "returncode", 0) != 0:
+                run_error = f"step2_search_minimal_cpu exited with {proc.returncode}"
+        else:
+            if will_resume:
+                seed_result = seed_colab_vm_from_promoted(session, seed_plan, run_dir, run_cmd=run_cmd)
+            if not skip_bootstrap:
+                run_cmd(["colab", "exec", "-s", session, "--timeout", "1800", "-f", str(scripts_dir / "step2_bootstrap.py")], check=True)
+            step3_proc = run_cmd(
+                ["colab", "exec", "-s", session, "--timeout", "1800", "-f", str(scripts_dir / "step3_autonomous.py")],
+                check=False,
+            )
+            if getattr(step3_proc, "returncode", 0) != 0:
+                run_error = f"step3_autonomous exited with {step3_proc.returncode}"
+
+        tar_local = run_dir / "run_diagnostics.tar.gz"
+        dl = run_cmd(["colab", "download", "-s", session, "/content/run_diagnostics.tar.gz", str(tar_local)], check=False)
+        if getattr(dl, "returncode", 1) == 0 and tar_local.is_file():
+            diag_dir.mkdir(parents=True, exist_ok=True)
+            with tarfile.open(tar_local, "r:gz") as tf:
+                tf.extractall(diag_dir, filter="data")
+            persistence = persist_improved_weights_from_colab(
+                session=session,
+                diagnostics_dir=diag_dir,
+                promoted_dir=promoted_dir,
+                run_id=run_id,
+                always_persist=always_persist_weights,
+                upload_drive=upload_drive,
+                run_cmd=run_cmd,
+            )
+    except Exception as exc:
+        run_error = repr(exc)
+        raise
+    finally:
+        if not keep_vm:
+            run_cmd(["colab", "stop", "-s", session], check=False)
+
+    return {
+        "run_id": run_id,
+        "session": session,
+        "gpu": gpu,
+        "mode": mode,
+        "resume_seed": seed_result,
+        "bootstrap_skipped": skip_bootstrap,
+        "diagnostics_dir": str(diag_dir),
+        "persistence": persistence,
+        "error": run_error,
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="End-to-end Colab CLI runner with auto-resume, minimal-CPU search, and gated persistence")
+    parser.add_argument("--session", type=str, default="minimind-selfchange")
+    parser.add_argument("--gpu", type=str, default="T4")
+    parser.add_argument("--branch", type=str, default="mychanges")
+    parser.add_argument("--repo-url", type=str, default="https://github.com/ed2k/minimind.git")
+    parser.add_argument("--workspace-dir", type=Path, default=Path("selfchange/workspace"))
+    parser.add_argument("--mode", choices=["autonomous", "search_minimal_cpu"], default="autonomous")
+    parser.add_argument("--search-rungs", type=str, default=None)
+    parser.add_argument("--search-max-rungs", type=int, default=4)
+    parser.add_argument("--max-cycles", type=int, default=10)
+    parser.add_argument("--autonomy-level", type=int, default=1)
+    parser.add_argument("--total-traces", type=int, default=3000)
+    parser.add_argument("--warmstart-stage", choices=["full_sft", "lora"], default="full_sft")
+    parser.add_argument("--always-persist-weights", action="store_true")
+    parser.add_argument("--upload-drive", action="store_true")
+    parser.add_argument("--keep-vm", action="store_true")
+    parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--skip-bootstrap-on-resume", action=argparse.BooleanOptionalAction, default=True)
+    args = parser.parse_args()
+
+    out = run_colab_cli_pipeline(
+        session=args.session,
+        gpu=args.gpu,
+        branch=args.branch,
+        repo_url=args.repo_url,
+        workspace_dir=args.workspace_dir,
+        max_cycles=args.max_cycles,
+        autonomy_level=args.autonomy_level,
+        total_traces=args.total_traces,
+        warmstart_stage=args.warmstart_stage,
+        always_persist_weights=args.always_persist_weights,
+        upload_drive=args.upload_drive,
+        keep_vm=args.keep_vm,
+        resume=args.resume,
+        skip_bootstrap_on_resume=args.skip_bootstrap_on_resume,
+        mode=args.mode,
+        search_rungs=args.search_rungs,
+        search_max_rungs=args.search_max_rungs,
+    )
+    print(json.dumps(out, indent=2))
+    return 0 if out.get("error") is None else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
