@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import re
 from pathlib import Path
 
 from selfchange.bootstrap.data_quality import (
@@ -178,6 +179,88 @@ _SYS_PREFIX_VARIANTS = [
     "Verify parameter names and constraints before calling any tool.",
 ]
 
+_FLOAT_CLAMP_CODE_FIXTURES: list[tuple[str, str]] = [
+    (
+        "beta_clamp.py",
+        "def clip_beta(beta: float, max_beta: float = 0.25) -> float:\n    if beta < 1e-5:\n        return 1e-5\n    return min(beta, max_beta)\n",
+    ),
+    (
+        "step_lr_cap.py",
+        "def bound_step_lr(lr: float, cap: float = 3e-4) -> float:\n    if lr < 1e-6:\n        return 1e-6\n    return min(lr, cap)\n",
+    ),
+    (
+        "scale_floor.py",
+        "def floor_decay(lr: float, floor_lr: float = 2e-5) -> float:\n    scaled = lr * 0.5\n    if scaled < floor_lr:\n        return floor_lr\n    return min(scaled, 0.95)\n",
+    ),
+    (
+        "grad_cap.py",
+        "def cap_grad_norm(gn: float, max_gn: float = 1.5) -> float:\n    if gn < 1e-7:\n        return 1e-7\n    return min(gn, max_gn)\n",
+    ),
+    (
+        "wd_guard.py",
+        "def bound_weight_decay(wd: float, top: float = 0.15) -> float:\n    if wd < 1e-6:\n        return 1e-6\n    return min(wd, top)\n",
+    ),
+    (
+        "temp_range.py",
+        "def clip_temp(temp: float, max_t: float = 1.2) -> float:\n    if temp < 0.05:\n        return 0.05\n    return min(temp, max_t)\n",
+    ),
+    (
+        "ratio_guard.py",
+        "def clamp_ratio(val: float, hi: float = 0.85) -> float:\n    if val < 0.05:\n        return 0.05\n    return min(val, hi)\n",
+    ),
+    (
+        "eps_bound.py",
+        "def safe_adam_eps(eps: float, upper: float = 4e-4) -> float:\n    if eps < 1e-7:\n        return 1e-7\n    return min(eps, upper)\n",
+    ),
+]
+
+
+def _build_numbered_line_code_edit_sample(fname: str, clean_src: str, rng: random.Random, wt_dir: Path) -> dict | None:
+    lo_val = rng.choice(["1e-7", "2e-6", "1e-6", "1e-5", "0.02", "0.05"])
+    hi_val = rng.choice(["0.15", "0.25", "0.45", "0.65", "0.85", "1.2", "3e-4", "4e-4"])
+    src = re.sub(r"1e-[567]|0\.05", lo_val, clean_src)
+    src = re.sub(r"0\.(?:15|25|85|95)|1\.[25]|[34]e-4", hi_val, src)
+    lines = src.splitlines()
+    if len(lines) < 3 or "min(" not in src:
+        return None
+    target_idx = next((i for i, ln in enumerate(lines) if "min(" in ln and "#" not in ln), -1)
+    if target_idx < 0:
+        return None
+    broken_lines = list(lines)
+    broken_lines[target_idx] = lines[target_idx].replace("min(", "max(", 1)
+    broken_src = "\n".join(broken_lines) + "\n"
+    line_num = target_idx + 1
+    edit_args = {"path": fname, "start_line": line_num, "end_line": line_num, "lines": [lines[target_idx]]}
+
+    m_dir = wt_dir / "selfchange" / "mutable"
+    m_dir.mkdir(parents=True, exist_ok=True)
+    target_file = m_dir / Path(fname).name
+    target_file.write_text(broken_src, encoding="utf-8")
+    res = WorktreeToolExecutor(wt_dir, autonomy_level=1).dispatch("replace_line_range", edit_args)
+    if not res.get("ok") or target_file.read_text(encoding="utf-8").strip() != src.strip():
+        return None
+
+    numbered = "\n".join(f"{i + 1}: {ln}" for i, ln in enumerate(broken_lines))
+    sys_msg = rng.choice(
+        [
+            f"{SYSTEM_PROMPT}\nFix bug with replace_line_range using integer line numbers.",
+            "Fix the logic bug using replace_line_range with integer start_line and end_line.",
+        ]
+    )
+    convs = [
+        {"role": "system", "content": sys_msg, "tools": _select_tools(["replace_line_range"])},
+        {"role": "user", "content": f"{fname}:\n{numbered}"},
+        {
+            "role": "assistant",
+            "content": (
+                f"<think>\nObserve: {fname} line {line_num} uses max instead of min. "
+                f"Integer index start_line={line_num} end_line={line_num}. Plan: call replace_line_range.\n</think>\n\n"
+                f"{_tc_xml('replace_line_range', edit_args)}"
+            ),
+        },
+    ]
+    return format_sft_record({"conversations": convs})
+
 
 def diagnose_model_limitations(eval_report: dict) -> list[dict]:
     """Extract actionable, evidence-backed limitation cards from an eval report."""
@@ -309,12 +392,12 @@ def _build_schema_disambiguation_sample(rng: random.Random, wt_dir: Path) -> dic
             {"role": "user", "content": f"fault=oom module={mod} batch_size={bs} accumulation_steps={acc}; read train.log then patch_config."},
             {
                 "role": "assistant",
-                "content": f"<think>\nObserve: fault=oom in {mod} with batch_size={bs}. Read logs first using read_log_tail(log_name).\n</think>\n\n{_tc_xml('read_log_tail', {'log_name': 'train.log', 'lines': 20})}",
+                "content": f"<think>\nObserve: fault=oom in {mod} batch_size={bs}. Plan: call read_log_tail.\n</think>\n\n{_tc_xml('read_log_tail', {'log_name': 'train.log', 'lines': 20})}",
             },
             {"role": "tool", "content": f"RuntimeError: CUDA out of memory in {mod} at batch_size={bs}"},
             {
                 "role": "assistant",
-                "content": f"<think>\nObserve: CUDA OOM confirmed in {mod} at batch_size={bs}. Cause: batch too large. Plan: call patch_config with updates={json.dumps(updates)}.\n</think>\n\n{_tc_xml('patch_config', {'updates': updates})}",
+                "content": f"<think>\nObserve: CUDA OOM in {mod} batch_size={bs}. Plan: call patch_config.\n</think>\n\n{_tc_xml('patch_config', {'updates': updates})}",
             },
         ]
         return format_sft_record({"conversations": convs})
@@ -328,14 +411,13 @@ def _build_schema_disambiguation_sample(rng: random.Random, wt_dir: Path) -> dic
         if not WorktreeToolExecutor(wt_dir, autonomy_level=1).dispatch("patch_config", {"updates": updates}).get("ok"):
             return None
         convs = [
-            {"role": "system", "content": f"{SYSTEM_PROMPT}\nApply numeric training stabilization via patch_config(updates).", "tools": _select_tools(["patch_config", "read_log_tail"])},
+            {"role": "system", "content": f"{SYSTEM_PROMPT}\nStabilize NaN loss using patch_config(updates).", "tools": _select_tools(["patch_config", "read_log_tail"])},
             {"role": "user", "content": f"fault=nan_loss step={step} lr={lr} grad_norm=inf; halve lr to {new_lr} and set grad_clip=0.5 via patch_config."},
             {
                 "role": "assistant",
                 "content": (
-                    f"<think>\nObserve: step={step} has fault=nan_loss at lr={lr} grad_norm=inf. "
-                    f"Cause: lr={lr} too high; patch_config requires updates dict (never log_name). "
-                    f"Plan: call patch_config setting learning_rate={new_lr} grad_clip=0.5.\n</think>\n\n"
+                    f"<think>\nObserve: step={step} nan_loss lr={lr} grad_norm=inf. "
+                    f"Plan: call patch_config learning_rate={new_lr} grad_clip=0.5.\n</think>\n\n"
                     f"{_tc_xml('patch_config', {'updates': updates})}"
                 ),
             },
@@ -351,8 +433,8 @@ def _build_schema_disambiguation_sample(rng: random.Random, wt_dir: Path) -> dic
             {
                 "role": "assistant",
                 "content": (
-                    f"<think>\nObserve: {ckpt} hit corrupt_checkpoint EOFError with verified_ancestor={anc}. "
-                    f"Plan: call rollback_to_ancestor with node_id={anc}.\n</think>\n\n"
+                    f"<think>\nObserve: {ckpt} corrupt_checkpoint verified_ancestor={anc}. "
+                    f"Plan: call rollback_to_ancestor.\n</think>\n\n"
                     f"{_tc_xml('rollback_to_ancestor', {'node_id': anc})}"
                 ),
             },
@@ -372,8 +454,8 @@ def _build_schema_disambiguation_sample(rng: random.Random, wt_dir: Path) -> dic
             {
                 "role": "assistant",
                 "content": (
-                    f"<think>\nObserve: batch_size=1 OOM at max_seq_len={seq}. Cause: activation length overflow. "
-                    f"Plan: call patch_config updates max_seq_len={new_seq}.\n</think>\n\n"
+                    f"<think>\nObserve: batch_size=1 OOM max_seq_len={seq}. "
+                    f"Plan: call patch_config max_seq_len={new_seq}.\n</think>\n\n"
                     f"{_tc_xml('patch_config', {'updates': updates})}"
                 ),
             },
@@ -392,8 +474,8 @@ def _build_schema_disambiguation_sample(rng: random.Random, wt_dir: Path) -> dic
         {
             "role": "assistant",
             "content": (
-                f"<think>\nObserve: tag_errors={errs} at temperature={temp}. "
-                f"Plan: call patch_config with updates temperature=0.0 max_turns=4.\n</think>\n\n"
+                f"<think>\nObserve: tag_errors={errs} temperature={temp}. "
+                f"Plan: call patch_config.\n</think>\n\n"
                 f"{_tc_xml('patch_config', {'updates': updates})}"
             ),
         },
@@ -500,42 +582,83 @@ def _build_meta_selfchange_sample(limitation: dict, rng: random.Random, wt_dir: 
     return format_sft_record({"conversations": convs})
 
 
-def _build_reasoning_math_or_noop_sample(rng: random.Random) -> dict:
-    if rng.random() < 0.25:
-        loss = round(rng.uniform(0.45, 1.45), 3)
-        cyc = rng.randint(1, 60)
-        if cyc == 12:
-            cyc = 13
+def _build_healthy_noop_sample(rng: random.Random) -> dict:
+    loss = round(rng.uniform(0.35, 1.55), 3)
+    cyc = rng.randint(1, 90)
+    if cyc == 12:
+        cyc = 13
+    gn = round(rng.uniform(0.15, 0.85), 2)
+    lr = rng.choice(["2e-5", "3e-5", "5e-5"])
+    ppl = round(rng.uniform(4.2, 14.5), 2)
+    sys_msg = rng.choice(
+        [
+            "Monitor training health metrics cleanly. Do not call patch_config unless an error is present.",
+            "Inspect system state safely; avoid config edits when consecutive_failures=0 and system is healthy.",
+            "Check health status. Call tools only for verified faults.",
+        ]
+    )
+    user_msg = rng.choice(
+        [
+            f"health_report status=healthy cycle={cyc} train_loss={loss} grad_norm={gn} errors=0",
+            f"monitor checkpoint: healthy=true cycle={cyc} val_ppl={ppl} loss={loss} consecutive_failures=0",
+            f"eval_cycle={cyc} fault=healthy stage=full_sft lr={lr} loss={loss} consecutive_failures=0",
+            f"state=healthy epoch=1 cycle={cyc} loss={loss} consecutive_failures=0",
+        ]
+    )
+    if rng.random() < 0.70:
         convs = [
-            {"role": "system", "content": "Monitor system health. Do not edit config unless fault is present.", "tools": _select_tools(["get_system_state", "patch_config"])},
-            {"role": "user", "content": f"fault=healthy cycle={cyc} loss={loss} consecutive_failures=0"},
+            {"role": "system", "content": sys_msg, "tools": _select_tools(["get_system_state", "patch_config"])},
+            {"role": "user", "content": user_msg},
             {
                 "role": "assistant",
                 "content": (
-                    f"<think>\nObserve: cycle={cyc}, loss={loss}, consecutive_failures=0, fault=healthy. "
-                    f"No training error exists so patch_config must NOT be called.\n</think>\n\n"
-                    f"Cycle {cyc} is healthy (loss={loss}, consecutive_failures=0). No edits required."
+                    f"<think>\nObserve: cycle={cyc} status is healthy (loss={loss}, zero failures). "
+                    f"No fault present; do not call patch_config.\n</think>\n\n"
+                    f"Training health looks normal on cycle {cyc}. No edits required."
                 ),
             },
         ]
-        return format_sft_record({"conversations": convs})
+    else:
+        convs = [
+            {"role": "system", "content": sys_msg, "tools": _select_tools(["get_system_state", "patch_config"])},
+            {"role": "user", "content": user_msg},
+            {
+                "role": "assistant",
+                "content": (
+                    f"<think>\nObserve: cycle={cyc} loss={loss} zero failures. "
+                    f"Inspect state only without mutating config. Plan: call get_system_state.\n</think>\n\n"
+                    f"{_tc_xml('get_system_state', {})}"
+                ),
+            },
+        ]
+    return format_sft_record({"conversations": convs})
 
+
+def _build_reasoning_math_or_noop_sample(rng: random.Random) -> dict:
     kind = rng.randrange(4)
     if kind == 0:
-        bs = rng.choice([8, 12, 24, 32, 64])
+        bs = rng.choice([8, 12, 16, 20, 24, 32, 48, 64])
         acc = rng.choice([1, 2, 4])
         halves = rng.choice([1, 2, 3])
         if (bs, acc, halves) == (16, 2, 2):
             bs = 32
-        f_bs = max(1, bs // (2**halves))
-        f_acc = acc * (2**halves)
-        q = f"Start with batch_size={bs} and accumulation_steps={acc}. After {halves} OOM halving step(s) where batch_size halves and accumulation_steps doubles each step, what are final batch_size and accumulation_steps?"
+        cur_bs, cur_acc = bs, acc
+        trace_parts = []
+        for step_idx in range(1, halves + 1):
+            cur_bs = max(1, cur_bs // 2)
+            cur_acc = cur_acc * 2
+            trace_parts.append(f"Step {step_idx}: batch_size={cur_bs}, accum={cur_acc}")
+        q = (
+            f"Start with batch_size={bs} and accumulation_steps={acc}. "
+            f"After {halves} OOM halving step(s) where batch_size halves and accumulation_steps doubles each step, "
+            f"what are final batch_size and accumulation_steps?"
+        )
         think = (
             f"Observe: initial batch_size={bs}, accumulation_steps={acc}, steps={halves}. "
-            f"Each step divides batch_size by 2 and multiplies accumulation_steps by 2: "
-            f"batch_size={bs}//(2^{halves})={f_bs}, accumulation_steps={acc}*(2^{halves})={f_acc}, effective_batch={f_bs * f_acc}."
+            + "; ".join(trace_parts)
+            + f". Effective batch={cur_bs * cur_acc}."
         )
-        ans = f"Final batch_size={f_bs} and accumulation_steps={f_acc} (effective batch size remains {f_bs * f_acc})."
+        ans = f"Final batch_size={cur_bs} and accumulation_steps={cur_acc} (effective batch size remains {cur_bs * cur_acc})."
     elif kind == 1:
         seq = rng.choice([384, 512, 768, 1024, 1536])
         budget = int(0.9 * seq)
@@ -545,12 +668,16 @@ def _build_reasoning_math_or_noop_sample(rng: random.Random) -> dict:
     elif kind == 2:
         lr = rng.choice([0.0004, 0.0003, 0.0002, 0.0001])
         steps = rng.choice([2, 3])
-        final_lr = round(lr / (2**steps), 8)
+        cur_lr = lr
+        halve_notes = []
+        for s_i in range(1, steps + 1):
+            cur_lr = round(cur_lr / 2.0, 8)
+            halve_notes.append(f"#{s_i}:{cur_lr}")
         q = f"Starting at learning_rate={lr}, if NaN recovery halves the learning rate {steps} times, what is the final learning_rate?"
-        think = f"Observe: initial learning_rate={lr}, halvings={steps}. Divide {lr} by 2^{steps}={2**steps} -> {final_lr}."
-        ans = f"After {steps} halvings from {lr}, the final learning_rate is {final_lr}."
+        think = f"Observe: initial learning_rate={lr}, count={steps}. Divide repeatedly -> " + ", ".join(halve_notes) + "."
+        ans = f"Result: final learning_rate is {cur_lr}."
     else:
-        total = rng.choice([100, 200, 400, 600, 1200])
+        total = rng.choice([100, 200, 400, 600, 1200, 1600])
         ratio = rng.choice([0.2, 0.25, 0.3])
         anc = int(round(total * ratio))
         dom = total - anc
@@ -595,32 +722,66 @@ def _build_targeted_dpo_pair(sample: dict, mode: int, rng: random.Random) -> dic
     if usr_msg is None or asst_msg is None:
         return None
     good_text = str(asst_msg.get("content", ""))
+    usr_text = str(usr_msg.get("content", ""))
     if not good_text.strip():
         return None
 
     chosen = [
         {"role": "system", "content": str(sys_msg.get("content", ""))},
-        {"role": "user", "content": str(usr_msg.get("content", ""))},
+        {"role": "user", "content": usr_text},
         {"role": "assistant", "content": good_text},
     ]
 
-    m = mode % 7
-    if m == 0 and "patch_config" in good_text:
-        bad_text = '<think>\n</think>\n\n<tool_call>\n{"name":"patch_config","arguments":{"log_name":"' + str(usr_msg.get("content", ""))[:60] + '"}}\n</tool_call>'
-    elif m == 1 and "replace_line_range" in good_text:
-        bad_text = '<think>\nUpdate target file.\n</think>\n\n<tool_call>\n{"name":"replace_line_range","arguments":{"path":"/home/user/input/database.txt"}}\n</tool_call>'
-    elif m == 2 and "replace_line_range" in good_text:
-        bad_text = "<think>\nWrite corrected Python function.\n</think>\n\nI'll create a new function:\n\n```python\ndef fix_bug(x):\n    return x\n"
-    elif m == 3:
-        bad_text = "<think>\n</think>\n\n" + good_text.split("</think>")[-1].strip()
-        if "{" in bad_text and "patch_config" in bad_text:
-            bad_text = bad_text.replace('"updates"', '"log_name"')
-    elif m == 4:
-        bad_text = "<think>\nWe need to check the Gradient Norm in the Grad Norm. " + ("It is a type of normalized gradient in the Grad Norm. " * 4) + "\n"
-    elif m == 5:
-        bad_text = good_text.replace("</think>", "")
-    else:
-        bad_text = '<think>\nObserve: guess unknown issue. Plan: call read_log_tail on train.log.\n</think>\n\n<tool_call>\n{"name":"replace_line_range","arguments":{"path":"wrong.py","start_line":99,"end_line":99,"lines":["pass"]}}\n</tool_call>'
+    bad_text: str | None = None
+    if "healthy" in usr_text and ("consecutive_failures=0" in usr_text or "errors=0" in usr_text):
+        bogus_lr = rng.choice([12, 0.01, 1.5])
+        bad_text = (
+            '<think>\nObserve: healthy cycle needs tuning.\n</think>\n\n'
+            f'<tool_call>\n{{"name":"patch_config","arguments":{{"updates":{{"temperature":0.0,"training":{{"learning_rate":{bogus_lr},"accumulation_steps":8}}}}}}}}\n</tool_call>'
+        )
+    elif "replace_line_range" in good_text:
+        tc_match = re.search(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", good_text, flags=re.DOTALL)
+        sub = mode % 4
+        if sub == 0 and tc_match:
+            try:
+                obj = json.loads(tc_match.group(1))
+                bad_args = dict(obj.get("arguments", {}))
+                bad_args["start_line"] = rng.choice([5e-4, 3e-4, 1e-5])
+                bad_args["end_line"] = 99
+                bad_text = (
+                    f"<think>\nObserve: use float constant as start_line.\n</think>\n\n"
+                    f"{_tc_xml('replace_line_range', bad_args)}"
+                )
+            except Exception:
+                bad_text = None
+        elif sub == 1:
+            bad_text = '<think>\nUpdate target file.\n</think>\n\n<tool_call>\n{"name":"replace_line_range","arguments":{"path":"/home/user/input/database.txt"}}\n</tool_call>'
+        elif sub == 2:
+            bad_text = "<think>\nWrite corrected Python function.\n</think>\n\nI'll create a new function:\n\n```python\ndef fix_bug(x):\n    return x\n"
+    elif "Final batch_size=" in good_text and mode % 2 == 0:
+        m_bs = re.search(r"Final batch_size=(\d+) and accumulation_steps=(\d+)", good_text)
+        if m_bs:
+            wrong_bs = int(m_bs.group(1)) + 2
+            acc_v = int(m_bs.group(2))
+            bad_text = (
+                f"<think>\nObserve: compute direct jump batch_size={wrong_bs}, accum={acc_v}.\n</think>\n\n"
+                f"Final batch_size={wrong_bs} and accumulation_steps={acc_v}."
+            )
+
+    if bad_text is None:
+        m = mode % 7
+        if m == 0 and "patch_config" in good_text:
+            bad_text = '<think>\n</think>\n\n<tool_call>\n{"name":"patch_config","arguments":{"log_name":"' + usr_text[:60] + '"}}\n</tool_call>'
+        elif m == 3:
+            bad_text = "<think>\n</think>\n\n" + good_text.split("</think>")[-1].strip()
+            if "{" in bad_text and "patch_config" in bad_text:
+                bad_text = bad_text.replace('"updates"', '"log_name"')
+        elif m == 4:
+            bad_text = "<think>\nWe need to check the Gradient Norm in the Grad Norm. " + ("It is a type of normalized gradient in the Grad Norm. " * 4) + "\n"
+        elif m == 5:
+            bad_text = good_text.replace("</tool_call>", "").strip() if "</tool_call>" in good_text else good_text.replace("</think>", "")
+        else:
+            bad_text = '<think>\nObserve: guess unknown issue. Plan: call read_log_tail on train.log.\n</think>\n\n<tool_call>\n{"name":"replace_line_range","arguments":{"path":"wrong.py","start_line":99,"end_line":99,"lines":["pass"]}}\n</tool_call>'
 
     rejected = [
         {"role": "system", "content": chosen[0]["content"]},
@@ -629,7 +790,6 @@ def _build_targeted_dpo_pair(sample: dict, mode: int, rng: random.Random) -> dic
     ]
     if chosen == rejected:
         return None
-    _ = rng
     return format_dpo_record({"chosen": chosen, "rejected": rejected})
 
 
@@ -641,6 +801,8 @@ def build_limitation_fix_and_meta_dataset(
     dpo_count: int = 240,
     max_seq_len: int = 768,
     seed: int = 42,
+    extra_sft_paths: list[Path] | None = None,
+    extra_dpo_paths: list[Path] | None = None,
 ) -> dict:
     """Diagnose limitations from eval report and build an audited fix + meta-selfchange dataset."""
     repo_root = Path(repo_root).resolve()
@@ -666,16 +828,24 @@ def build_limitation_fix_and_meta_dataset(
     fixtures = [fx for fx in raw_fixtures if Path(fx["filename"]).name not in ("oom_helper.py", "lr_guard.py")]
     compact_fixtures = [fx for fx in fixtures if len(fx["source"].splitlines()) <= 5 and len(fx["source"]) <= 170] or fixtures
 
-    target_schema = max(1, int(round(sft_count * 0.22)))
-    target_code = max(1, int(round(sft_count * 0.28)))
-    target_meta = max(1, int(round(sft_count * 0.20)))
-    target_reason = max(1, int(round(sft_count * 0.15)))
-    target_qa = max(1, sft_count - target_schema - target_code - target_meta - target_reason)
+    target_schema = max(1, int(round(sft_count * 0.20)))
+    target_code = max(1, int(round(sft_count * 0.30)))
+    target_meta = max(1, int(round(sft_count * 0.18)))
+    target_reason = max(1, int(round(sft_count * 0.12)))
+    target_noop = max(1, int(round(sft_count * 0.08)))
+    target_qa = max(1, sft_count - target_schema - target_code - target_meta - target_reason - target_noop)
 
     sft_rows: list[dict] = []
-    dpo_pool: list[dict] = []
+    dpo_buckets: dict[str, list[dict]] = {}
     seen_json: set[str] = set()
-    counts = {"schema_disambiguation": 0, "code_repair": 0, "meta_selfchange": 0, "reasoning_math_and_noop": 0, "core_tech_qa": 0}
+    counts = {
+        "schema_disambiguation": 0,
+        "code_repair": 0,
+        "meta_selfchange": 0,
+        "reasoning_math": 0,
+        "healthy_noop": 0,
+        "core_tech_qa": 0,
+    }
 
     def _try_add(sample: dict | None, bucket: str, for_dpo: bool = False) -> bool:
         if not sample or not sample.get("conversations"):
@@ -693,8 +863,21 @@ def build_limitation_fix_and_meta_dataset(
         sft_rows.append(sample)
         counts[bucket] += 1
         if for_dpo:
-            dpo_pool.append(sample)
+            dpo_buckets.setdefault(bucket, []).append(sample)
         return True
+
+    for extra_p in extra_sft_paths or []:
+        ep = Path(extra_p)
+        if not ep.is_file():
+            continue
+        for ln in ep.read_text(encoding="utf-8").splitlines():
+            if not ln.strip() or counts["meta_selfchange"] >= target_meta:
+                continue
+            try:
+                rec = format_sft_record(json.loads(ln))
+            except Exception:
+                continue
+            _try_add(rec, "meta_selfchange", for_dpo=(sum(1 for m in rec["conversations"] if m.get("role") == "assistant") == 1))
 
     import tempfile
 
@@ -704,17 +887,24 @@ def build_limitation_fix_and_meta_dataset(
         attempts = 0
         while counts["schema_disambiguation"] < target_schema and attempts < target_schema * 8:
             attempts += 1
-            if _try_add(_build_schema_disambiguation_sample(rng, wt_dir), "schema_disambiguation", for_dpo=True):
-                pass
+            _try_add(_build_schema_disambiguation_sample(rng, wt_dir), "schema_disambiguation", for_dpo=True)
 
         attempts = 0
-        direct_goal = target_code // 2
-        direct_got = 0
-        while direct_got < direct_goal and attempts < direct_goal * 8:
+        float_goal = max(1, target_code // 3)
+        float_got = 0
+        while float_got < float_goal and attempts < float_goal * 10:
+            attempts += 1
+            fn_name, fn_src = _FLOAT_CLAMP_CODE_FIXTURES[attempts % len(_FLOAT_CLAMP_CODE_FIXTURES)]
+            if _try_add(_build_numbered_line_code_edit_sample(fn_name, fn_src, rng, wt_dir), "code_repair", for_dpo=True):
+                float_got += 1
+
+        attempts = 0
+        direct_goal = max(float_goal + 1, int(round(target_code * 0.65)))
+        while counts["code_repair"] < direct_goal and attempts < target_code * 8:
             attempts += 1
             fx = fixtures[attempts % len(fixtures)]
-            if _try_add(_build_direct_code_edit_sample(fx, rng, wt_dir), "code_repair", for_dpo=True):
-                direct_got += 1
+            _try_add(_build_direct_code_edit_sample(fx, rng, wt_dir), "code_repair", for_dpo=True)
+
         attempts = 0
         while counts["code_repair"] < target_code and attempts < target_code * 12:
             attempts += 1
@@ -728,9 +918,14 @@ def build_limitation_fix_and_meta_dataset(
             _try_add(_build_meta_selfchange_sample(lim, rng, wt_dir, variant_idx=attempts), "meta_selfchange", for_dpo=(attempts % 2 == 1))
 
         attempts = 0
-        while counts["reasoning_math_and_noop"] < target_reason and attempts < target_reason * 8:
+        while counts["reasoning_math"] < target_reason and attempts < target_reason * 8:
             attempts += 1
-            _try_add(_build_reasoning_math_or_noop_sample(rng), "reasoning_math_and_noop", for_dpo=(attempts % 3 == 0))
+            _try_add(_build_reasoning_math_or_noop_sample(rng), "reasoning_math", for_dpo=(attempts % 2 == 0))
+
+        attempts = 0
+        while counts["healthy_noop"] < target_noop and attempts < target_noop * 10:
+            attempts += 1
+            _try_add(_build_healthy_noop_sample(rng), "healthy_noop", for_dpo=True)
 
         qa_idx = 0
         while counts["core_tech_qa"] < target_qa and qa_idx < target_qa * 4:
@@ -751,14 +946,47 @@ def build_limitation_fix_and_meta_dataset(
 
     dpo_rows: list[dict] = []
     seen_dpo: set[str] = set()
-    single_turn_dpo_pool = [
-        r for r in dpo_pool if sum(1 for m in r["conversations"] if m.get("role") == "assistant") == 1
-    ] or dpo_pool
-    if single_turn_dpo_pool and dpo_count > 0:
-        for idx in range(dpo_count * 5):
+    for extra_dp in extra_dpo_paths or []:
+        edp = Path(extra_dp)
+        if not edp.is_file():
+            continue
+        for ln in edp.read_text(encoding="utf-8").splitlines():
+            if not ln.strip() or len(dpo_rows) >= dpo_count:
+                continue
+            try:
+                rec = format_dpo_record(json.loads(ln))
+            except Exception:
+                continue
+            ex_u, nm_u = _extract_prompt_keys(rec["chosen"])
+            if (ex_u and ex_u in h_exact) or (nm_u and nm_u in h_norm):
+                continue
+            if estimate_tokens(rec["chosen"]) > token_limit:
+                continue
+            p_sig = json.dumps(rec, sort_keys=True, ensure_ascii=False)
+            if p_sig not in seen_dpo:
+                seen_dpo.add(p_sig)
+                dpo_rows.append(rec)
+
+    bucket_names = ["healthy_noop", "code_repair", "schema_disambiguation", "reasoning_math", "meta_selfchange", "core_tech_qa"]
+    interleaved_pool: list[dict] = []
+    single_by_bucket: dict[str, list[dict]] = {}
+    for b in bucket_names:
+        items = [r for r in dpo_buckets.get(b, []) if sum(1 for m in r["conversations"] if m.get("role") == "assistant") == 1]
+        if items:
+            rng.shuffle(items)
+            single_by_bucket[b] = items
+    max_len_b = max((len(v) for v in single_by_bucket.values()), default=0)
+    for i in range(max_len_b):
+        for b in bucket_names:
+            lst = single_by_bucket.get(b, [])
+            if i < len(lst):
+                interleaved_pool.append(lst[i])
+
+    if interleaved_pool and dpo_count > 0:
+        for idx in range(dpo_count * 6):
             if len(dpo_rows) >= dpo_count:
                 break
-            pair = _build_targeted_dpo_pair(single_turn_dpo_pool[idx % len(single_turn_dpo_pool)], mode=idx, rng=rng)
+            pair = _build_targeted_dpo_pair(interleaved_pool[idx % len(interleaved_pool)], mode=idx, rng=rng)
             if pair is None:
                 continue
             p_sig = json.dumps(pair, sort_keys=True, ensure_ascii=False)
@@ -798,6 +1026,7 @@ def record_verified_selfchange_episode(
     output_sft_jsonl: Path,
     output_dpo_jsonl: Path | None = None,
     seed: int = 42,
+    episode_tag: str = "ep",
 ) -> dict:
     """Convert an executed (before_eval -> fix_steps -> after_eval) self-change run into verified training traces."""
     _ = seed
@@ -823,15 +1052,17 @@ def record_verified_selfchange_episode(
         updates = {"temperature": 0.0, "thinking_ratio": 1.0, "training": {"learning_rate": lr, "epochs": epochs, "dpo_beta": 0.15}}
         ev = str(lim["evidence"]).replace("<", "").replace(">", "")[:70]
         rc = str(lim["root_cause"]).replace("<", "").replace(">", "")[:70]
+        ep_a = f"{episode_tag}_{idx}a"
+        ep_b = f"{episode_tag}_{idx}b"
         sft_episodes.append(
             format_sft_record(
                 {
                     "conversations": [
                         {"role": "system", "content": "Diagnose eval limitations from logs and configure training fix via patch_config.", "tools": tools_diagnose},
-                        {"role": "user", "content": f"selfchange_diagnose id=ep_{idx}a limitation={lid} before_pass={before_p}/{before_t} before_eos={before_eos}"},
+                        {"role": "user", "content": f"selfchange_diagnose id={ep_a} limitation={lid} before_pass={before_p}/{before_t} before_eos={before_eos}"},
                         {
                             "role": "assistant",
-                            "content": f"<think>\nObserve: ep_{idx}a before_pass={before_p}/{before_t} eos={before_eos} limitation={lid}. Plan: call read_log_tail.\n</think>\n\n{_tc_xml('read_log_tail', {'log_name': 'eval.log', 'lines': 20})}",
+                            "content": f"<think>\nObserve: {ep_a} before_pass={before_p}/{before_t} eos={before_eos} limitation={lid}. Plan: call read_log_tail.\n</think>\n\n{_tc_xml('read_log_tail', {'log_name': 'eval.log', 'lines': 20})}",
                         },
                         {"role": "tool", "content": f"evidence={ev} root_cause={rc}"},
                         {
@@ -847,10 +1078,10 @@ def record_verified_selfchange_episode(
                 {
                     "conversations": [
                         {"role": "system", "content": "Curate verified fix trace and submit selfchange candidate.", "tools": tools_submit},
-                        {"role": "user", "content": f"selfchange_verify id=ep_{idx}b limitation={lid} before_pass={before_p}/{before_t} after_pass={after_p}/{after_t} after_eos={after_eos}"},
+                        {"role": "user", "content": f"selfchange_verify id={ep_b} limitation={lid} before_pass={before_p}/{before_t} after_pass={after_p}/{after_t} after_eos={after_eos}"},
                         {
                             "role": "assistant",
-                            "content": f"<think>\nObserve: ep_{idx}b resolved {lid} {before_p}->{after_p} after_eos={after_eos}. Plan: call curate_experience mode=limitation_fix.\n</think>\n\n{_tc_xml('curate_experience', {'mode': 'limitation_fix'})}",
+                            "content": f"<think>\nObserve: {ep_b} resolved {lid} {before_p}->{after_p} after_eos={after_eos}. Plan: call curate_experience mode=limitation_fix.\n</think>\n\n{_tc_xml('curate_experience', {'mode': 'limitation_fix'})}",
                         },
                         {"role": "tool", "content": json.dumps({"ok": 1, "steps": steps[:2]}, separators=(",", ":"))},
                         {
@@ -873,11 +1104,11 @@ def record_verified_selfchange_episode(
         for idx, lim in enumerate(limitations):
             chosen = [
                 {"role": "system", "content": f"{SYSTEM_PROMPT}\nDiagnose limitation and fix via patch_config."},
-                {"role": "user", "content": f"meta_selfchange_fix limitation={lim['limitation_id']} before_pass={before_p}/{before_t} before_eos={before_eos}"},
+                {"role": "user", "content": f"meta_selfchange_fix tag={episode_tag} limitation={lim['limitation_id']} before_pass={before_p}/{before_t} before_eos={before_eos}"},
                 {
                     "role": "assistant",
                     "content": (
-                        f"<think>\nObserve: before_pass={before_p}/{before_t} before_eos={before_eos} caused by {lim['limitation_id']}. "
+                        f"<think>\nObserve: {episode_tag} before_pass={before_p}/{before_t} before_eos={before_eos} caused by {lim['limitation_id']}. "
                         f"Apply curated fix ({steps[0] if steps else 'sft+dpo'}) with lr={lr}. Plan: call patch_config.\n</think>\n\n"
                         f"{_tc_xml('patch_config', {'updates': {'temperature': 0.0, 'training': {'learning_rate': lr, 'epochs': epochs}}})}"
                     ),
@@ -918,6 +1149,8 @@ def main() -> int:
     p_b.add_argument("--repo-root", type=Path, default=Path("."))
     p_b.add_argument("--output-dir", type=Path, default=Path("selfchange/workspace/limitation_fix_data"))
     p_b.add_argument("--eval-report", type=Path, default=None)
+    p_b.add_argument("--extra-sft", action="append", type=Path, default=[])
+    p_b.add_argument("--extra-dpo", action="append", type=Path, default=[])
     p_b.add_argument("--sft-count", type=int, default=1200)
     p_b.add_argument("--dpo-count", type=int, default=240)
     p_b.add_argument("--max-seq-len", type=int, default=768)
@@ -928,6 +1161,7 @@ def main() -> int:
     p_rec.add_argument("--after-eval", type=Path, required=True)
     p_rec.add_argument("--output-sft", type=Path, required=True)
     p_rec.add_argument("--output-dpo", type=Path, default=None)
+    p_rec.add_argument("--episode-tag", type=str, default="ep")
 
     args = parser.parse_args()
     if args.command == "build":
@@ -939,6 +1173,8 @@ def main() -> int:
             dpo_count=args.dpo_count,
             max_seq_len=args.max_seq_len,
             seed=args.seed,
+            extra_sft_paths=args.extra_sft,
+            extra_dpo_paths=args.extra_dpo,
         )
         print(json.dumps(rep, indent=2))
         return 0 if rep["overall_passed"] else 1
@@ -951,6 +1187,7 @@ def main() -> int:
         fix_summary={"steps_taken": ["diagnose_limitations", "build_limitation_fix_and_meta_dataset", "full_sft", "contrastive_dpo"]},
         output_sft_jsonl=args.output_sft,
         output_dpo_jsonl=args.output_dpo,
+        episode_tag=args.episode_tag,
     )
     print(json.dumps(rec, indent=2))
     return 0

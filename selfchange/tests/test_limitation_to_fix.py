@@ -49,20 +49,34 @@ class TestLimitationToFixPipeline(unittest.TestCase):
             tmp_p = Path(tmp)
             eval_json = tmp_p / "base_eval.json"
             eval_json.write_text(json.dumps(self.sample_before), encoding="utf-8")
+            extra_sft = tmp_p / "extra_ep.jsonl"
+            extra_dpo = tmp_p / "extra_dpo.jsonl"
+            record_verified_selfchange_episode(
+                before_eval=self.sample_before,
+                after_eval={"passed_count": 7, "total_count": 10, "eos_rate": 0.9, "examples": []},
+                fix_summary={"steps_taken": ["diagnose", "curate", "full_sft", "dpo"], "learning_rate": 2e-5},
+                output_sft_jsonl=extra_sft,
+                output_dpo_jsonl=extra_dpo,
+                episode_tag="ep_extra",
+            )
             out_dir = tmp_p / "fix_data"
             rep = build_limitation_fix_and_meta_dataset(
                 repo_root=self.repo_root,
                 output_dir=out_dir,
                 eval_report_path=eval_json,
-                sft_count=120,
-                dpo_count=40,
+                sft_count=160,
+                dpo_count=60,
                 max_seq_len=768,
-                seed=42,
+                seed=43,
+                extra_sft_paths=[extra_sft],
+                extra_dpo_paths=[extra_dpo],
             )
             self.assertTrue(rep["overall_passed"], msg=json.dumps(rep, indent=2))
             self.assertGreater(rep["split_breakdown"]["schema_disambiguation"], 0)
             self.assertGreater(rep["split_breakdown"]["meta_selfchange"], 0)
             self.assertGreater(rep["split_breakdown"]["code_repair"], 0)
+            self.assertGreater(rep["split_breakdown"]["healthy_noop"], 0)
+            self.assertGreater(rep["split_breakdown"]["reasoning_math"], 0)
 
             sft_m = rep["sft_audit"]["metrics"]
             self.assertEqual(sft_m["leakage_count"], 0)
@@ -75,8 +89,19 @@ class TestLimitationToFixPipeline(unittest.TestCase):
             self.assertTrue(rep["dpo_audit"]["passed"])
             self.assertEqual(dpo_m["schema_valid_rate"], 1.0)
 
-            # Confirm none of the 10 held-out prompt strings appear verbatim in sft_train.jsonl
             sft_raw = Path(rep["sft_path"]).read_text(encoding="utf-8")
+            dpo_raw = Path(rep["dpo_path"]).read_text(encoding="utf-8")
+            self.assertIn("ep_extra_", sft_raw)
+            self.assertIn("Step 1: batch_size=", sft_raw)
+            self.assertIn("Integer index start_line=", sft_raw)
+            self.assertIn("healthy", dpo_raw)
+            dpo_unesc = dpo_raw.replace('\\"', '"')
+            self.assertTrue(
+                '"start_line":0.000' in dpo_unesc or '"start_line":1e-05' in dpo_unesc,
+                msg="Expected float start_line negative in DPO pool",
+            )
+
+            # Confirm none of the 10 held-out prompt strings appear verbatim in sft_train.jsonl
             for item in HELDOUT_10_PROMPTS:
                 usr = item["messages"][-1]["content"]
                 self.assertNotIn(usr, sft_raw, msg=f"Heldout leakage for {item['id']}")
@@ -93,10 +118,19 @@ class TestLimitationToFixPipeline(unittest.TestCase):
                 fix_summary={"steps_taken": ["diagnose", "curate", "full_sft", "dpo"], "learning_rate": 3e-5, "sft_epochs": 3, "dpo_epochs": 1},
                 output_sft_jsonl=sft_p,
                 output_dpo_jsonl=dpo_p,
+                episode_tag="ep_t1",
+            )
+            res2 = record_verified_selfchange_episode(
+                before_eval=self.sample_before,
+                after_eval={"passed_count": 9, "total_count": 10, "eos_rate": 1.0, "examples": []},
+                fix_summary={"steps_taken": ["diagnose", "curate", "full_sft", "dpo"], "learning_rate": 2e-5, "sft_epochs": 3, "dpo_epochs": 2},
+                output_sft_jsonl=sft_p,
+                output_dpo_jsonl=dpo_p,
+                episode_tag="ep_t2",
             )
             self.assertTrue(res["improved"])
-            self.assertGreaterEqual(res["recorded_sft_total"], 5)
-            self.assertGreaterEqual(res["recorded_dpo_total"], 5)
+            self.assertGreaterEqual(res2["recorded_sft_total"], 10)
+            self.assertGreaterEqual(res2["recorded_dpo_total"], 10)
 
             audit_sft = audit_training_dataset(
                 sft_p,

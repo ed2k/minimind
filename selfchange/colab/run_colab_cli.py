@@ -615,6 +615,56 @@ def inspect_resume_seed(promoted_dir: Path) -> dict:
     }
 
 
+def _upload_file_chunked(
+    session: str,
+    local_path: Path,
+    remote_path: str,
+    work_dir: Path,
+    run_cmd: Callable = subprocess.run,
+    chunk_bytes: int = 25 * 1024 * 1024,
+) -> list[str]:
+    """Upload file directly if <= chunk_bytes, else shard and reassemble remotely to avoid proxy 500s."""
+    local_path = Path(local_path)
+    if local_path.stat().st_size <= chunk_bytes:
+        run_cmd(["colab", "upload", "-s", session, str(local_path), remote_path], check=True)
+        return [remote_path]
+
+    stem_tag = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in local_path.stem)
+    chunk_dir = Path(work_dir) / "upload_chunks" / stem_tag
+    chunk_dir.mkdir(parents=True, exist_ok=True)
+    remote_parts: list[str] = []
+    idx = 0
+    with local_path.open("rb") as rf:
+        while True:
+            buf = rf.read(chunk_bytes)
+            if not buf:
+                break
+            part_name = f"part_{idx:03d}"
+            local_part = chunk_dir / part_name
+            local_part.write_bytes(buf)
+            remote_part = f"/content/_seed_part_{stem_tag}_{idx:03d}"
+            run_cmd(["colab", "upload", "-s", session, str(local_part), remote_part], check=True)
+            remote_parts.append(remote_part)
+            idx += 1
+
+    reassemble_script = Path(work_dir) / f"step_reassemble_{stem_tag}.py"
+    reassemble_src = f"""from pathlib import Path
+
+dst = Path({remote_path!r})
+dst.parent.mkdir(parents=True, exist_ok=True)
+parts = {remote_parts!r}
+with dst.open("wb") as wf:
+    for p_str in parts:
+        p = Path(p_str)
+        wf.write(p.read_bytes())
+        p.unlink(missing_ok=True)
+print(f"Reassembled {{dst}} ({{dst.stat().st_size}} bytes) from {{len(parts)}} parts", flush=True)
+"""
+    atomic_write_text(reassemble_script, reassemble_src)
+    run_cmd(["colab", "exec", "-s", session, "--timeout", "180", "-f", str(reassemble_script)], check=True)
+    return [remote_path]
+
+
 def seed_colab_vm_from_promoted(
     session: str,
     seed_plan: dict,
@@ -660,8 +710,7 @@ print(f"Seeded {mirror} with {len(list(mirror.rglob('*')))} entries", flush=True
         run_cmd(["colab", "exec", "-s", session, "--timeout", "120", "-f", str(unpack_script)], check=True)
 
         for local_w, remote_w in seed_plan["weight_uploads"]:
-            run_cmd(["colab", "upload", "-s", session, local_w, remote_w], check=True)
-            uploaded.append(remote_w)
+            uploaded.extend(_upload_file_chunked(session, Path(local_w), remote_w, work_dir, run_cmd=run_cmd))
         return {"seeded": True, "mode": "full_mirror", "uploaded_files": uploaded}
 
     # weight_only fallback
@@ -675,8 +724,7 @@ print(f"Prepared weight dir {{target}}", flush=True)
 """
     atomic_write_text(prep_script, prep_src)
     run_cmd(["colab", "exec", "-s", session, "--timeout", "60", "-f", str(prep_script)], check=True)
-    run_cmd(["colab", "upload", "-s", session, str(seed_plan["primary_weight"]), remote_w], check=True)
-    uploaded.append(remote_w)
+    uploaded.extend(_upload_file_chunked(session, Path(seed_plan["primary_weight"]), remote_w, work_dir, run_cmd=run_cmd))
     return {"seeded": True, "mode": "weight_only", "uploaded_files": uploaded}
 
 

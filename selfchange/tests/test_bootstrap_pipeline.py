@@ -13,6 +13,7 @@ from selfchange.bootstrap.offline_rft_dpo import collect_offline_rollouts, run_o
 from selfchange.bootstrap.setup_base import build_anchor_split, setup_micro_model
 from selfchange.bootstrap.warmstart_sft import run_warmstart_curriculum
 from selfchange.colab.run_colab_cli import (
+    _upload_file_chunked,
     build_remote_phase_scripts,
     inspect_resume_seed,
     persist_improved_weights_from_colab,
@@ -419,6 +420,36 @@ class TestBootstrapPipeline(unittest.TestCase):
             self.assertTrue(any(c[5].endswith("/cand_768.pth") for c in uploads4))
             step3_file = [Path(c[-1]) for c in cmds4 if c[:2] == ["colab", "exec"] and Path(c[-1]).name == "step3_autonomous.py"][0]
             self.assertIn("--model-path", step3_file.read_text(encoding="utf-8"))
+
+    def test_upload_file_chunked_small_and_large(self) -> None:
+        import ast
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_p = Path(tmp)
+            work = tmp_p / "work"
+            small = tmp_p / "small.pth"
+            small.write_bytes(b"123456")
+            large = tmp_p / "large_cand.pth"
+            large.write_bytes(b"A" * 25)
+
+            cmds: list[list[str]] = []
+
+            def _mock(cmd, **_kwargs):
+                cmds.append(cmd)
+                return type("Proc", (), {"returncode": 0})()
+
+            out_s = _upload_file_chunked("sess", small, "/content/small.pth", work, run_cmd=_mock, chunk_bytes=10)
+            self.assertEqual(out_s, ["/content/small.pth"])
+            self.assertEqual(cmds, [["colab", "upload", "-s", "sess", str(small), "/content/small.pth"]])
+
+            cmds.clear()
+            out_l = _upload_file_chunked("sess", large, "/content/dest/large_cand.pth", work, run_cmd=_mock, chunk_bytes=10)
+            self.assertEqual(out_l, ["/content/dest/large_cand.pth"])
+            uploads = [c for c in cmds if c[:2] == ["colab", "upload"]]
+            execs = [c for c in cmds if c[:2] == ["colab", "exec"]]
+            self.assertEqual(len(uploads), 3)
+            self.assertEqual(len(execs), 1)
+            ast.parse(Path(execs[0][-1]).read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":
