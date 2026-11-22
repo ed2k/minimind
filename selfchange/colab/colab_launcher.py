@@ -50,17 +50,51 @@ def _is_real_weight_file(path: Path) -> bool:
         return False
 
 
+def _torch_available() -> bool:
+    try:
+        __import__("torch")
+        return True
+    except ImportError:
+        return False
+
+
+def _resolve_gguf_candidate(workspace_dir: Path) -> tuple[Path, str] | None:
+    gguf_dir = workspace_dir / "promoted_models" / "gguf"
+    meta_file = gguf_dir / "latest_gguf.json"
+    if meta_file.is_file():
+        try:
+            meta = json.loads(meta_file.read_text(encoding="utf-8"))
+            raw = meta.get("champion_gguf") or (meta.get("selected_artifact") or {}).get("path")
+            if raw:
+                p = Path(raw)
+                if not p.is_file():
+                    p = gguf_dir / p.name
+                if _is_real_weight_file(p):
+                    return p.resolve(), "gguf_latest"
+        except Exception:
+            pass
+    champ_gguf = gguf_dir / "champion.gguf"
+    if _is_real_weight_file(champ_gguf):
+        return champ_gguf.resolve(), "gguf_champion"
+    if gguf_dir.is_dir():
+        for g in sorted(gguf_dir.glob("*.gguf")):
+            if _is_real_weight_file(g):
+                return g.resolve(), f"gguf_{g.stem}"
+    return None
+
+
 def resolve_model_checkpoint(
     repo_root: Path,
     workspace_dir: Path,
     profile: ComputeProfile,
     explicit_model_path: Path | None = None,
 ) -> tuple[Path | None, str]:
-    """Resolve the best available MiniMind checkpoint in priority order without silent fallback."""
+    """Resolve the best available MiniMind checkpoint (supporting PyTorch .pth and zero-PyTorch .gguf)."""
     repo_root = Path(repo_root).resolve()
     workspace_dir = Path(workspace_dir).resolve()
     moe_suffix = "_moe" if profile.use_moe else ""
     hs = profile.hidden_size
+    has_torch = _torch_available()
 
     champ_file = workspace_dir / "champion.json"
     if champ_file.is_file():
@@ -82,6 +116,11 @@ def resolve_model_checkpoint(
         if _is_real_weight_file(cand_exp):
             return cand_exp.resolve(), "explicit"
 
+    if not has_torch:
+        gguf_hit = _resolve_gguf_candidate(workspace_dir)
+        if gguf_hit is not None:
+            return gguf_hit
+
     candidates = [
         ("offline_dpo_r1", workspace_dir / "models" / "candidates" / f"offline_dpo_r1_{hs}{moe_suffix}.pth"),
         ("offline_rft_r1_merged", workspace_dir / "models" / "candidates" / f"offline_rft_r1_merged_{hs}{moe_suffix}.pth"),
@@ -94,11 +133,15 @@ def resolve_model_checkpoint(
     for label, path in candidates:
         if _is_real_weight_file(path):
             return path.resolve(), label
+
+    gguf_hit = _resolve_gguf_candidate(workspace_dir)
+    if gguf_hit is not None:
+        return gguf_hit
     return None, "none"
 
 
 class MiniMindProposerSession:
-    """Reusable cached MiniMind-3 session supporting dynamic weight hot-reloading, strict eval, and exploration."""
+    """Reusable MiniMind-3 session supporting PyTorch .pth and zero-PyTorch llama.cpp .gguf checkpoints."""
 
     def __init__(
         self,
@@ -108,6 +151,8 @@ class MiniMindProposerSession:
         autonomy_level: int = 1,
         workspace_dir: Path | None = None,
         enable_exploration: bool = True,
+        llama_bin_dir: Path | None = None,
+        llama_base_url: str | None = None,
     ):
         self.initial_model_path = Path(initial_model_path).resolve()
         self.tokenizer_path = Path(tokenizer_path).resolve()
@@ -115,13 +160,29 @@ class MiniMindProposerSession:
         self.autonomy_level = autonomy_level
         self.workspace_dir = Path(workspace_dir).resolve() if workspace_dir is not None else None
         self.enable_exploration = enable_exploration
+        self.llama_bin_dir = Path(llama_bin_dir).resolve() if llama_bin_dir is not None else None
+        self.llama_base_url = llama_base_url
         self.loaded_path: Path | None = None
         self.model = None
         self.tokenizer = None
+        self._llama_server = None
         self.model_config: dict | None = load_model_config(self.initial_model_path)
         self.last_scorecard: dict | None = None
         self.last_exploration: dict | None = None
         self._scorecard_cache: dict[tuple[str, int], dict] = {}
+
+    @property
+    def is_gguf_mode(self) -> bool:
+        if self.loaded_path is not None:
+            return self.loaded_path.suffix.lower() == ".gguf"
+        return self.initial_model_path.suffix.lower() == ".gguf"
+
+    def close(self) -> None:
+        if self._llama_server is not None:
+            self._llama_server.close()
+            self._llama_server = None
+            if self.loaded_path is not None and self.loaded_path.suffix.lower() == ".gguf":
+                self.model = None
 
     def _ensure_loaded(self, target_path: Path | None = None) -> None:
         desired = (
@@ -129,10 +190,33 @@ class MiniMindProposerSession:
             if (target_path is not None and _is_real_weight_file(Path(target_path)))
             else self.initial_model_path
         )
+        if desired.suffix.lower() == ".gguf":
+            if self._llama_server is not None and self.loaded_path == desired:
+                return
+            from selfchange.training.llamacpp_backend import LlamaCppServerSession
+
+            if self._llama_server is None:
+                self._llama_server = LlamaCppServerSession(
+                    desired,
+                    ctx_size=max(1024, self.profile.max_total_len),
+                    bin_dir=self.llama_bin_dir,
+                    base_url=self.llama_base_url,
+                )
+            else:
+                self._llama_server.reload(desired)
+            self.model = self._llama_server
+            self.tokenizer = "llamacpp_gguf"
+            self.loaded_path = desired
+            self.model_config = load_model_config(desired) or self.model_config
+            return
+
         if self.model is not None and self.loaded_path == desired:
             return
         from selfchange.training.model_loader import load_minimind_model
 
+        if self._llama_server is not None:
+            self._llama_server.close()
+            self._llama_server = None
         if self.model is not None:
             self.model = None
             try:
@@ -154,6 +238,25 @@ class MiniMindProposerSession:
         key = (str(self.loaded_path), mtime)
         if key in self._scorecard_cache:
             card = self._scorecard_cache[key]
+        elif self.is_gguf_mode:
+            assert self._llama_server is not None
+            max_new = min(160, self.profile.max_gen_len)
+            card = evaluate_model_strict_suite(
+                None,
+                None,
+                self.profile,
+                max_tasks=20,
+                k_rollouts=1,
+                reply_fn=lambda msgs, tls, temp: self._llama_server.generate_reply(
+                    msgs,
+                    tools=tls,
+                    temperature=temp,
+                    max_new_tokens=max_new,
+                    open_thinking=True,
+                ),
+            )
+            card["mean_tok_per_sec"] = self._llama_server.mean_tok_per_sec()
+            self._scorecard_cache[key] = card
         else:
             card = evaluate_model_strict_suite(self.model, self.tokenizer, self.profile, max_tasks=20, k_rollouts=1)
             self._scorecard_cache[key] = card
@@ -166,8 +269,6 @@ class MiniMindProposerSession:
         return card
 
     def propose(self, ctx: CycleContext, handle: WorktreeHandle, executor: WorktreeToolExecutor) -> dict:
-        from selfchange.training.model_loader import generate_agent_reply
-
         parent_w = Path(ctx.parent.weight_path) if (ctx.parent and ctx.parent.weight_path) else None
         self._ensure_loaded(parent_w)
         assert self.model is not None and self.tokenizer is not None
@@ -176,16 +277,31 @@ class MiniMindProposerSession:
 
         if self.enable_exploration and self.workspace_dir is not None:
             exp_tasks = build_exploration_tasks(self.last_scorecard, ctx.cycle_index, max_tasks=3)
-            exp_res = run_multi_rollout_exploration(self.model, self.tokenizer, self.profile, exp_tasks, k_rollouts=4)
+            if self.is_gguf_mode:
+                assert self._llama_server is not None
+                max_new = min(160, self.profile.max_gen_len)
+                exp_res = run_multi_rollout_exploration(
+                    None,
+                    None,
+                    self.profile,
+                    exp_tasks,
+                    k_rollouts=4,
+                    reply_fn=lambda msgs, tls, temp: self._llama_server.generate_reply(
+                        msgs,
+                        tools=tls,
+                        temperature=temp,
+                        max_new_tokens=max_new,
+                        open_thinking=True,
+                    ),
+                )
+            else:
+                exp_res = run_multi_rollout_exploration(self.model, self.tokenizer, self.profile, exp_tasks, k_rollouts=4)
             self.last_exploration = exp_res
             traj_f = self.workspace_dir / "trajectories.jsonl"
             traj_f.parent.mkdir(parents=True, exist_ok=True)
             with traj_f.open("a", encoding="utf-8") as tf:
                 for row in exp_res["trajectories"]:
                     tf.write(json.dumps({"cycle_index": ctx.cycle_index, **row}, ensure_ascii=False) + "\n")
-
-        eos_tok = self.tokenizer.eos_token or "<|im_end|>"
-        pad_tok = self.tokenizer.pad_token or "<|endoftext|>"
 
         cfg_path = handle.path / "selfchange" / "mutable" / "config.json"
         cfg = json.loads(cfg_path.read_text(encoding="utf-8")) if cfg_path.is_file() else {"max_turns": 4}
@@ -200,18 +316,37 @@ class MiniMindProposerSession:
         )
         compact_tools = _compact_tools(tool_names)
 
-        def _model_fn(messages: list[dict], tools: list[dict]) -> str:
-            raw = generate_agent_reply(
-                self.model,
-                self.tokenizer,
-                messages,
-                tools,
-                max_new_tokens=min(160, self.profile.max_gen_len),
-                temperature=float(cfg.get("temperature", 0.2)),
-                top_p=float(cfg.get("top_p", 0.9)),
-                open_thinking=True,
-            )
-            return raw.replace(eos_tok, "").replace(pad_tok, "").strip()
+        if self.is_gguf_mode:
+            assert self._llama_server is not None
+
+            def _model_fn(messages: list[dict], tools: list[dict]) -> str:
+                txt, _ = self._llama_server.generate_reply(
+                    messages,
+                    tools=tools,
+                    temperature=float(cfg.get("temperature", 0.2)),
+                    max_new_tokens=min(160, self.profile.max_gen_len),
+                    top_p=float(cfg.get("top_p", 0.9)),
+                    open_thinking=True,
+                )
+                return txt
+        else:
+            from selfchange.training.model_loader import generate_agent_reply
+
+            eos_tok = self.tokenizer.eos_token or "<|im_end|>"
+            pad_tok = self.tokenizer.pad_token or "<|endoftext|>"
+
+            def _model_fn(messages: list[dict], tools: list[dict]) -> str:
+                raw = generate_agent_reply(
+                    self.model,
+                    self.tokenizer,
+                    messages,
+                    tools,
+                    max_new_tokens=min(160, self.profile.max_gen_len),
+                    temperature=float(cfg.get("temperature", 0.2)),
+                    top_p=float(cfg.get("top_p", 0.9)),
+                    open_thinking=True,
+                )
+                return raw.replace(eos_tok, "").replace(pad_tok, "").strip()
 
         initial_state = diagnose_weakness_state(
             self.last_scorecard,
@@ -509,8 +644,10 @@ def launch_colab_session(
     eval_with_model: bool = False,
     extra_eval_fn=None,
     persist_only_if_improved: bool = True,
+    llama_bin_dir: Path | None = None,
+    llama_base_url: str | None = None,
 ) -> dict:
-    """Re-entrant Colab session bootstrap: restore Drive -> run cycles -> report -> sync Drive."""
+    """Re-entrant Colab/local session bootstrap: restore Drive -> run cycles -> report -> sync Drive."""
     repo_root = Path(repo_root).resolve()
     workspace_dir = Path(workspace_dir).resolve()
     workspace_dir.mkdir(parents=True, exist_ok=True)
@@ -558,11 +695,16 @@ def launch_colab_session(
                 profile,
                 autonomy_level=autonomy_level,
                 workspace_dir=workspace_dir,
+                llama_bin_dir=llama_bin_dir,
+                llama_base_url=llama_base_url,
             )
             proposer_fn = session.propose
             if eval_with_model and extra_eval_fn is None:
                 extra_eval_fn = session.eval_candidate
 
+    gguf_mode = bool(session is not None and session.is_gguf_mode)
+    backend_name = "llamacpp_gguf" if gguf_mode else ("pytorch" if session is not None else "none")
+    effective_dry_run = bool(dry_run or gguf_mode)
     proposer_mode = "minimind" if session is not None else ("custom" if proposer_fn is not None else ("dry_run" if dry_run else "scripted_fallback"))
 
     resolved_anchor: Path | None = None
@@ -578,13 +720,14 @@ def launch_colab_session(
     session_info = {
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "profile": profile.name,
+        "backend": backend_name,
         "proposer_mode": proposer_mode,
         "model_source": model_source,
         "active_model_path": str(resolved_model) if resolved_model else None,
         "eval_with_model": bool(extra_eval_fn is not None),
         "anchor_path": str(resolved_anchor) if resolved_anchor else None,
         "require_model": require_model,
-        "dry_run": dry_run,
+        "dry_run": effective_dry_run,
         "persist_only_if_improved": persist_only_if_improved,
     }
     atomic_write_text(workspace_dir / "session_info.json", json.dumps(session_info, indent=2, ensure_ascii=False) + "\n")
@@ -599,101 +742,106 @@ def launch_colab_session(
         cycle_config=CycleConfig(
             autonomy_level=autonomy_level,
             train_every_n_cycles=train_every_n_cycles,
-            dry_run_training=dry_run,
+            dry_run_training=effective_dry_run,
             anchor_path=resolved_anchor,
             base_weight_path=resolved_model,
         ),
         extra_eval_fn=extra_eval_fn,
         session=session,
-        live_self_improve=(session is not None and not dry_run),
+        live_self_improve=(session is not None and not dry_run and not gguf_mode),
         model_config=session.model_config if session is not None else None,
     )
 
-    if not runner.registry.load_archive():
-        head_proc = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo_root, capture_output=True, text=True)
-        head_sha = head_proc.stdout.strip() if head_proc.returncode == 0 else "0" * 40
-        surv_s, eval_s, rep_s, eff_s, tot_s = 1.0, 1.0, 1.0, 1.0, 0.95
-        if extra_eval_fn is not None:
-            cal = runner.verifier.verify_candidate(
-                repo_root,
-                check_git=False,
-                extra_eval_fn=lambda wt: runner._invoke_extra_eval(wt, resolved_model),
-                min_extra_score=0.0,
+    try:
+        if not runner.registry.load_archive():
+            head_proc = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo_root, capture_output=True, text=True)
+            head_sha = head_proc.stdout.strip() if head_proc.returncode == 0 else "0" * 40
+            surv_s, eval_s, rep_s, eff_s, tot_s = 1.0, 1.0, 1.0, 1.0, 0.95
+            if extra_eval_fn is not None:
+                cal = runner.verifier.verify_candidate(
+                    repo_root,
+                    check_git=False,
+                    extra_eval_fn=lambda wt: runner._invoke_extra_eval(wt, resolved_model),
+                    min_extra_score=0.0,
+                )
+                surv_s, eval_s, rep_s, eff_s, tot_s = (
+                    cal.survival_score,
+                    cal.eval_score,
+                    cal.self_repair_score,
+                    cal.efficiency_score,
+                    cal.total_score,
+                )
+                if "gate3" in cal.gates:
+                    runner._best_extra_score = float(cal.gates["gate3"].details.get("extra_score", 0.0))
+            runner.registry.register_node(
+                LineageNode(
+                    node_id="bootstrap_0",
+                    parent_id=None,
+                    commit_sha=head_sha,
+                    weight_path=str(resolved_model) if resolved_model else None,
+                    survival_score=surv_s,
+                    eval_score=eval_s,
+                    self_repair_score=rep_s,
+                    efficiency_score=eff_s,
+                    total_score=tot_s,
+                    status="bootstrap",
+                    hypothesis="initial verified baseline",
+                    created_at=datetime.now(timezone.utc).isoformat(),
+                )
             )
-            surv_s, eval_s, rep_s, eff_s, tot_s = (
-                cal.survival_score,
-                cal.eval_score,
-                cal.self_repair_score,
-                cal.efficiency_score,
-                cal.total_score,
+
+        start_champion = runner.registry.get_champion()
+
+        def _persist_and_sync() -> dict:
+            decision = assess_run_improvement(
+                workspace_dir,
+                start_champion=start_champion,
+                end_champion=runner.registry.get_champion(),
+                resumed=bool(restore_info.get("restored")),
             )
-            if "gate3" in cal.gates:
-                runner._best_extra_score = float(cal.gates["gate3"].details.get("extra_score", 0.0))
-        runner.registry.register_node(
-            LineageNode(
-                node_id="bootstrap_0",
-                parent_id=None,
-                commit_sha=head_sha,
-                weight_path=str(resolved_model) if resolved_model else None,
-                survival_score=surv_s,
-                eval_score=eval_s,
-                self_repair_score=rep_s,
-                efficiency_score=eff_s,
-                total_score=tot_s,
-                status="bootstrap",
-                hypothesis="initial verified baseline",
-                created_at=datetime.now(timezone.utc).isoformat(),
+            session_info["updated_at"] = datetime.now(timezone.utc).isoformat()
+            session_info["persistence_decision"] = decision
+            atomic_write_text(
+                workspace_dir / "session_info.json",
+                json.dumps(session_info, indent=2, ensure_ascii=False) + "\n",
             )
+            generate_run_report(workspace_dir)
+            if drive_sync is not None:
+                sync_weights = True if not persist_only_if_improved else bool(decision["persist_weights"])
+                drive_sync.sync_to_drive(repo_root / "selfchange" / "mutable", include_weights=sync_weights)
+            return decision
+
+        sup = Supervisor(
+            repo_root=repo_root,
+            workspace_dir=workspace_dir,
+            profile=profile,
+            cycle_runner=runner,
+            kernel_dir=kdir,
+            manifest_path=mpath,
+            register_signals=False,
+            on_cycle_end=lambda _st, _out: _persist_and_sync(),
         )
+        sup.load_state()
+        final_state = sup.run(max_cycles=max_cycles)
 
-    start_champion = runner.registry.get_champion()
-
-    def _persist_and_sync() -> dict:
-        decision = assess_run_improvement(
-            workspace_dir,
-            start_champion=start_champion,
-            end_champion=runner.registry.get_champion(),
-            resumed=bool(restore_info.get("restored")),
-        )
-        session_info["updated_at"] = datetime.now(timezone.utc).isoformat()
-        session_info["persistence_decision"] = decision
-        atomic_write_text(
-            workspace_dir / "session_info.json",
-            json.dumps(session_info, indent=2, ensure_ascii=False) + "\n",
-        )
-        generate_run_report(workspace_dir)
-        if drive_sync is not None:
-            sync_weights = True if not persist_only_if_improved else bool(decision["persist_weights"])
-            drive_sync.sync_to_drive(repo_root / "selfchange" / "mutable", include_weights=sync_weights)
-        return decision
-
-    sup = Supervisor(
-        repo_root=repo_root,
-        workspace_dir=workspace_dir,
-        profile=profile,
-        cycle_runner=runner,
-        kernel_dir=kdir,
-        manifest_path=mpath,
-        register_signals=False,
-        on_cycle_end=lambda _st, _out: _persist_and_sync(),
-    )
-    sup.load_state()
-    final_state = sup.run(max_cycles=max_cycles)
-
-    persistence_decision = _persist_and_sync()
-    report_path = workspace_dir / "report.md"
-    champ = runner.registry.get_champion()
-    return {
-        "restore": restore_info,
-        "proposer_mode": proposer_mode,
-        "active_model_path": str(resolved_model) if resolved_model else None,
-        "model_source": model_source,
-        "eval_with_model": bool(extra_eval_fn is not None),
-        "persistence_decision": persistence_decision,
-        "state": asdict(final_state),
-        "champion": champ.to_dict() if champ else None,
-        "report_path": str(report_path),
-    }
+        persistence_decision = _persist_and_sync()
+        report_path = workspace_dir / "report.md"
+        champ = runner.registry.get_champion()
+        return {
+            "restore": restore_info,
+            "backend": backend_name,
+            "proposer_mode": proposer_mode,
+            "active_model_path": str(resolved_model) if resolved_model else None,
+            "model_source": model_source,
+            "eval_with_model": bool(extra_eval_fn is not None),
+            "persistence_decision": persistence_decision,
+            "state": asdict(final_state),
+            "champion": champ.to_dict() if champ else None,
+            "report_path": str(report_path),
+        }
+    finally:
+        if session is not None:
+            session.close()
 
 
 def main() -> int:

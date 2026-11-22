@@ -439,6 +439,122 @@ if __name__ == "__main__":
     return {"step1_setup.py": base_scripts["step1_setup.py"], "step2_search_minimal_cpu.py": step2_search}
 
 
+def _resolve_export_pths(workspace_dir: Path, promoted_dir: Path, export_pth: str | None) -> list[Path]:
+    paths: list[Path] = []
+    if export_pth:
+        for piece in str(export_pth).split(","):
+            s = piece.strip()
+            if not s:
+                continue
+            p = Path(s).resolve()
+            if p.is_file() and p not in paths:
+                paths.append(p)
+        return paths
+
+    defaults = [
+        promoted_dir / "minimal_cpu_search" / "minimal_cpu_champion.pth",
+        promoted_dir / "limitation_fix_v2" / "fixed_champion_768.pth",
+    ]
+    latest_json = promoted_dir / "latest_champion.json"
+    if latest_json.is_file():
+        try:
+            pw = json.loads(latest_json.read_text(encoding="utf-8")).get("primary_weight")
+            if pw:
+                defaults.append(Path(pw))
+        except Exception:
+            pass
+    for d in defaults:
+        if d.is_file() and d.resolve() not in paths:
+            paths.append(d.resolve())
+    return paths
+
+
+def _extract_gguf_artifacts(tar_local: Path, gguf_dir: Path) -> dict:
+    gguf_dir = Path(gguf_dir).resolve()
+    gguf_dir.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(tar_local, "r:gz") as tf:
+        tf.extractall(gguf_dir, filter="data")
+
+    latest_file = gguf_dir / "latest_gguf.json"
+    info: dict = {"gguf_dir": str(gguf_dir), "files": sorted(p.name for p in gguf_dir.iterdir() if p.is_file())}
+    if latest_file.is_file():
+        try:
+            meta = json.loads(latest_file.read_text(encoding="utf-8"))
+            if meta.get("champion_gguf"):
+                meta["champion_gguf"] = str((gguf_dir / Path(meta["champion_gguf"]).name).resolve())
+            if isinstance(meta.get("selected_artifact"), dict) and meta["selected_artifact"].get("path"):
+                meta["selected_artifact"]["path"] = str((gguf_dir / Path(meta["selected_artifact"]["path"]).name).resolve())
+            for rep in meta.get("reports", []):
+                if isinstance(rep.get("best_gguf"), dict) and rep["best_gguf"].get("path"):
+                    rep["best_gguf"]["path"] = str((gguf_dir / Path(rep["best_gguf"]["path"]).name).resolve())
+                for art in rep.get("artifacts", []):
+                    if isinstance(art, dict) and art.get("path"):
+                        art["path"] = str((gguf_dir / Path(art["path"]).name).resolve())
+            atomic_write_text(latest_file, json.dumps(meta, indent=2, ensure_ascii=False) + "\n")
+            info["latest_gguf"] = meta
+        except Exception:
+            pass
+    return info
+
+
+def build_gguf_export_script(
+    remote_pths: list[str],
+    quants: str = "Q8_0,Q4_K_M",
+    verify: bool = True,
+    max_tasks: int = 20,
+    fallback_remote_pth: str | None = None,
+) -> str:
+    """Build remote Colab script that exports .pth champion(s) -> verified GGUF and packs /content/run_gguf_artifacts.tar.gz."""
+    pth_list = list(remote_pths)
+    verify_flag = "--verify" if verify else "--no-verify"
+    return f"""import json
+import os
+import subprocess
+import sys
+import tarfile
+from pathlib import Path
+
+repo = Path("/content/minimind")
+ws = repo / "selfchange" / "workspace"
+gguf_dir = ws / "promoted_models" / "gguf"
+gguf_dir.mkdir(parents=True, exist_ok=True)
+os.chdir(repo)
+
+pths = [p for p in {pth_list!r} if Path(p).is_file()]
+if not pths:
+    champ_json = ws / "champion.json"
+    if champ_json.is_file():
+        try:
+            cw = json.loads(champ_json.read_text(encoding="utf-8")).get("champion", {{}}).get("weight_path")
+            if cw:
+                cp = Path(cw) if Path(cw).is_absolute() else (ws / cw)
+                if cp.is_file():
+                    pths = [str(cp.resolve())]
+        except Exception:
+            pass
+if not pths and {fallback_remote_pth!r} and Path({fallback_remote_pth!r}).is_file():
+    pths = [{fallback_remote_pth!r}]
+if not pths:
+    raise FileNotFoundError("No .pth checkpoint available on Colab VM to export to GGUF.")
+
+cmd = [sys.executable, "-m", "selfchange.colab.export_gguf", "--out-dir", str(gguf_dir), "--quants", {quants!r}, {verify_flag!r}, "--max-tasks", {str(int(max_tasks))!r}]
+for p in pths:
+    cmd.extend(["--pth", p])
+proc = subprocess.run(cmd, cwd=str(repo), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+if proc.stdout:
+    print(proc.stdout[-8000:], flush=True)
+if proc.returncode != 0:
+    raise RuntimeError(f"export_gguf failed with exit={{proc.returncode}}")
+
+tar_out = Path("/content/run_gguf_artifacts.tar.gz")
+with tarfile.open(tar_out, "w:gz") as tf:
+    for p in sorted(gguf_dir.iterdir()):
+        if p.is_file() and (p.suffix == ".gguf" or p.suffix == ".json"):
+            tf.add(p, arcname=p.name)
+print(f"Packed {{tar_out}} ({{tar_out.stat().st_size}} bytes)", flush=True)
+"""
+
+
 def _ensure_gdrive_folder(folder_name: str, run_cmd: Callable) -> str | None:
     search = run_cmd(
         ["gdrive", "readonly", "search", "--json", "--name-exact", folder_name],
@@ -841,15 +957,19 @@ def run_colab_cli_pipeline(
     search_max_rungs: int = 4,
     overlay_local_code: bool = False,
     repo_root: Path | None = None,
+    export_pth: str | None = None,
+    gguf_quants: str = "Q8_0,Q4_K_M",
 ) -> dict:
-    """Provision a Colab GPU VM, run autonomous loop or minimal-CPU Pareto search, persist if improved, and stop VM."""
+    """Provision a Colab GPU VM, run autonomous loop, minimal-CPU search, or GGUF export/sync, and stop VM."""
     workspace_dir = Path(workspace_dir).resolve()
     run_id = datetime.now(timezone.utc).strftime("run_%Y%m%d_%H%M%S")
     run_dir = workspace_dir / "colab_runs" / run_id
     scripts_dir = run_dir / "scripts"
     diag_dir = run_dir / "diagnostics"
     promoted_dir = workspace_dir / "promoted_models"
+    gguf_dir = promoted_dir / "gguf"
 
+    export_uploads: list[tuple[Path, str]] = []
     if mode == "search_minimal_cpu":
         will_resume = False
         skip_bootstrap = False
@@ -862,12 +982,52 @@ def run_colab_cli_pipeline(
             always_persist_weights=always_persist_weights or True,
         )
         seed_plan = {"mode": "none", "reason": "minimal_cpu_search"}
+    elif mode == "export_gguf":
+        will_resume = False
+        skip_bootstrap = True
+        local_pths = _resolve_export_pths(workspace_dir, promoted_dir, export_pth)
+        if not local_pths:
+            raise FileNotFoundError(
+                f"No .pth checkpoints found to export to GGUF (export_pth={export_pth!r}, promoted_dir={promoted_dir})."
+            )
+        remote_pths: list[str] = []
+        for idx, pth in enumerate(local_pths):
+            remote_p = f"/content/minimind/selfchange/workspace/export_inputs/{idx}_{pth.name}"
+            remote_pths.append(remote_p)
+            export_uploads.append((pth, remote_p))
+            sib_cfg = pth.with_suffix(".config.json")
+            if sib_cfg.is_file():
+                export_uploads.append((sib_cfg, str(Path(remote_p).with_suffix(".config.json"))))
+            elif (promoted_dir / "model_config.json").is_file():
+                export_uploads.append((promoted_dir / "model_config.json", str(Path(remote_p).with_suffix(".config.json"))))
+
+        base_scripts = build_remote_phase_scripts(
+            repo_url=repo_url,
+            branch=branch,
+            total_traces=total_traces,
+            lightweight_setup=True,
+        )
+        scripts = {
+            "step1_setup.py": base_scripts["step1_setup.py"],
+            "step_prep_export.py": f"""from pathlib import Path
+Path('/content/minimind/selfchange/workspace/export_inputs').mkdir(parents=True, exist_ok=True)
+print('Prepared export_inputs', flush=True)
+""",
+            "step2_export_gguf.py": build_gguf_export_script(remote_pths, quants=gguf_quants, verify=True, max_tasks=20),
+        }
+        seed_plan = {"mode": "none", "reason": "export_gguf"}
     else:
         seed_plan = inspect_resume_seed(promoted_dir) if resume else {"mode": "none", "reason": "resume_disabled"}
         will_resume = seed_plan["mode"] != "none"
         skip_bootstrap = bool(will_resume and skip_bootstrap_on_resume)
         lightweight_setup = bool(will_resume and skip_bootstrap)
         explicit_model_path = seed_plan.get("remote_model_path") if seed_plan["mode"] == "weight_only" else None
+        if mode == "sync_train_gguf":
+            traj_local = workspace_dir / "trajectories.jsonl"
+            if traj_local.is_file() and traj_local.stat().st_size > 0:
+                seed_plan.setdefault("extra_uploads", []).append(
+                    (str(traj_local), "/content/minimind/selfchange/workspace/trajectories.jsonl")
+                )
 
         scripts = build_remote_phase_scripts(
             repo_url=repo_url,
@@ -880,6 +1040,19 @@ def run_colab_cli_pipeline(
             lightweight_setup=lightweight_setup,
             explicit_model_path=explicit_model_path,
         )
+        if mode == "sync_train_gguf":
+            fallback_p = seed_plan.get("remote_model_path") or (
+                f"/content/drive_mirror/{seed_plan['weight_uploads'][0][1].split('/content/drive_mirror/', 1)[-1]}"
+                if seed_plan.get("weight_uploads")
+                else None
+            )
+            scripts["step4_export_gguf.py"] = build_gguf_export_script(
+                [],
+                quants=gguf_quants,
+                verify=True,
+                max_tasks=20,
+                fallback_remote_pth=fallback_p,
+            )
     for name, content in scripts.items():
         atomic_write_text(scripts_dir / name, content)
 
@@ -888,6 +1061,7 @@ def run_colab_cli_pipeline(
     seed_result: dict = {"seeded": False, "mode": seed_plan["mode"], "uploaded_files": []}
     overlay_files: list[str] = []
     persistence: dict = {"persisted": False, "reason": "not_evaluated", "local_weights": []}
+    gguf_result: dict = {}
 
     try:
         run_cmd(["colab", "exec", "-s", session, "--timeout", "900", "-f", str(scripts_dir / "step1_setup.py")], check=True)
@@ -898,6 +1072,15 @@ def run_colab_cli_pipeline(
             proc = run_cmd(["colab", "exec", "-s", session, "--timeout", "2400", "-f", str(scripts_dir / "step2_search_minimal_cpu.py")], check=False)
             if getattr(proc, "returncode", 0) != 0:
                 run_error = f"step2_search_minimal_cpu exited with {proc.returncode}"
+        elif mode == "export_gguf":
+            run_cmd(["colab", "exec", "-s", session, "--timeout", "120", "-f", str(scripts_dir / "step_prep_export.py")], check=True)
+            uploaded_exp: list[str] = []
+            for local_p, remote_p in export_uploads:
+                uploaded_exp.extend(_upload_file_chunked(session, local_p, remote_p, run_dir, run_cmd=run_cmd))
+            seed_result = {"seeded": True, "mode": "export_gguf", "uploaded_files": uploaded_exp}
+            exp_proc = run_cmd(["colab", "exec", "-s", session, "--timeout", "1800", "-f", str(scripts_dir / "step2_export_gguf.py")], check=False)
+            if getattr(exp_proc, "returncode", 0) != 0:
+                run_error = f"step2_export_gguf exited with {exp_proc.returncode}"
         else:
             if will_resume:
                 seed_result = seed_colab_vm_from_promoted(session, seed_plan, run_dir, run_cmd=run_cmd)
@@ -909,33 +1092,46 @@ def run_colab_cli_pipeline(
             )
             if getattr(step3_proc, "returncode", 0) != 0:
                 run_error = f"step3_autonomous exited with {step3_proc.returncode}"
+            if mode == "sync_train_gguf" and run_error is None:
+                step4_proc = run_cmd(["colab", "exec", "-s", session, "--timeout", "1800", "-f", str(scripts_dir / "step4_export_gguf.py")], check=False)
+                if getattr(step4_proc, "returncode", 0) != 0:
+                    run_error = f"step4_export_gguf exited with {step4_proc.returncode}"
 
-        tar_local = run_dir / "run_diagnostics.tar.gz"
-        dl = run_cmd(["colab", "download", "-s", session, "/content/run_diagnostics.tar.gz", str(tar_local)], check=False)
-        if getattr(dl, "returncode", 1) == 0 and tar_local.is_file():
-            diag_dir.mkdir(parents=True, exist_ok=True)
-            with tarfile.open(tar_local, "r:gz") as tf:
-                tf.extractall(diag_dir, filter="data")
-            curated_dst = workspace_dir / "curated_data"
-            for ep_name in ("verified_selfchange_episodes.jsonl", "verified_selfchange_dpo.jsonl"):
-                ep_src = diag_dir / "curated_data" / ep_name
-                if not ep_src.is_file():
-                    continue
-                ep_dst = curated_dst / ep_name
-                src_lines = len(ep_src.read_text(encoding="utf-8").splitlines())
-                dst_lines = len(ep_dst.read_text(encoding="utf-8").splitlines()) if ep_dst.is_file() else 0
-                if src_lines > dst_lines:
-                    curated_dst.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(ep_src, ep_dst)
-            persistence = persist_improved_weights_from_colab(
-                session=session,
-                diagnostics_dir=diag_dir,
-                promoted_dir=promoted_dir,
-                run_id=run_id,
-                always_persist=always_persist_weights,
-                upload_drive=upload_drive,
-                run_cmd=run_cmd,
-            )
+        if mode in ("export_gguf", "sync_train_gguf"):
+            gguf_tar = run_dir / "run_gguf_artifacts.tar.gz"
+            dl_gguf = run_cmd(["colab", "download", "-s", session, "/content/run_gguf_artifacts.tar.gz", str(gguf_tar)], check=False)
+            if getattr(dl_gguf, "returncode", 1) == 0 and gguf_tar.is_file():
+                gguf_result = _extract_gguf_artifacts(gguf_tar, gguf_dir)
+            elif run_error is None:
+                run_error = "missing_gguf_artifacts_from_colab"
+
+        if mode != "export_gguf":
+            tar_local = run_dir / "run_diagnostics.tar.gz"
+            dl = run_cmd(["colab", "download", "-s", session, "/content/run_diagnostics.tar.gz", str(tar_local)], check=False)
+            if getattr(dl, "returncode", 1) == 0 and tar_local.is_file():
+                diag_dir.mkdir(parents=True, exist_ok=True)
+                with tarfile.open(tar_local, "r:gz") as tf:
+                    tf.extractall(diag_dir, filter="data")
+                curated_dst = workspace_dir / "curated_data"
+                for ep_name in ("verified_selfchange_episodes.jsonl", "verified_selfchange_dpo.jsonl"):
+                    ep_src = diag_dir / "curated_data" / ep_name
+                    if not ep_src.is_file():
+                        continue
+                    ep_dst = curated_dst / ep_name
+                    src_lines = len(ep_src.read_text(encoding="utf-8").splitlines())
+                    dst_lines = len(ep_dst.read_text(encoding="utf-8").splitlines()) if ep_dst.is_file() else 0
+                    if src_lines > dst_lines:
+                        curated_dst.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(ep_src, ep_dst)
+                persistence = persist_improved_weights_from_colab(
+                    session=session,
+                    diagnostics_dir=diag_dir,
+                    promoted_dir=promoted_dir,
+                    run_id=run_id,
+                    always_persist=always_persist_weights,
+                    upload_drive=upload_drive,
+                    run_cmd=run_cmd,
+                )
     except Exception as exc:
         run_error = repr(exc)
         raise
@@ -943,7 +1139,7 @@ def run_colab_cli_pipeline(
         if not keep_vm:
             run_cmd(["colab", "stop", "-s", session], check=False)
 
-    return {
+    out_summary = {
         "run_id": run_id,
         "session": session,
         "gpu": gpu,
@@ -955,18 +1151,23 @@ def run_colab_cli_pipeline(
         "persistence": persistence,
         "error": run_error,
     }
+    if gguf_result:
+        out_summary["gguf"] = gguf_result
+    return out_summary
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="End-to-end Colab CLI runner with auto-resume, minimal-CPU search, and gated persistence")
+    parser = argparse.ArgumentParser(description="End-to-end Colab CLI runner with auto-resume, minimal-CPU search, and GGUF export")
     parser.add_argument("--session", type=str, default="minimind-selfchange")
     parser.add_argument("--gpu", type=str, default="T4")
     parser.add_argument("--branch", type=str, default="mychanges")
     parser.add_argument("--repo-url", type=str, default="https://github.com/ed2k/minimind.git")
     parser.add_argument("--workspace-dir", type=Path, default=Path("selfchange/workspace"))
-    parser.add_argument("--mode", choices=["autonomous", "search_minimal_cpu"], default="autonomous")
+    parser.add_argument("--mode", choices=["autonomous", "search_minimal_cpu", "export_gguf", "sync_train_gguf"], default="autonomous")
     parser.add_argument("--search-rungs", type=str, default=None)
     parser.add_argument("--search-max-rungs", type=int, default=4)
+    parser.add_argument("--export-pth", type=str, default=None)
+    parser.add_argument("--gguf-quants", type=str, default="Q8_0,Q4_K_M")
     parser.add_argument("--max-cycles", type=int, default=10)
     parser.add_argument("--autonomy-level", type=int, default=1)
     parser.add_argument("--total-traces", type=int, default=3000)
@@ -998,6 +1199,8 @@ def main() -> int:
         search_rungs=args.search_rungs,
         search_max_rungs=args.search_max_rungs,
         overlay_local_code=args.overlay_local_code,
+        export_pth=args.export_pth,
+        gguf_quants=args.gguf_quants,
     )
     print(json.dumps(out, indent=2))
     return 0 if out.get("error") is None else 1
