@@ -803,6 +803,7 @@ def build_limitation_fix_and_meta_dataset(
     seed: int = 42,
     extra_sft_paths: list[Path] | None = None,
     extra_dpo_paths: list[Path] | None = None,
+    extra_heldout_prompts: list[dict] | None = None,
 ) -> dict:
     """Diagnose limitations from eval report and build an audited fix + meta-selfchange dataset."""
     repo_root = Path(repo_root).resolve()
@@ -816,16 +817,24 @@ def build_limitation_fix_and_meta_dataset(
     atomic_write_text(output_dir / "limitations_diagnosed.json", json.dumps(limitations, indent=2, ensure_ascii=False) + "\n")
 
     heldout_path = output_dir / "heldout_eval_10.jsonl"
+    combined_heldout = [*HELDOUT_10_PROMPTS, *(extra_heldout_prompts or [])]
     heldout_rows = [
-        format_sft_record({"conversations": [*item["messages"], {"role": "assistant", "content": f"HELD_OUT_PROBE:{item['id']}"}]})
-        for item in HELDOUT_10_PROMPTS
+        format_sft_record({"conversations": [*item["messages"], {"role": "assistant", "content": f"HELD_OUT_PROBE:{item.get('id', idx)}"}]})
+        for idx, item in enumerate(combined_heldout)
     ]
     write_sft_jsonl(heldout_path, heldout_rows)
     h_exact = {_extract_prompt_keys(r["conversations"])[0] for r in heldout_rows}
     h_norm = {_extract_prompt_keys(r["conversations"])[1] for r in heldout_rows}
 
+    excluded_files = {"oom_helper.py", "lr_guard.py"}
+    for item in combined_heldout:
+        for m in item.get("messages", []):
+            txt = str(m.get("content", ""))
+            for fn in re.findall(r"\b[a-zA-Z_][a-zA-Z0-9_]*\.py\b", txt):
+                excluded_files.add(Path(fn).name)
+
     raw_fixtures = collect_code_fixtures(repo_root)
-    fixtures = [fx for fx in raw_fixtures if Path(fx["filename"]).name not in ("oom_helper.py", "lr_guard.py")]
+    fixtures = [fx for fx in raw_fixtures if Path(fx["filename"]).name not in excluded_files]
     compact_fixtures = [fx for fx in fixtures if len(fx["source"].splitlines()) <= 5 and len(fx["source"]) <= 170] or fixtures
 
     target_schema = max(1, int(round(sft_count * 0.20)))

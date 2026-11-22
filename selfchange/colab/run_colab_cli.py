@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import subprocess
 import tarfile
 from datetime import datetime, timezone
@@ -245,6 +246,11 @@ def _pack_diagnostics(repo: Path, drive_mirror: Path, tar_out: Path) -> None:
             "session_info.json",
             "baseline_untouched.json",
             "baseline_prepared.json",
+            "live_scorecard_start.json",
+            "live_scorecard_end.json",
+            "live_scorecard_latest.json",
+            "curated_data/verified_selfchange_episodes.jsonl",
+            "curated_data/verified_selfchange_dpo.jsonl",
             "logs/train.log",
             "logs/train_history.jsonl",
             "logs/fatal_report.json",
@@ -261,6 +267,12 @@ def _pack_diagnostics(repo: Path, drive_mirror: Path, tar_out: Path) -> None:
             if src.is_file():
                 tf.add(src, arcname=rel)
                 added.add(rel)
+        champ_dir = ws / "promoted_models"
+        for extra_name in ("model_config.json",):
+            p = champ_dir / extra_name
+            if p.is_file() and extra_name not in added:
+                tf.add(p, arcname=extra_name)
+                added.add(extra_name)
 
 
 def main() -> None:
@@ -576,6 +588,19 @@ def inspect_resume_seed(promoted_dir: Path) -> dict:
 
     local_by_name = {p.name: p for p in cand_paths}
     primary_pth = cand_paths[0]
+    ws_dir = promoted_dir.parent
+    cur_dir = ws_dir / "curated_data"
+    extra_carry: list[tuple[str, str]] = []
+    sib_cfg = primary_pth.with_suffix(".config.json")
+    if sib_cfg.is_file():
+        extra_carry.append((str(sib_cfg), f"/content/minimind/selfchange/workspace/models/candidates/{primary_pth.stem}.config.json"))
+    elif (promoted_dir / "model_config.json").is_file():
+        extra_carry.append((str(promoted_dir / "model_config.json"), f"/content/minimind/selfchange/workspace/models/candidates/{primary_pth.stem}.config.json"))
+    for ep_name in ("verified_selfchange_episodes.jsonl", "verified_selfchange_dpo.jsonl"):
+        ep_f = cur_dir / ep_name
+        if ep_f.is_file() and ep_f.stat().st_size > 0:
+            extra_carry.append((str(ep_f), f"/content/minimind/selfchange/workspace/curated_data/{ep_name}"))
+
     diag_raw = data.get("diagnostics_dir")
     diag_dir = Path(diag_raw) if diag_raw else None
     manifest_file = (diag_dir / "manifest.json") if diag_dir else None
@@ -603,6 +628,7 @@ def inspect_resume_seed(promoted_dir: Path) -> dict:
                     "non_weight_files": non_weight_rels,
                     "weight_uploads": weight_uploads,
                     "primary_weight": str(primary_pth),
+                    "extra_uploads": extra_carry,
                 }
         except (json.JSONDecodeError, OSError):
             pass
@@ -612,6 +638,7 @@ def inspect_resume_seed(promoted_dir: Path) -> dict:
         "run_id": run_id,
         "primary_weight": str(primary_pth),
         "remote_model_path": f"/content/minimind/selfchange/workspace/models/candidates/{primary_pth.name}",
+        "extra_uploads": extra_carry,
     }
 
 
@@ -679,6 +706,8 @@ def seed_colab_vm_from_promoted(
     work_dir = Path(work_dir).resolve()
     work_dir.mkdir(parents=True, exist_ok=True)
     uploaded: list[str] = []
+    extra_uploads = [(str(lp), str(rp)) for lp, rp in seed_plan.get("extra_uploads", [])]
+    extra_dirs = sorted({str(Path(rp).parent) for _, rp in extra_uploads})
 
     if mode == "full_mirror":
         diag_dir = Path(seed_plan["diagnostics_dir"])
@@ -693,7 +722,7 @@ def seed_colab_vm_from_promoted(
         uploaded.append(remote_tar)
 
         unpack_script = work_dir / "step_unpack_seed.py"
-        unpack_src = """import shutil
+        unpack_src = f"""import shutil
 import tarfile
 from pathlib import Path
 
@@ -704,28 +733,91 @@ mirror.mkdir(parents=True, exist_ok=True)
 with tarfile.open("/content/seed_mirror_state.tar.gz", "r:gz") as tf:
     tf.extractall(mirror, filter="data")
 (mirror / "weights").mkdir(parents=True, exist_ok=True)
-print(f"Seeded {mirror} with {len(list(mirror.rglob('*')))} entries", flush=True)
+for extra_dir in {extra_dirs!r}:
+    Path(extra_dir).mkdir(parents=True, exist_ok=True)
+print(f"Seeded {{mirror}} with {{len(list(mirror.rglob('*')))}} entries", flush=True)
 """
         atomic_write_text(unpack_script, unpack_src)
         run_cmd(["colab", "exec", "-s", session, "--timeout", "120", "-f", str(unpack_script)], check=True)
 
         for local_w, remote_w in seed_plan["weight_uploads"]:
             uploaded.extend(_upload_file_chunked(session, Path(local_w), remote_w, work_dir, run_cmd=run_cmd))
+        for local_extra, remote_extra in extra_uploads:
+            uploaded.extend(_upload_file_chunked(session, Path(local_extra), remote_extra, work_dir, run_cmd=run_cmd))
         return {"seeded": True, "mode": "full_mirror", "uploaded_files": uploaded}
 
     # weight_only fallback
     remote_w = str(seed_plan["remote_model_path"])
     prep_script = work_dir / "step_prep_weight_dir.py"
+    all_dirs = sorted({str(Path(remote_w).parent), *extra_dirs})
     prep_src = f"""from pathlib import Path
 
-target = Path({remote_w!r}).parent
-target.mkdir(parents=True, exist_ok=True)
-print(f"Prepared weight dir {{target}}", flush=True)
+for target_str in {all_dirs!r}:
+    target = Path(target_str)
+    target.mkdir(parents=True, exist_ok=True)
+    print(f"Prepared dir {{target}}", flush=True)
 """
     atomic_write_text(prep_script, prep_src)
     run_cmd(["colab", "exec", "-s", session, "--timeout", "60", "-f", str(prep_script)], check=True)
     uploaded.extend(_upload_file_chunked(session, Path(seed_plan["primary_weight"]), remote_w, work_dir, run_cmd=run_cmd))
+    for local_extra, remote_extra in extra_uploads:
+        uploaded.extend(_upload_file_chunked(session, Path(local_extra), remote_extra, work_dir, run_cmd=run_cmd))
     return {"seeded": True, "mode": "weight_only", "uploaded_files": uploaded}
+
+
+def _overlay_local_code_to_colab(
+    session: str,
+    repo_root: Path,
+    work_dir: Path,
+    run_cmd: Callable = subprocess.run,
+) -> list[str]:
+    """Pack local selfchange/trainer Python updates (excluding workspace/kernel/caches) and apply on Colab."""
+    repo_root = Path(repo_root).resolve()
+    work_dir = Path(work_dir).resolve()
+    work_dir.mkdir(parents=True, exist_ok=True)
+    tar_path = work_dir / "local_code_overlay.tar.gz"
+
+    include_roots = [
+        repo_root / "selfchange" / "bootstrap",
+        repo_root / "selfchange" / "colab",
+        repo_root / "selfchange" / "training",
+        repo_root / "selfchange" / "tests",
+        repo_root / "trainer",
+    ]
+    packed_files: list[Path] = []
+    for root in include_roots:
+        if root.is_dir():
+            for p in sorted(root.rglob("*.py")):
+                if "__pycache__" in p.parts:
+                    continue
+                packed_files.append(p)
+    top_selfchange = repo_root / "selfchange"
+    if top_selfchange.is_dir():
+        for top_py in sorted(top_selfchange.glob("*.py")):
+            packed_files.append(top_py)
+
+    with tarfile.open(tar_path, "w:gz") as tf:
+        for p in packed_files:
+            tf.add(p, arcname=p.relative_to(repo_root).as_posix())
+
+    remote_tar = "/content/local_code_overlay.tar.gz"
+    uploaded = _upload_file_chunked(session, tar_path, remote_tar, work_dir, run_cmd=run_cmd)
+    apply_script = work_dir / "step_apply_overlay.py"
+    apply_src = """import subprocess
+import sys
+import tarfile
+from pathlib import Path
+
+repo = Path("/content/minimind")
+repo.mkdir(parents=True, exist_ok=True)
+with tarfile.open("/content/local_code_overlay.tar.gz", "r:gz") as tf:
+    tf.extractall(repo, filter="data")
+subprocess.run([sys.executable, "-m", "selfchange.kernel.supervisor", "--check-only"], cwd=repo, check=True)
+print("Applied local code overlay and verified kernel integrity", flush=True)
+"""
+    atomic_write_text(apply_script, apply_src)
+    run_cmd(["colab", "exec", "-s", session, "--timeout", "120", "-f", str(apply_script)], check=True)
+    return uploaded
 
 
 def run_colab_cli_pipeline(
@@ -747,6 +839,8 @@ def run_colab_cli_pipeline(
     mode: str = "autonomous",
     search_rungs: str | None = None,
     search_max_rungs: int = 4,
+    overlay_local_code: bool = False,
+    repo_root: Path | None = None,
 ) -> dict:
     """Provision a Colab GPU VM, run autonomous loop or minimal-CPU Pareto search, persist if improved, and stop VM."""
     workspace_dir = Path(workspace_dir).resolve()
@@ -772,7 +866,7 @@ def run_colab_cli_pipeline(
         seed_plan = inspect_resume_seed(promoted_dir) if resume else {"mode": "none", "reason": "resume_disabled"}
         will_resume = seed_plan["mode"] != "none"
         skip_bootstrap = bool(will_resume and skip_bootstrap_on_resume)
-        lightweight_setup = bool(seed_plan["mode"] == "full_mirror" and skip_bootstrap)
+        lightweight_setup = bool(will_resume and skip_bootstrap)
         explicit_model_path = seed_plan.get("remote_model_path") if seed_plan["mode"] == "weight_only" else None
 
         scripts = build_remote_phase_scripts(
@@ -792,10 +886,14 @@ def run_colab_cli_pipeline(
     run_cmd(["colab", "new", "-s", session, "--gpu", gpu], check=True)
     run_error: str | None = None
     seed_result: dict = {"seeded": False, "mode": seed_plan["mode"], "uploaded_files": []}
+    overlay_files: list[str] = []
     persistence: dict = {"persisted": False, "reason": "not_evaluated", "local_weights": []}
 
     try:
         run_cmd(["colab", "exec", "-s", session, "--timeout", "900", "-f", str(scripts_dir / "step1_setup.py")], check=True)
+        if overlay_local_code:
+            eff_repo = Path(repo_root).resolve() if repo_root is not None else Path(__file__).resolve().parents[2]
+            overlay_files = _overlay_local_code_to_colab(session, eff_repo, run_dir, run_cmd=run_cmd)
         if mode == "search_minimal_cpu":
             proc = run_cmd(["colab", "exec", "-s", session, "--timeout", "2400", "-f", str(scripts_dir / "step2_search_minimal_cpu.py")], check=False)
             if getattr(proc, "returncode", 0) != 0:
@@ -818,6 +916,17 @@ def run_colab_cli_pipeline(
             diag_dir.mkdir(parents=True, exist_ok=True)
             with tarfile.open(tar_local, "r:gz") as tf:
                 tf.extractall(diag_dir, filter="data")
+            curated_dst = workspace_dir / "curated_data"
+            for ep_name in ("verified_selfchange_episodes.jsonl", "verified_selfchange_dpo.jsonl"):
+                ep_src = diag_dir / "curated_data" / ep_name
+                if not ep_src.is_file():
+                    continue
+                ep_dst = curated_dst / ep_name
+                src_lines = len(ep_src.read_text(encoding="utf-8").splitlines())
+                dst_lines = len(ep_dst.read_text(encoding="utf-8").splitlines()) if ep_dst.is_file() else 0
+                if src_lines > dst_lines:
+                    curated_dst.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(ep_src, ep_dst)
             persistence = persist_improved_weights_from_colab(
                 session=session,
                 diagnostics_dir=diag_dir,
@@ -840,6 +949,7 @@ def run_colab_cli_pipeline(
         "gpu": gpu,
         "mode": mode,
         "resume_seed": seed_result,
+        "overlay_files": overlay_files,
         "bootstrap_skipped": skip_bootstrap,
         "diagnostics_dir": str(diag_dir),
         "persistence": persistence,
@@ -866,6 +976,7 @@ def main() -> int:
     parser.add_argument("--keep-vm", action="store_true")
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--skip-bootstrap-on-resume", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--overlay-local-code", action="store_true")
     args = parser.parse_args()
 
     out = run_colab_cli_pipeline(
@@ -886,6 +997,7 @@ def main() -> int:
         mode=args.mode,
         search_rungs=args.search_rungs,
         search_max_rungs=args.search_max_rungs,
+        overlay_local_code=args.overlay_local_code,
     )
     print(json.dumps(out, indent=2))
     return 0 if out.get("error") is None else 1

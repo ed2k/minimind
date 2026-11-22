@@ -182,6 +182,16 @@ def stage_from_weight_for_trainer(
         finally:
             if tmp.exists():
                 tmp.unlink(missing_ok=True)
+
+    cfg_src = found.with_suffix(".config.json")
+    if not cfg_src.is_file():
+        sib = found.parent / "model_config.json"
+        if sib.is_file():
+            cfg_src = sib
+    if cfg_src.is_file():
+        cfg_dst = target_out.with_suffix(".config.json")
+        if cfg_src.resolve() != cfg_dst.resolve():
+            shutil.copy2(cfg_src, cfg_dst)
     return target_out
 
 

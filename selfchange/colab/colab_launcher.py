@@ -8,7 +8,7 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 
-from selfchange.kernel.autonomous_cycle import AutonomousCycleRunner, CycleConfig
+from selfchange.kernel.autonomous_cycle import CycleConfig
 from selfchange.kernel.budgets import ComputeProfile, get_profile
 from selfchange.kernel.colab_sync import ColabDriveSync
 from selfchange.kernel.integrity import KERNEL_MANIFEST_FILENAME, atomic_write_text
@@ -17,6 +17,14 @@ from selfchange.kernel.supervisor import CycleContext, Supervisor
 from selfchange.kernel.tool_runtime import SELFCHANGE_TOOLS, WorktreeToolExecutor
 from selfchange.kernel.worktree import WorktreeHandle
 from selfchange.mutable.agent_loop import run_agent_episode
+from selfchange.colab.autonomous_engine import (
+    SelfImprovingCycleRunner,
+    build_exploration_tasks,
+    diagnose_weakness_state,
+    evaluate_model_strict_suite,
+    run_multi_rollout_exploration,
+)
+from selfchange.training.model_loader import load_model_config
 
 _TOOLS_BY_NAME = {t["function"]["name"]: t for t in SELFCHANGE_TOOLS}
 
@@ -90,7 +98,7 @@ def resolve_model_checkpoint(
 
 
 class MiniMindProposerSession:
-    """Reusable cached MiniMind-3 session supporting dynamic weight hot-reloading and eval."""
+    """Reusable cached MiniMind-3 session supporting dynamic weight hot-reloading, strict eval, and exploration."""
 
     def __init__(
         self,
@@ -98,14 +106,22 @@ class MiniMindProposerSession:
         tokenizer_path: Path,
         profile: ComputeProfile,
         autonomy_level: int = 1,
+        workspace_dir: Path | None = None,
+        enable_exploration: bool = True,
     ):
         self.initial_model_path = Path(initial_model_path).resolve()
         self.tokenizer_path = Path(tokenizer_path).resolve()
         self.profile = profile
         self.autonomy_level = autonomy_level
+        self.workspace_dir = Path(workspace_dir).resolve() if workspace_dir is not None else None
+        self.enable_exploration = enable_exploration
         self.loaded_path: Path | None = None
         self.model = None
         self.tokenizer = None
+        self.model_config: dict | None = load_model_config(self.initial_model_path)
+        self.last_scorecard: dict | None = None
+        self.last_exploration: dict | None = None
+        self._scorecard_cache: dict[tuple[str, int], dict] = {}
 
     def _ensure_loaded(self, target_path: Path | None = None) -> None:
         desired = (
@@ -126,8 +142,28 @@ class MiniMindProposerSession:
                     torch.cuda.empty_cache()
             except Exception:
                 pass
-        self.model, self.tokenizer = load_minimind_model(desired, self.tokenizer_path, self.profile)
+        cfg = load_model_config(desired) or self.model_config
+        self.model, self.tokenizer = load_minimind_model(desired, self.tokenizer_path, self.profile, model_config=cfg)
         self.loaded_path = desired
+        self.model_config = cfg
+
+    def eval_strict_scorecard(self, weight_path: Path | None = None) -> dict:
+        self._ensure_loaded(weight_path)
+        assert self.model is not None and self.tokenizer is not None and self.loaded_path is not None
+        mtime = self.loaded_path.stat().st_mtime_ns if self.loaded_path.is_file() else 0
+        key = (str(self.loaded_path), mtime)
+        if key in self._scorecard_cache:
+            card = self._scorecard_cache[key]
+        else:
+            card = evaluate_model_strict_suite(self.model, self.tokenizer, self.profile, max_tasks=20, k_rollouts=1)
+            self._scorecard_cache[key] = card
+        self.last_scorecard = card
+        if self.workspace_dir is not None:
+            start_f = self.workspace_dir / "live_scorecard_start.json"
+            if not start_f.is_file():
+                atomic_write_text(start_f, json.dumps(card, indent=2, ensure_ascii=False) + "\n")
+            atomic_write_text(self.workspace_dir / "live_scorecard_latest.json", json.dumps(card, indent=2, ensure_ascii=False) + "\n")
+        return card
 
     def propose(self, ctx: CycleContext, handle: WorktreeHandle, executor: WorktreeToolExecutor) -> dict:
         from selfchange.training.model_loader import generate_agent_reply
@@ -135,6 +171,19 @@ class MiniMindProposerSession:
         parent_w = Path(ctx.parent.weight_path) if (ctx.parent and ctx.parent.weight_path) else None
         self._ensure_loaded(parent_w)
         assert self.model is not None and self.tokenizer is not None
+        if self.last_scorecard is None:
+            self.eval_strict_scorecard(parent_w)
+
+        if self.enable_exploration and self.workspace_dir is not None:
+            exp_tasks = build_exploration_tasks(self.last_scorecard, ctx.cycle_index, max_tasks=3)
+            exp_res = run_multi_rollout_exploration(self.model, self.tokenizer, self.profile, exp_tasks, k_rollouts=4)
+            self.last_exploration = exp_res
+            traj_f = self.workspace_dir / "trajectories.jsonl"
+            traj_f.parent.mkdir(parents=True, exist_ok=True)
+            with traj_f.open("a", encoding="utf-8") as tf:
+                for row in exp_res["trajectories"]:
+                    tf.write(json.dumps({"cycle_index": ctx.cycle_index, **row}, ensure_ascii=False) + "\n")
+
         eos_tok = self.tokenizer.eos_token or "<|im_end|>"
         pad_tok = self.tokenizer.pad_token or "<|endoftext|>"
 
@@ -164,14 +213,14 @@ class MiniMindProposerSession:
             )
             return raw.replace(eos_tok, "").replace(pad_tok, "").strip()
 
-        initial_state = {
-            "profile": ctx.profile.name,
-            "last_fault": "none" if not ctx.safe_mode else "safe_mode_check",
-            "champion_id": ctx.parent.node_id if ctx.parent else None,
-            "consecutive_failures": 0,
-            "training": cfg.get("training", {}),
-            "log_tail": f"cycle={ctx.cycle_index} safe_mode={ctx.safe_mode} config_only={ctx.config_only}",
-        }
+        initial_state = diagnose_weakness_state(
+            self.last_scorecard,
+            ctx.cycle_index,
+            ctx.parent.node_id if ctx.parent else None,
+            {"profile": ctx.profile.name, "training": cfg.get("training", {})},
+            ctx.safe_mode,
+            ctx.config_only,
+        )
         ep = run_agent_episode(initial_state, compact_tools, _model_fn, executor.dispatch, cfg)
         if not executor.submitted:
             executor.dispatch("submit_candidate", {"hypothesis": f"minimind cycle {ctx.cycle_index}"})
@@ -197,12 +246,9 @@ class MiniMindProposerSession:
         }
 
     def eval_candidate(self, worktree_dir: Path, weight_path: Path | None = None) -> float:
-        from selfchange.bootstrap.eval_baseline import evaluate_minimind_candidate
-
-        self._ensure_loaded(weight_path)
-        assert self.model is not None and self.tokenizer is not None
-        res = evaluate_minimind_candidate(worktree_dir, self.model, self.tokenizer, self.profile, num_code_tasks=4)
-        return float(res["extra_score"])
+        _ = worktree_dir
+        card = self.eval_strict_scorecard(weight_path)
+        return float(card["overall_score"])
 
 
 def make_minimind_proposer(
@@ -511,6 +557,7 @@ def launch_colab_session(
                 resolved_tok,
                 profile,
                 autonomy_level=autonomy_level,
+                workspace_dir=workspace_dir,
             )
             proposer_fn = session.propose
             if eval_with_model and extra_eval_fn is None:
@@ -542,7 +589,7 @@ def launch_colab_session(
     }
     atomic_write_text(workspace_dir / "session_info.json", json.dumps(session_info, indent=2, ensure_ascii=False) + "\n")
 
-    runner = AutonomousCycleRunner(
+    runner = SelfImprovingCycleRunner(
         repo_root=repo_root,
         workspace_dir=workspace_dir,
         profile=profile,
@@ -557,6 +604,9 @@ def launch_colab_session(
             base_weight_path=resolved_model,
         ),
         extra_eval_fn=extra_eval_fn,
+        session=session,
+        live_self_improve=(session is not None and not dry_run),
+        model_config=session.model_config if session is not None else None,
     )
 
     if not runner.registry.load_archive():
