@@ -261,6 +261,8 @@ class MiniMindProposerSession:
         else:
             card = evaluate_model_strict_suite(self.model, self.tokenizer, self.profile, max_tasks=20, k_rollouts=1)
             self._scorecard_cache[key] = card
+        while len(self._scorecard_cache) > 16:
+            self._scorecard_cache.pop(next(iter(self._scorecard_cache)))
         self.last_scorecard = card
         if self.workspace_dir is not None:
             start_f = self.workspace_dir / "live_scorecard_start.json"
@@ -277,7 +279,8 @@ class MiniMindProposerSession:
             self.eval_strict_scorecard(parent_w)
 
         if self.enable_exploration and self.workspace_dir is not None:
-            exp_tasks = build_exploration_tasks(self.last_scorecard, ctx.cycle_index, max_tasks=3)
+            exp_tasks_n = 4 if (self.last_scorecard and self.last_scorecard.get("failing_task_ids")) else 3
+            exp_tasks = build_exploration_tasks(self.last_scorecard, ctx.cycle_index, max_tasks=exp_tasks_n)
             if self.is_gguf_mode:
                 assert self._llama_server is not None
                 max_new = min(160, self.profile.max_gen_len)
@@ -349,6 +352,16 @@ class MiniMindProposerSession:
                 )
                 return raw.replace(eos_tok, "").replace(pad_tok, "").strip()
 
+        recent_train_rows: list[dict] = []
+        if self.workspace_dir is not None:
+            hist_p = self.workspace_dir / "logs" / "train_history.jsonl"
+            if hist_p.is_file():
+                try:
+                    all_h = [json.loads(ln) for ln in hist_p.read_text(encoding="utf-8").splitlines() if ln.strip()]
+                    recent_train_rows = [r for r in all_h if r.get("stage") in ("lora", "dpo")][-3:]
+                except Exception:
+                    recent_train_rows = []
+
         initial_state = diagnose_weakness_state(
             self.last_scorecard,
             ctx.cycle_index,
@@ -356,6 +369,7 @@ class MiniMindProposerSession:
             {"profile": ctx.profile.name, "training": cfg.get("training", {})},
             ctx.safe_mode,
             ctx.config_only,
+            recent_train_rows=recent_train_rows,
         )
         ep = run_agent_episode(initial_state, compact_tools, _model_fn, executor.dispatch, cfg)
         if not executor.submitted:
@@ -653,6 +667,7 @@ def launch_colab_session(
     local_cpu_dpo_count: int = 16,
     local_cpu_timeout_sec: int = 1200,
     local_cpu_threads: int = 2,
+    register_signals: bool = False,
 ) -> dict:
     """Re-entrant Colab/local session bootstrap: restore Drive -> run cycles -> report -> sync Drive."""
     repo_root = Path(repo_root).resolve()
@@ -734,9 +749,13 @@ def launch_colab_session(
         if cand_anchor.is_file():
             resolved_anchor = cand_anchor.resolve()
     else:
-        default_anchor = workspace_dir / "models" / "base" / "data" / "anchor_sft.jsonl"
-        if default_anchor.is_file():
-            resolved_anchor = default_anchor.resolve()
+        for cand_anchor in (
+            workspace_dir / "models" / "base" / "data" / "anchor_sft.jsonl",
+            repo_root / "selfchange" / "workspace" / "curated_data" / "verified_selfchange_episodes.jsonl",
+        ):
+            if cand_anchor.is_file():
+                resolved_anchor = cand_anchor.resolve()
+                break
 
     session_info = {
         "updated_at": datetime.now(timezone.utc).isoformat(),
@@ -848,7 +867,7 @@ def launch_colab_session(
             cycle_runner=runner,
             kernel_dir=kdir,
             manifest_path=mpath,
-            register_signals=False,
+            register_signals=register_signals,
             on_cycle_end=lambda _st, _out: _persist_and_sync(),
         )
         sup.load_state()
@@ -919,6 +938,7 @@ def main() -> int:
         local_cpu_dpo_count=args.local_dpo_count,
         local_cpu_timeout_sec=args.local_train_timeout,
         local_cpu_threads=args.local_cpu_threads,
+        register_signals=True,
     )
     print(json.dumps(res, indent=2))
     return 0

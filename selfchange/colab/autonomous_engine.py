@@ -53,6 +53,114 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _prune_oldest_entries(entries: list[Path], keep: int, protected: set[Path] | None = None) -> int:
+    def _mtime_ns(p: Path) -> int:
+        try:
+            return p.stat().st_mtime_ns
+        except OSError:
+            return 0
+
+    ordered = sorted(entries, key=_mtime_ns, reverse=True)
+    prot = {p.resolve() for p in (protected or set())}
+    deleted = 0
+    for p in ordered[max(0, int(keep)) :]:
+        try:
+            if p.resolve() in prot:
+                continue
+        except OSError:
+            continue
+        if p.is_dir():
+            shutil.rmtree(p, ignore_errors=True)
+            deleted += 1
+        elif p.is_file():
+            if p.suffix.lower() == ".gguf":
+                p.with_suffix(".config.json").unlink(missing_ok=True)
+            p.unlink(missing_ok=True)
+            deleted += 1
+    return deleted
+
+
+def prune_forever_workspace(
+    workspace_dir: Path,
+    keep_gguf_candidates: int = 2,
+    keep_synth_dirs: int = 3,
+    keep_scorecards: int = 5,
+    keep_reviews: int = 10,
+    max_trajectories: int = 400,
+    protected_paths: set[Path] | None = None,
+) -> dict:
+    """Bound disk and trajectory growth in a long-running selfchange workspace while protecting active champions."""
+    workspace_dir = Path(workspace_dir).resolve()
+    protected: set[Path] = {Path(p).resolve() for p in (protected_paths or set())}
+
+    champ_file = workspace_dir / "champion.json"
+    if champ_file.is_file():
+        try:
+            wp = json.loads(champ_file.read_text(encoding="utf-8")).get("champion", {}).get("weight_path")
+            if wp:
+                protected.add(Path(wp).resolve())
+        except Exception:
+            pass
+    gguf_dir = workspace_dir / "promoted_models" / "gguf"
+    champ_gguf = gguf_dir / "champion.gguf"
+    if champ_gguf.is_file():
+        protected.add(champ_gguf.resolve())
+    latest_gguf = gguf_dir / "latest_gguf.json"
+    if latest_gguf.is_file():
+        try:
+            meta = json.loads(latest_gguf.read_text(encoding="utf-8"))
+            for cand in (meta.get("champion_gguf"), (meta.get("selected_artifact") or {}).get("path")):
+                if cand:
+                    protected.add(Path(cand).resolve())
+        except Exception:
+            pass
+
+    deleted_ggufs = 0
+    cand_gguf_dir = gguf_dir / "candidates"
+    if cand_gguf_dir.is_dir():
+        deleted_ggufs = _prune_oldest_entries(list(cand_gguf_dir.glob("*.gguf")), keep_gguf_candidates, protected)
+
+    deleted_synth = 0
+    deleted_batches = 0
+    train_data_dir = workspace_dir / "training_data"
+    if train_data_dir.is_dir():
+        synth_dirs = [p for p in train_data_dir.glob("synth_c*") if p.is_dir()]
+        deleted_synth = _prune_oldest_entries(synth_dirs, keep_synth_dirs)
+        for pat in ("rft_c*.jsonl", "dpo_c*.jsonl"):
+            deleted_batches += _prune_oldest_entries(list(train_data_dir.glob(pat)), keep_synth_dirs)
+
+    scorecards = [p for p in workspace_dir.glob("live_scorecard_c*.json") if p.is_file()]
+    deleted_scorecards = _prune_oldest_entries(scorecards, keep_scorecards)
+
+    deleted_reviews = 0
+    reviews_dir = workspace_dir / "data_reviews"
+    if reviews_dir.is_dir():
+        deleted_reviews = _prune_oldest_entries([p for p in reviews_dir.iterdir() if p.is_file()], keep_reviews)
+
+    traj_path = workspace_dir / "trajectories.jsonl"
+    compacted_trajs = 0
+    traj_count = 0
+    if traj_path.is_file():
+        lines = [ln for ln in traj_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        if len(lines) > max(1, int(max_trajectories)):
+            kept = lines[-max(1, int(max_trajectories)) :]
+            compacted_trajs = len(lines) - len(kept)
+            atomic_write_text(traj_path, "\n".join(kept) + "\n")
+            traj_count = len(kept)
+        else:
+            traj_count = len(lines)
+
+    return {
+        "deleted_ggufs": deleted_ggufs,
+        "deleted_synth": deleted_synth,
+        "deleted_batches": deleted_batches,
+        "deleted_scorecards": deleted_scorecards,
+        "deleted_reviews": deleted_reviews,
+        "compacted_trajectories": compacted_trajs,
+        "retained_trajectories": traj_count,
+    }
+
+
 def _compact_tools(names: list[str]) -> list[dict]:
     selected: list[dict] = []
     for name in names:
@@ -545,13 +653,25 @@ def _procedural_exploration_bank(cycle_index: int, rng: random.Random) -> dict[s
     anc = f"anc_exp_{300 + cycle_index * 11 + rng.randint(1, 7)}"
     lo_val = rng.choice(["1e-6", "2e-6", "1e-5"])
     hi_val = rng.choice(["3e-4", "4e-4", "0.25", "0.45"])
+    ceil_val = rng.choice(["0.80", "0.85", "0.95"])
     b_start, a_start, halves, f_b, f_a = rng.choice([(24, 1, 2, 6, 4), (48, 1, 3, 6, 8), (20, 2, 2, 5, 8)])
+    lr_init, lr_halves, lr_pats, lr_forb = rng.choice(
+        [
+            ("0.0008", 2, [r"\b0\.0002\b|\b2e-0?4\b"], [r"\bfinal\s+learning_rate\s*(?:=|is|:)?\s*0\.0004\b"]),
+            ("0.0016", 3, [r"\b0\.0002\b|\b2e-0?4\b"], [r"\bfinal\s+learning_rate\s*(?:=|is|:)?\s*0\.0008\b"]),
+        ]
+    )
     cyc = 60 + cycle_index * 5 + rng.randint(1, 4)
 
     code_clip_clean = f"def exp_bound_val(val: float, hi: float = {hi_val}) -> float:\n    if val < {lo_val}:\n        return {lo_val}\n    return min(val, hi)\n"
     code_clip_broken = code_clip_clean.replace("return min(val, hi)", "return max(val, hi)")
     code_fn = f"exp_bound_{cycle_index}.py"
     code_num = "\n".join(f"{i + 1}: {ln}" for i, ln in enumerate(code_clip_broken.splitlines()))
+
+    code_floor_clean = f"def exp_floor_val(val: float, lo: float = {lo_val}) -> float:\n    if val > {ceil_val}:\n        return {ceil_val}\n    return max(val, lo)\n"
+    code_floor_broken = code_floor_clean.replace("return max(val, lo)", "return min(val, lo)")
+    code_floor_fn = f"exp_floor_{cycle_index}.py"
+    code_floor_num = "\n".join(f"{i + 1}: {ln}" for i, ln in enumerate(code_floor_broken.splitlines()))
 
     return {
         "tool_call_op": [
@@ -591,6 +711,19 @@ def _procedural_exploration_bank(cycle_index: int, rng: random.Random) -> dict[s
                 ],
                 "tools": _compact_tools(["replace_line_range"]),
             },
+            {
+                "id": f"exp_c{cycle_index}_code_floor",
+                "category": "code_edit",
+                "check": "code_edit",
+                "filename": code_floor_fn,
+                "broken": code_floor_broken,
+                "clean": code_floor_clean,
+                "messages": [
+                    {"role": "system", "content": "Fix line 4 lower bound with replace_line_range (use max, not min)."},
+                    {"role": "user", "content": f"{code_floor_fn}:\n{code_floor_num}"},
+                ],
+                "tools": _compact_tools(["replace_line_range"]),
+            },
         ],
         "reasoning_math": [
             {
@@ -610,7 +743,41 @@ def _procedural_exploration_bank(cycle_index: int, rng: random.Random) -> dict[s
                     }
                 ],
                 "tools": None,
-            }
+            },
+            {
+                "id": f"exp_c{cycle_index}_math_lr",
+                "category": "reasoning_math",
+                "check": "math_token",
+                "expected_patterns": lr_pats,
+                "forbidden_patterns": lr_forb,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": f"Cycle {cyc}: starting at learning_rate={lr_init}, if NaN recovery halves learning_rate {lr_halves} times, what is the final learning_rate?",
+                    }
+                ],
+                "tools": None,
+            },
+        ],
+        "core_tech_qa": [
+            {
+                "id": f"exp_c{cycle_index}_qa_zh",
+                "category": "core_tech_qa",
+                "check": "qa_zh_accum",
+                "messages": [
+                    {"role": "user", "content": f"Cycle={cyc}, batch_size={bs}：什么是梯度累积？在显存或内存受限设备上微批大小为1时它有什么作用？"},
+                ],
+                "tools": None,
+            },
+            {
+                "id": f"exp_c{cycle_index}_qa_ast",
+                "category": "core_tech_qa",
+                "check": "qa_ast_worktree",
+                "messages": [
+                    {"role": "user", "content": f"During cycle={cyc}, why must edited Python modules in a git worktree be validated with ast.parse before execution?"},
+                ],
+                "tools": None,
+            },
         ],
         "noop": [
             {
@@ -638,19 +805,34 @@ def build_exploration_tasks(scorecard: dict | None, cycle_index: int, max_tasks:
     }
     ordered_cats = sorted(scores.keys(), key=lambda k: scores[k])
     tasks: list[dict] = []
+    seen_ids: set[str] = set()
+
+    def _add(item: dict) -> None:
+        if len(tasks) < max_tasks and item["id"] not in seen_ids:
+            seen_ids.add(item["id"])
+            tasks.append(item)
+
+    failing = set((scorecard or {}).get("failing_task_ids") or [])
+    if any("rollback" in fid for fid in failing):
+        _add(bank["tool_call_op"][1])
+    if any("clamp_float3" in fid for fid in failing):
+        _add(bank["code_edit"][1])
+    if any("math_lr" in fid or "math_oom" in fid for fid in failing):
+        _add(bank["reasoning_math"][1 if any("math_lr" in fid for fid in failing) else 0])
+    if any("qa_zh" in fid for fid in failing):
+        _add(bank["core_tech_qa"][0])
+    if any("qa_ast" in fid for fid in failing):
+        _add(bank["core_tech_qa"][1])
+
+    # Primary sample from each category in weakness order first
     for cat in ordered_cats:
+        if bank.get(cat):
+            _add(bank[cat][0])
+    if float((scorecard or {}).get("noop_pass_rate", 1.0)) < 1.0:
+        _add(bank["noop"][0])
+    for cat in (*ordered_cats, "core_tech_qa"):
         for item in bank.get(cat, []):
-            if len(tasks) < max_tasks:
-                tasks.append(item)
-    if len(tasks) < max_tasks and float((scorecard or {}).get("noop_pass_rate", 1.0)) < 1.0:
-        tasks.append(bank["noop"][0])
-    # Guarantee diversity across tool/code/math if max_tasks allows
-    for cat in ("tool_call_op", "code_edit", "reasoning_math"):
-        for item in bank.get(cat, []):
-            if len(tasks) >= max_tasks:
-                break
-            if item["id"] not in {t["id"] for t in tasks}:
-                tasks.append(item)
+            _add(item)
     return tasks[:max_tasks]
 
 
@@ -728,8 +910,16 @@ def run_multi_rollout_exploration(
     }
 
 
-def diagnose_weakness_state(scorecard: dict | None, cycle_index: int, parent_node_id: str | None, cfg: dict, safe_mode: bool, config_only: bool) -> dict:
-    """Convert real live scorecard failures into an actionable fault card instead of fault=none."""
+def diagnose_weakness_state(
+    scorecard: dict | None,
+    cycle_index: int,
+    parent_node_id: str | None,
+    cfg: dict,
+    safe_mode: bool,
+    config_only: bool,
+    recent_train_rows: list[dict] | None = None,
+) -> dict:
+    """Convert real live scorecard failures and recent training outcomes into an actionable fault card."""
     fault = "none"
     target_hint = f"cycle={cycle_index} safe_mode={safe_mode} config_only={config_only}"
     if scorecard:
@@ -745,6 +935,22 @@ def diagnose_weakness_state(scorecard: dict | None, cycle_index: int, parent_nod
         elif float(scorecard.get("eos_rate", 1.0)) < 0.95:
             fault = "eos_truncation_or_loop"
             target_hint += f" eos_rate={scorecard.get('eos_rate')}"
+
+    if recent_train_rows:
+        last = recent_train_rows[-1]
+        target_hint += (
+            f" last_train={last.get('stage')}(ok={last.get('ok')},accepted={last.get('accepted')},"
+            f"loss={last.get('final_loss')},score={last.get('before_score')}->{last.get('after_score')})"
+        )
+        low_loss_rejects = sum(
+            1
+            for r in recent_train_rows[-3:]
+            if r.get("accepted") is False and r.get("final_loss") is not None and float(r["final_loss"]) < 0.05
+        )
+        if low_loss_rejects >= 2 or (
+            last.get("accepted") is False and last.get("final_loss") is not None and float(last["final_loss"]) < 0.01
+        ):
+            target_hint += " overfit_hint=lower_lr_or_switch_dpo"
 
     return {
         "profile": str(cfg.get("profile", "colab_t4")),
@@ -868,6 +1074,25 @@ class SelfImprovingCycleRunner(AutonomousCycleRunner):
             model_config=self.model_config,
         )
 
+    def _recent_rejection_stats(self) -> tuple[int, float | None]:
+        if not self.train_history_path.is_file():
+            return 0, None
+        try:
+            rows = [json.loads(ln) for ln in self.train_history_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        except Exception:
+            return 0, None
+        train_rows = [r for r in rows if r.get("stage") in ("lora", "dpo") and r.get("ok")]
+        if not train_rows:
+            return 0, None
+        streak = 0
+        for r in reversed(train_rows):
+            if r.get("accepted") is False:
+                streak += 1
+            else:
+                break
+        last_loss = train_rows[-1].get("final_loss")
+        return streak, (float(last_loss) if last_loss is not None else None)
+
     def _collect_live_metrics(self, ctx: CycleContext, rft: list[dict], dpo: list[dict]) -> dict:
         sc = getattr(self.session, "last_scorecard", None) or {}
         exp = getattr(self.session, "last_exploration", None) or {}
@@ -913,6 +1138,10 @@ class SelfImprovingCycleRunner(AutonomousCycleRunner):
         atomic_write_text(diag_eval_path, json.dumps(before_sc, indent=2, ensure_ascii=False) + "\n")
         cur_ep_sft = self.curated_episodes_dir / "verified_selfchange_episodes.jsonl"
         cur_ep_dpo = self.curated_episodes_dir / "verified_selfchange_dpo.jsonl"
+        seed_cur_sft = self.repo_root / "selfchange" / "workspace" / "curated_data" / "verified_selfchange_episodes.jsonl"
+        seed_cur_dpo = self.repo_root / "selfchange" / "workspace" / "curated_data" / "verified_selfchange_dpo.jsonl"
+        extra_sft_paths = list(dict.fromkeys([p.resolve() for p in (cur_ep_sft, seed_cur_sft) if p.is_file()]))
+        extra_dpo_paths = list(dict.fromkeys([p.resolve() for p in (cur_ep_dpo, seed_cur_dpo) if p.is_file()]))
         synth_dir = self.workspace_dir / "training_data" / f"synth_c{ctx.cycle_index:04d}"
         max_seq = 512 if gguf_local_train else min(768, self.profile.max_seq_len)
         sft_count = self.local_cpu_sft_count if gguf_local_train else 320
@@ -926,8 +1155,8 @@ class SelfImprovingCycleRunner(AutonomousCycleRunner):
             dpo_count=dpo_count,
             max_seq_len=max_seq,
             seed=42 + ctx.cycle_index * 13,
-            extra_sft_paths=[cur_ep_sft] if cur_ep_sft.is_file() else None,
-            extra_dpo_paths=[cur_ep_dpo] if cur_ep_dpo.is_file() else None,
+            extra_sft_paths=extra_sft_paths or None,
+            extra_dpo_paths=extra_dpo_paths or None,
             extra_heldout_prompts=STRICT_HELDOUT_PROMPTS,
         )
 
@@ -970,7 +1199,27 @@ class SelfImprovingCycleRunner(AutonomousCycleRunner):
                 non_noop_rft.append(rec)
         safe_rft.extend(non_noop_rft)
         safe_rft.extend(noop_rft[: max(1, len(non_noop_rft) // 3)])
-        merged_sft = safe_rft + synth_sft
+        base_sft = safe_rft + synth_sft
+        anchor_rows: list[dict] = []
+        if self.cycle_config.anchor_path and Path(self.cycle_config.anchor_path).is_file():
+            for ln in Path(self.cycle_config.anchor_path).read_text(encoding="utf-8").splitlines():
+                if not ln.strip():
+                    continue
+                rec = format_sft_record(json.loads(ln))
+                convs = rec.get("conversations", [])
+                ex_u, nm_u = _extract_prompt_keys(convs)
+                if (ex_u and ex_u in h_exact) or (nm_u and nm_u in h_norm):
+                    continue
+                if estimate_tokens(convs) > max_seq - 32:
+                    continue
+                anchor_rows.append(rec)
+        if anchor_rows:
+            op_cap = max(sft_count, 32) if gguf_local_train else len(base_sft)
+            op_slice = base_sft[:op_cap] if gguf_local_train else base_sft
+            anc_ratio = float(cfg.get("training", {}).get("anchor_replay_ratio", 0.25))
+            merged_sft = mix_with_anchor(op_slice, anchor_rows, anchor_ratio=anc_ratio)
+        else:
+            merged_sft = base_sft
 
         safe_on_dpo: list[dict] = []
         for p in dpo:
@@ -997,6 +1246,7 @@ class SelfImprovingCycleRunner(AutonomousCycleRunner):
             safe_on_dpo.append(rec)
         merged_dpo = safe_on_dpo + synth_dpo
 
+        rej_streak, last_loss = self._recent_rejection_stats() if gguf_local_train else (0, None)
         recipe = select_training_stage(
             metrics=live_metrics,
             buffer_stats={"rft_samples": len(merged_sft), "dpo_pairs": len(merged_dpo)},
@@ -1008,6 +1258,10 @@ class SelfImprovingCycleRunner(AutonomousCycleRunner):
             stage = "dpo" if (len(merged_dpo) >= 8 and ctx.safe_mode) else "lora"
         if stage == "rlvr" and (gguf_local_train or len(rft) < 4):
             stage = "dpo" if len(merged_dpo) >= 8 else "lora"
+        if gguf_local_train and rej_streak > 0 and rej_streak % 2 == 1 and len(merged_dpo) >= 8:
+            stage = "dpo"
+        if gguf_local_train and stage == "dpo":
+            merged_dpo = merged_dpo[: max(self.local_cpu_dpo_count, 16)]
 
         data_dir = self.workspace_dir / "training_data"
         data_dir.mkdir(parents=True, exist_ok=True)
@@ -1061,11 +1315,20 @@ class SelfImprovingCycleRunner(AutonomousCycleRunner):
             train_cfg["timeout_sec"] = self.local_cpu_timeout_sec
             train_cfg["cpu_threads"] = self.local_cpu_threads
             if stage == "lora":
-                train_cfg["lora_rank"] = min(8, int(train_cfg.get("lora_rank", 8)))
-        if stage == "dpo":
-            train_cfg["dpo_learning_rate"] = max(2e-7, float(train_cfg.get("dpo_learning_rate", 2e-7)))
-        elif stage == "lora":
-            train_cfg["learning_rate"] = min(5e-5, max(2e-5, float(train_cfg.get("learning_rate", 3e-5))))
+                lr_schedule = [2.0e-5, 1.0e-5, 5.0e-6, 3.0e-6]
+                adapt_lr = lr_schedule[rej_streak % len(lr_schedule)]
+                if last_loss is not None and last_loss < 0.05:
+                    adapt_lr = min(adapt_lr, 1.0e-5)
+                train_cfg["learning_rate"] = adapt_lr
+                train_cfg["lora_rank"] = 4 if (rej_streak >= 2 or (last_loss is not None and last_loss < 0.05)) else min(8, int(train_cfg.get("lora_rank", 8)))
+            elif stage == "dpo":
+                dpo_schedule = [2.0e-7, 1.0e-7, 5.0e-8]
+                train_cfg["dpo_learning_rate"] = dpo_schedule[rej_streak % len(dpo_schedule)]
+        else:
+            if stage == "dpo":
+                train_cfg["dpo_learning_rate"] = max(2e-7, float(train_cfg.get("dpo_learning_rate", 2e-7)))
+            elif stage == "lora":
+                train_cfg["learning_rate"] = min(5e-5, max(2e-5, float(train_cfg.get("learning_rate", 3e-5))))
 
         if gguf_local_train and self.session is not None:
             # Release llama-server memory before CPU PyTorch training on 8 GB hosts.
@@ -1255,6 +1518,9 @@ class SelfImprovingCycleRunner(AutonomousCycleRunner):
                 if reload_target:
                     self.session._ensure_loaded(reload_target)
                     self.session.last_scorecard = before_sc
+                if gguf_local_train and cand_gguf_path is not None:
+                    cand_gguf_path.unlink(missing_ok=True)
+                    cand_gguf_path.with_suffix(".config.json").unlink(missing_ok=True)
                 final_weight_path = None
         elif gguf_local_train and prev_gguf_path is not None and self.session is not None:
             self.session._ensure_loaded(prev_gguf_path)
@@ -1267,6 +1533,8 @@ class SelfImprovingCycleRunner(AutonomousCycleRunner):
                 "cycle_index": ctx.cycle_index,
                 "stage": stage,
                 "reason": recipe.get("reason"),
+                "rej_streak": rej_streak,
+                "effective_lr": train_cfg.get("dpo_learning_rate") if stage == "dpo" else train_cfg.get("learning_rate"),
                 "live_metrics": live_metrics,
                 "on_policy_rft": len(safe_rft),
                 "on_policy_dpo": len(safe_on_dpo),
@@ -1288,4 +1556,6 @@ class SelfImprovingCycleRunner(AutonomousCycleRunner):
                 "log_tail": res.log_tail,
             }
         )
+        if gguf_local_train:
+            prune_forever_workspace(self.workspace_dir)
         return final_weight_path

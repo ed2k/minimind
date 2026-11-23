@@ -417,6 +417,8 @@ class LlamaCppServerSession:
         if tps is not None:
             self.last_tok_per_sec = round(float(tps), 2)
             self.tok_per_sec_samples.append(self.last_tok_per_sec)
+            if len(self.tok_per_sec_samples) > 200:
+                self.tok_per_sec_samples = self.tok_per_sec_samples[-200:]
 
         raw_text = str(data.get("content", ""))
         stop_word = str(data.get("stopping_word") or "")
