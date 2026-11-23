@@ -44,8 +44,12 @@ def _start_mock_llama_server(handler_fn) -> tuple[ThreadingHTTPServer, str, thre
             raw = self.rfile.read(length).decode("utf-8") if length > 0 else "{}"
             req = json.loads(raw)
             resp_obj = handler_fn(req)
+            if isinstance(resp_obj, tuple):
+                status, resp_obj = resp_obj
+            else:
+                status = 200
             body = json.dumps(resp_obj).encode("utf-8")
-            self.send_response(200)
+            self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
@@ -460,6 +464,42 @@ class TestLowEndIntelMacGGUF(unittest.TestCase):
                 self.assertEqual(champ_gguf.read_bytes(), b"GGUF\x03\x00\x00\x00CAND1")
                 self.assertTrue((ws / "models" / "local_train_base.pth").is_file())
                 self.assertTrue((ws / "curated_data" / "verified_selfchange_episodes.jsonl").is_file())
+        finally:
+            srv.shutdown()
+            srv.server_close()
+            thread.join(timeout=2)
+
+    def test_llamacpp_server_retries_on_http_400_prompt_overflow(self) -> None:
+        prompts: list[str] = []
+
+        def _handle(req: dict):
+            p = req.get("prompt", "")
+            prompts.append(p)
+            if len(p) > 2000:
+                return 400, {"error": {"message": "request exceeds context size"}}
+            return {"content": "Trimmed cleanly.\n</think>\n\nRetry succeeded.", "stopped_eos": True, "timings": {"predicted_per_second": 55.0}}
+
+        srv, url, thread = _start_mock_llama_server(_handle)
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                fake_gguf = Path(tmp) / "m.gguf"
+                fake_gguf.write_bytes(b"GGUF\x03\x00\x00\x00")
+                sess = LlamaCppServerSession(fake_gguf, base_url=url)
+                self.assertEqual(sess.ctx_size, 4096)
+                msgs = [
+                    {"role": "system", "content": "Operate safely."},
+                    {"role": "user", "content": "Old turn 1: " + ("x" * 1600)},
+                    {"role": "assistant", "content": "Old reply 1: " + ("y" * 1600)},
+                    {"role": "user", "content": "Recent question"},
+                    {"role": "assistant", "content": "Recent action"},
+                ]
+                reply, eos_ok = sess.generate_reply(msgs, open_thinking=True)
+                self.assertTrue(eos_ok)
+                self.assertIn("Retry succeeded.", reply)
+                self.assertEqual(len(prompts), 2)
+                self.assertGreater(len(prompts[0]), 2000)
+                self.assertLessEqual(len(prompts[1]), 2000)
+                self.assertNotIn("Old turn 1", prompts[1])
         finally:
             srv.shutdown()
             srv.server_close()

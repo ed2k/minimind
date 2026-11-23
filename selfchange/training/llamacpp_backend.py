@@ -260,7 +260,7 @@ class LlamaCppServerSession:
     def __init__(
         self,
         model_path: Path,
-        ctx_size: int = 1024,
+        ctx_size: int = 4096,
         threads: int | None = None,
         bin_dir: Path | None = None,
         base_url: str | None = None,
@@ -341,6 +341,30 @@ class LlamaCppServerSession:
         self.close()
         raise TimeoutError(f"Timed out waiting {self.startup_timeout_sec}s for llama-server /health ({last_err})")
 
+    def _post_completion(self, payload: dict, max_new_tokens: int) -> dict:
+        req = urllib.request.Request(
+            f"{self.base_url}/completion",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=max(30.0, float(max_new_tokens) * 1.5)) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    @staticmethod
+    def _trim_messages_for_retry(messages: list[dict]) -> list[dict]:
+        if len(messages) > 3:
+            kept = [dict(messages[0])] + [dict(m) for m in messages[-2:]]
+        else:
+            kept = [dict(m) for m in messages]
+        for idx, msg in enumerate(kept):
+            if idx == 0 and msg.get("role") == "system":
+                continue
+            txt = str(msg.get("content", ""))
+            if len(txt) > 1200:
+                msg["content"] = txt[:1200]
+        return kept
+
     def generate_reply(
         self,
         messages: list[dict],
@@ -351,27 +375,34 @@ class LlamaCppServerSession:
         open_thinking: bool = True,
     ) -> tuple[str, bool]:
         """Generate a completion via /completion and return (reply_text, eos_ok)."""
-        prompt = render_minimind_chat_prompt(messages, tools=tools, open_thinking=open_thinking)
-        payload: dict = {
-            "prompt": prompt,
-            "n_predict": int(max_new_tokens),
-            "temperature": float(temperature),
-            "top_p": float(top_p) if temperature > 0.0 else 1.0,
-            "stop": ["<|im_end|>", "<|endoftext|>"],
-            "cache_prompt": True,
-        }
-        if temperature <= 0.0:
-            payload["top_k"] = 1
+        def _build_payload(msgs: list[dict]) -> dict:
+            prompt = render_minimind_chat_prompt(msgs, tools=tools, open_thinking=open_thinking)
+            pl: dict = {
+                "prompt": prompt,
+                "n_predict": int(max_new_tokens),
+                "temperature": float(temperature),
+                "top_p": float(top_p) if temperature > 0.0 else 1.0,
+                "stop": ["<|im_end|>", "<|endoftext|>"],
+                "cache_prompt": True,
+            }
+            if temperature <= 0.0:
+                pl["top_k"] = 1
+            return pl
 
-        req = urllib.request.Request(
-            f"{self.base_url}/completion",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
+        payload = _build_payload(messages)
         t0 = time.monotonic()
-        with urllib.request.urlopen(req, timeout=max(30.0, float(max_new_tokens) * 1.5)) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
+        try:
+            data = self._post_completion(payload, max_new_tokens)
+        except urllib.error.HTTPError as exc:
+            if exc.code != 400:
+                err_body = exc.read().decode("utf-8", errors="replace")[:500]
+                raise RuntimeError(f"llama-server HTTP {exc.code}: {err_body}") from exc
+            trimmed = self._trim_messages_for_retry(messages)
+            try:
+                data = self._post_completion(_build_payload(trimmed), max_new_tokens)
+            except urllib.error.HTTPError as retry_exc:
+                err_body = retry_exc.read().decode("utf-8", errors="replace")[:500]
+                raise RuntimeError(f"llama-server HTTP {retry_exc.code}: {err_body}") from retry_exc
         elapsed = max(1e-4, time.monotonic() - t0)
 
         timings = data.get("timings") if isinstance(data.get("timings"), dict) else {}

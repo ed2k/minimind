@@ -199,7 +199,7 @@ class MiniMindProposerSession:
             if self._llama_server is None:
                 self._llama_server = LlamaCppServerSession(
                     desired,
-                    ctx_size=max(1024, self.profile.max_total_len),
+                    ctx_size=max(4096, self.profile.max_total_len),
                     bin_dir=self.llama_bin_dir,
                     base_url=self.llama_base_url,
                 )
