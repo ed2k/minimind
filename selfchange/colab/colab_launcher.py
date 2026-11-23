@@ -22,6 +22,7 @@ from selfchange.colab.autonomous_engine import (
     build_exploration_tasks,
     diagnose_weakness_state,
     evaluate_model_strict_suite,
+    resolve_local_train_base_pth,
     run_multi_rollout_exploration,
 )
 from selfchange.training.model_loader import load_model_config
@@ -646,6 +647,12 @@ def launch_colab_session(
     persist_only_if_improved: bool = True,
     llama_bin_dir: Path | None = None,
     llama_base_url: str | None = None,
+    enable_local_cpu_train: bool = False,
+    local_train_base_pth: Path | None = None,
+    local_cpu_sft_count: int = 48,
+    local_cpu_dpo_count: int = 16,
+    local_cpu_timeout_sec: int = 1200,
+    local_cpu_threads: int = 2,
 ) -> dict:
     """Re-entrant Colab/local session bootstrap: restore Drive -> run cycles -> report -> sync Drive."""
     repo_root = Path(repo_root).resolve()
@@ -703,8 +710,22 @@ def launch_colab_session(
                 extra_eval_fn = session.eval_candidate
 
     gguf_mode = bool(session is not None and session.is_gguf_mode)
-    backend_name = "llamacpp_gguf" if gguf_mode else ("pytorch" if session is not None else "none")
-    effective_dry_run = bool(dry_run or gguf_mode)
+    resolved_train_base_pth: Path | None = None
+    if enable_local_cpu_train and gguf_mode and not dry_run:
+        resolved_train_base_pth = resolve_local_train_base_pth(
+            repo_root,
+            workspace_dir,
+            profile,
+            explicit_pth=local_train_base_pth,
+            model_config=session.model_config if session is not None else None,
+        )
+    local_train_ready = bool(gguf_mode and enable_local_cpu_train and not dry_run)
+    backend_name = (
+        "llamacpp_gguf+local_cpu_train"
+        if local_train_ready
+        else ("llamacpp_gguf" if gguf_mode else ("pytorch" if session is not None else "none"))
+    )
+    effective_dry_run = bool(dry_run or (gguf_mode and not enable_local_cpu_train))
     proposer_mode = "minimind" if session is not None else ("custom" if proposer_fn is not None else ("dry_run" if dry_run else "scripted_fallback"))
 
     resolved_anchor: Path | None = None
@@ -724,6 +745,8 @@ def launch_colab_session(
         "proposer_mode": proposer_mode,
         "model_source": model_source,
         "active_model_path": str(resolved_model) if resolved_model else None,
+        "enable_local_cpu_train": bool(enable_local_cpu_train),
+        "local_train_base_pth": str(resolved_train_base_pth) if resolved_train_base_pth else None,
         "eval_with_model": bool(extra_eval_fn is not None),
         "anchor_path": str(resolved_anchor) if resolved_anchor else None,
         "require_model": require_model,
@@ -748,8 +771,15 @@ def launch_colab_session(
         ),
         extra_eval_fn=extra_eval_fn,
         session=session,
-        live_self_improve=(session is not None and not dry_run and not gguf_mode),
+        live_self_improve=(session is not None and not dry_run and (not gguf_mode or bool(enable_local_cpu_train))),
         model_config=session.model_config if session is not None else None,
+        enable_local_cpu_train=bool(enable_local_cpu_train),
+        local_train_base_pth=resolved_train_base_pth,
+        local_cpu_sft_count=local_cpu_sft_count,
+        local_cpu_dpo_count=local_cpu_dpo_count,
+        local_cpu_timeout_sec=local_cpu_timeout_sec,
+        local_cpu_threads=local_cpu_threads,
+        llama_bin_dir=llama_bin_dir,
     )
 
     try:
@@ -860,6 +890,12 @@ def main() -> int:
     parser.add_argument("--eval-with-model", action="store_true")
     parser.add_argument("--always-persist-weights", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--enable-local-cpu-train", action="store_true")
+    parser.add_argument("--train-base-pth", type=Path, default=None)
+    parser.add_argument("--local-sft-count", type=int, default=48)
+    parser.add_argument("--local-dpo-count", type=int, default=16)
+    parser.add_argument("--local-train-timeout", type=int, default=1200)
+    parser.add_argument("--local-cpu-threads", type=int, default=2)
     args = parser.parse_args()
 
     res = launch_colab_session(
@@ -877,6 +913,12 @@ def main() -> int:
         anchor_path=args.anchor_path,
         eval_with_model=args.eval_with_model,
         persist_only_if_improved=not args.always_persist_weights,
+        enable_local_cpu_train=args.enable_local_cpu_train,
+        local_train_base_pth=args.train_base_pth,
+        local_cpu_sft_count=args.local_sft_count,
+        local_cpu_dpo_count=args.local_dpo_count,
+        local_cpu_timeout_sec=args.local_train_timeout,
+        local_cpu_threads=args.local_cpu_threads,
     )
     print(json.dumps(res, indent=2))
     return 0

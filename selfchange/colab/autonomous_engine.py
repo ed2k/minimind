@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import ast
+import gc
 import json
+import os
 import random
 import re
+import shutil
 import tempfile
 import time
 from datetime import datetime, timezone
@@ -32,7 +35,7 @@ from selfchange.mutable.agent_loop import parse_tool_calls
 from selfchange.mutable.data_curator import compute_rep_penalty, curate_rft_samples, build_dpo_pairs, mix_with_anchor
 from selfchange.mutable.prompts import SYSTEM_PROMPT
 from selfchange.mutable.train_recipe import select_training_stage
-from selfchange.training.model_loader import load_model_config
+from selfchange.training.model_loader import load_model_config, save_model_config
 from selfchange.training.self_train_runner import (
     format_dpo_record,
     format_sft_record,
@@ -753,6 +756,61 @@ def diagnose_weakness_state(scorecard: dict | None, cycle_index: int, parent_nod
     }
 
 
+def resolve_local_train_base_pth(
+    repo_root: Path,
+    workspace_dir: Path,
+    profile: ComputeProfile,
+    explicit_pth: Path | None = None,
+    model_config: dict | None = None,
+) -> Path | None:
+    """Locate the matching .pth checkpoint for offline local CPU training alongside a GGUF session."""
+    repo_root = Path(repo_root).resolve()
+    workspace_dir = Path(workspace_dir).resolve()
+    ws_promoted = workspace_dir / "models" / "local_train_base.pth"
+    if ws_promoted.is_file() and ws_promoted.stat().st_size > 1024:
+        return ws_promoted.resolve()
+    if explicit_pth is not None and str(explicit_pth) != "auto":
+        cand = Path(explicit_pth)
+        if not cand.is_absolute():
+            cand = repo_root / cand
+        if cand.is_file() and cand.stat().st_size > 1024:
+            return cand.resolve()
+
+    hs = int((model_config or {}).get("hidden_size", profile.hidden_size))
+    moe_suffix = "_moe" if bool((model_config or {}).get("use_moe", profile.use_moe)) else ""
+    candidates = [
+        workspace_dir / "models" / "base" / "local_train_base.pth",
+        repo_root / "out" / "minimal_cpu_champion.pth",
+        repo_root / "out" / f"full_sft_{hs}{moe_suffix}.pth",
+        repo_root / "out" / "fixed_champion_768.pth",
+    ]
+    existing = [p.resolve() for p in candidates if p.is_file() and p.stat().st_size > 1024]
+    if not existing:
+        return None
+    if model_config and model_config.get("hidden_size") is not None:
+        target_sig = (
+            int(model_config["hidden_size"]),
+            model_config.get("num_hidden_layers"),
+            model_config.get("intermediate_size"),
+        )
+        for p in existing:
+            cfg = load_model_config(p)
+            if not cfg:
+                continue
+            cand_sig = (
+                cfg.get("hidden_size"),
+                cfg.get("num_hidden_layers"),
+                cfg.get("intermediate_size"),
+            )
+            if cand_sig == target_sig:
+                return p
+        for p in existing:
+            cfg = load_model_config(p)
+            if cfg and cfg.get("hidden_size") == target_sig[0]:
+                return p
+    return existing[0]
+
+
 class SelfImprovingCycleRunner(AutonomousCycleRunner):
     """Autonomous runner using live strict eval, multi-rollout exploration, weakness-targeted synthesis, and gated promotion."""
 
@@ -770,6 +828,13 @@ class SelfImprovingCycleRunner(AutonomousCycleRunner):
         live_self_improve: bool = True,
         model_config: dict | None = None,
         curated_episodes_dir: Path | None = None,
+        enable_local_cpu_train: bool = False,
+        local_train_base_pth: Path | None = None,
+        local_cpu_sft_count: int = 48,
+        local_cpu_dpo_count: int = 16,
+        local_cpu_timeout_sec: int = 1200,
+        local_cpu_threads: int = 2,
+        llama_bin_dir: Path | None = None,
     ):
         super().__init__(
             repo_root=repo_root,
@@ -785,7 +850,23 @@ class SelfImprovingCycleRunner(AutonomousCycleRunner):
         self.live_self_improve = live_self_improve
         self.model_config = dict(model_config) if model_config else None
         self.curated_episodes_dir = Path(curated_episodes_dir) if curated_episodes_dir else (self.workspace_dir / "curated_data")
+        self.enable_local_cpu_train = bool(enable_local_cpu_train)
+        self.local_train_base_pth = Path(local_train_base_pth).resolve() if local_train_base_pth is not None else None
+        self.local_cpu_sft_count = max(4, int(local_cpu_sft_count))
+        self.local_cpu_dpo_count = max(4, int(local_cpu_dpo_count))
+        self.local_cpu_timeout_sec = max(60, int(local_cpu_timeout_sec))
+        self.local_cpu_threads = max(1, int(local_cpu_threads))
+        self.llama_bin_dir = Path(llama_bin_dir).resolve() if llama_bin_dir is not None else None
         self._ep_counter = 0
+
+    def _resolve_local_train_base_pth(self) -> Path | None:
+        return resolve_local_train_base_pth(
+            self.repo_root,
+            self.workspace_dir,
+            self.profile,
+            explicit_pth=self.local_train_base_pth,
+            model_config=self.model_config,
+        )
 
     def _collect_live_metrics(self, ctx: CycleContext, rft: list[dict], dpo: list[dict]) -> dict:
         sc = getattr(self.session, "last_scorecard", None) or {}
@@ -808,8 +889,11 @@ class SelfImprovingCycleRunner(AutonomousCycleRunner):
         }
 
     def _run_periodic_training(self, ctx: CycleContext, worktree_dir: Path) -> str | None:
+        gguf_session = bool(self.session is not None and getattr(self.session, "is_gguf_mode", False))
+        gguf_local_train = bool(gguf_session and self.enable_local_cpu_train)
         if self.cycle_config.dry_run_training or not self.live_self_improve or self.session is None:
-            return super()._run_periodic_training(ctx, worktree_dir)
+            if not gguf_local_train:
+                return super()._run_periodic_training(ctx, worktree_dir)
 
         trajs = (
             [json.loads(ln) for ln in self.trajectories_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
@@ -830,14 +914,16 @@ class SelfImprovingCycleRunner(AutonomousCycleRunner):
         cur_ep_sft = self.curated_episodes_dir / "verified_selfchange_episodes.jsonl"
         cur_ep_dpo = self.curated_episodes_dir / "verified_selfchange_dpo.jsonl"
         synth_dir = self.workspace_dir / "training_data" / f"synth_c{ctx.cycle_index:04d}"
-        max_seq = min(768, self.profile.max_seq_len)
+        max_seq = 512 if gguf_local_train else min(768, self.profile.max_seq_len)
+        sft_count = self.local_cpu_sft_count if gguf_local_train else 320
+        dpo_count = self.local_cpu_dpo_count if gguf_local_train else 80
 
         synth_rep = build_limitation_fix_and_meta_dataset(
             repo_root=self.repo_root,
             output_dir=synth_dir,
             eval_report_path=diag_eval_path,
-            sft_count=320,
-            dpo_count=80,
+            sft_count=sft_count,
+            dpo_count=dpo_count,
             max_seq_len=max_seq,
             seed=42 + ctx.cycle_index * 13,
             extra_sft_paths=[cur_ep_sft] if cur_ep_sft.is_file() else None,
@@ -920,7 +1006,7 @@ class SelfImprovingCycleRunner(AutonomousCycleRunner):
         stage = recipe["stage"]
         if stage == "none":
             stage = "dpo" if (len(merged_dpo) >= 8 and ctx.safe_mode) else "lora"
-        if stage == "rlvr" and len(rft) < 4:
+        if stage == "rlvr" and (gguf_local_train or len(rft) < 4):
             stage = "dpo" if len(merged_dpo) >= 8 else "lora"
 
         data_dir = self.workspace_dir / "training_data"
@@ -932,18 +1018,59 @@ class SelfImprovingCycleRunner(AutonomousCycleRunner):
             data_file = data_dir / f"rft_c{ctx.cycle_index:04d}.jsonl"
             write_sft_jsonl(data_file, merged_sft)
 
-        from_weight, from_weight_path = self._resolve_training_from_weight(ctx)
-        eff_arch = self.model_config or (load_model_config(from_weight_path) if from_weight_path else None) or getattr(self.session, "model_config", None)
+        prev_gguf_path: Path | None = None
+        if gguf_local_train:
+            loaded_cur = getattr(self.session, "loaded_path", None)
+            if loaded_cur is not None and Path(loaded_cur).is_file():
+                prev_gguf_path = Path(loaded_cur).resolve()
+            base_train_pth = self._resolve_local_train_base_pth()
+            if base_train_pth is None:
+                self._append_train_history(
+                    {
+                        "timestamp": _utc_now(),
+                        "cycle_index": ctx.cycle_index,
+                        "stage": stage,
+                        "reason": recipe.get("reason"),
+                        "ok": False,
+                        "accepted": False,
+                        "skipped_reason": "missing_local_train_base_pth",
+                    }
+                )
+                return None
+            from_weight, from_weight_path = "full_sft", base_train_pth
+            eff_arch = (
+                load_model_config(base_train_pth)
+                or self.model_config
+                or getattr(self.session, "model_config", None)
+            )
+        else:
+            from_weight, from_weight_path = self._resolve_training_from_weight(ctx)
+            eff_arch = self.model_config or (load_model_config(from_weight_path) if from_weight_path else None) or getattr(self.session, "model_config", None)
+
         train_cfg = dict(recipe["training"])
         train_cfg["heldout_path"] = str(heldout_path)
         train_cfg["max_seq_len"] = max_seq
         train_cfg.setdefault("epochs", 1)
         train_cfg.setdefault("batch_size", min(4, self.profile.batch_size))
         train_cfg.setdefault("accumulation_steps", 2)
+        if gguf_local_train:
+            train_cfg["batch_size"] = 1
+            train_cfg["accumulation_steps"] = max(4, int(train_cfg.get("accumulation_steps", 4)))
+            train_cfg["epochs"] = 1
+            train_cfg["allow_seq_override"] = True
+            train_cfg["timeout_sec"] = self.local_cpu_timeout_sec
+            train_cfg["cpu_threads"] = self.local_cpu_threads
+            if stage == "lora":
+                train_cfg["lora_rank"] = min(8, int(train_cfg.get("lora_rank", 8)))
         if stage == "dpo":
             train_cfg["dpo_learning_rate"] = max(2e-7, float(train_cfg.get("dpo_learning_rate", 2e-7)))
         elif stage == "lora":
             train_cfg["learning_rate"] = min(5e-5, max(2e-5, float(train_cfg.get("learning_rate", 3e-5))))
+
+        if gguf_local_train and self.session is not None:
+            # Release llama-server memory before CPU PyTorch training on 8 GB hosts.
+            self.session.close()
+            gc.collect()
 
         res = run_training_stage(
             stage=stage,
@@ -959,17 +1086,31 @@ class SelfImprovingCycleRunner(AutonomousCycleRunner):
             model_config=eff_arch,
         )
 
+        if gguf_local_train:
+            ckpt_dir = self.repo_root / "checkpoints"
+            if ckpt_dir.is_dir():
+                for ep in ckpt_dir.glob(f"cand_c{ctx.cycle_index:04d}_*.pth"):
+                    ep.unlink(missing_ok=True)
+                try:
+                    ckpt_dir.rmdir()
+                except OSError:
+                    pass
+
         final_weight_path: str | None = res.output_weight_path if res.ok else None
         merge_error: str | None = None
         if stage == "lora" and res.ok and res.output_weight_path:
             try:
-                base_pth = stage_from_weight_for_trainer(
-                    from_weight,
-                    self.repo_root,
-                    self.workspace_dir,
-                    self.profile,
-                    from_weight_path=from_weight_path,
-                    model_config=eff_arch,
+                base_pth = (
+                    from_weight_path
+                    if (gguf_local_train and from_weight_path is not None and from_weight_path.is_file())
+                    else stage_from_weight_for_trainer(
+                        from_weight,
+                        self.repo_root,
+                        self.workspace_dir,
+                        self.profile,
+                        from_weight_path=from_weight_path,
+                        model_config=eff_arch,
+                    )
                 )
                 if base_pth is None:
                     raise FileNotFoundError(f"Base weight {from_weight!r} not found for LoRA merge")
@@ -996,15 +1137,53 @@ class SelfImprovingCycleRunner(AutonomousCycleRunner):
                     target_all_linear=True,
                     model_config=eff_arch,
                 )
+                if eff_arch:
+                    save_model_config(merged_path.with_suffix(".config.json"), eff_arch)
                 final_weight_path = str(merged_path)
             except Exception as exc:
                 merge_error = repr(exc)
                 final_weight_path = None
 
+        trained_pth_path: Path | None = (
+            Path(final_weight_path).resolve()
+            if (final_weight_path and Path(final_weight_path).is_file())
+            else None
+        )
+        eval_weight_path: Path | None = trained_pth_path
+        cand_gguf_path: Path | None = None
+        gguf_export_error: str | None = None
+
+        if gguf_local_train and trained_pth_path is not None:
+            gc.collect()
+            try:
+                from selfchange.colab.export_gguf import export_pth_to_single_gguf
+
+                cand_gguf_out = (
+                    self.workspace_dir
+                    / "promoted_models"
+                    / "gguf"
+                    / "candidates"
+                    / f"cand_c{ctx.cycle_index:04d}-q4_k_m.gguf"
+                )
+                tok_dir = Path(getattr(self.session, "tokenizer_path", self.repo_root / "model"))
+                cand_gguf_path = export_pth_to_single_gguf(
+                    pth_path=trained_pth_path,
+                    out_gguf_path=cand_gguf_out,
+                    tokenizer_dir=tok_dir,
+                    quant="Q4_K_M",
+                    model_config=eff_arch,
+                    llama_bin_dir=self.llama_bin_dir,
+                )
+                eval_weight_path = cand_gguf_path
+            except Exception as exc:
+                gguf_export_error = repr(exc)
+                eval_weight_path = None
+                final_weight_path = None
+
         accepted = False
         after_sc: dict | None = None
-        if final_weight_path and Path(final_weight_path).is_file():
-            after_sc = self.session.eval_strict_scorecard(Path(final_weight_path))
+        if eval_weight_path is not None and eval_weight_path.is_file():
+            after_sc = self.session.eval_strict_scorecard(eval_weight_path)
             score_up = float(after_sc["overall_score"]) > float(before_sc["overall_score"]) + 0.005
             pass_up = (
                 int(after_sc["passed_count"]) > int(before_sc["passed_count"])
@@ -1023,14 +1202,64 @@ class SelfImprovingCycleRunner(AutonomousCycleRunner):
                     episode_tag=f"live_c{ctx.cycle_index}_{self._ep_counter}",
                 )
                 atomic_write_text(self.workspace_dir / "live_scorecard_end.json", json.dumps(after_sc, indent=2, ensure_ascii=False) + "\n")
-                self.session._ensure_loaded(Path(final_weight_path))
-                self.session.last_scorecard = after_sc
+                if gguf_local_train and trained_pth_path is not None and cand_gguf_path is not None:
+                    gguf_dir = self.workspace_dir / "promoted_models" / "gguf"
+                    gguf_dir.mkdir(parents=True, exist_ok=True)
+                    champ_gguf = gguf_dir / "champion.gguf"
+                    tmp_c = champ_gguf.with_name(f".{champ_gguf.name}.{os.getpid()}.tmp")
+                    try:
+                        shutil.copy2(cand_gguf_path, tmp_c)
+                        os.replace(tmp_c, champ_gguf)
+                    finally:
+                        if tmp_c.exists():
+                            tmp_c.unlink(missing_ok=True)
+                    cand_cfg = cand_gguf_path.with_suffix(".config.json")
+                    if cand_cfg.is_file():
+                        shutil.copy2(cand_cfg, champ_gguf.with_suffix(".config.json"))
+                    atomic_write_text(
+                        gguf_dir / "latest_gguf.json",
+                        json.dumps(
+                            {
+                                "champion_gguf": str(champ_gguf),
+                                "selected_artifact": {"path": str(cand_gguf_path), "quant": "Q4_K_M"},
+                                "source_pth": str(trained_pth_path),
+                                "cycle_index": ctx.cycle_index,
+                            },
+                            indent=2,
+                            ensure_ascii=False,
+                        ) + "\n",
+                    )
+                    ws_base_pth = self.workspace_dir / "models" / "local_train_base.pth"
+                    ws_base_pth.parent.mkdir(parents=True, exist_ok=True)
+                    tmp_p = ws_base_pth.with_name(f".{ws_base_pth.name}.{os.getpid()}.tmp")
+                    try:
+                        shutil.copy2(trained_pth_path, tmp_p)
+                        os.replace(tmp_p, ws_base_pth)
+                    finally:
+                        if tmp_p.exists():
+                            tmp_p.unlink(missing_ok=True)
+                    pth_cfg = trained_pth_path.with_suffix(".config.json")
+                    if pth_cfg.is_file():
+                        shutil.copy2(pth_cfg, ws_base_pth.with_suffix(".config.json"))
+                    elif eff_arch:
+                        save_model_config(ws_base_pth.with_suffix(".config.json"), eff_arch)
+                    self.local_train_base_pth = ws_base_pth
+                    self.session._ensure_loaded(cand_gguf_path)
+                    self.session.last_scorecard = after_sc
+                    final_weight_path = str(cand_gguf_path)
+                else:
+                    self.session._ensure_loaded(Path(final_weight_path))
+                    self.session.last_scorecard = after_sc
             else:
-                # Reload previous baseline weight into session if rejected
-                if from_weight_path:
-                    self.session._ensure_loaded(from_weight_path)
+                reload_target = prev_gguf_path if gguf_local_train else from_weight_path
+                if reload_target:
+                    self.session._ensure_loaded(reload_target)
                     self.session.last_scorecard = before_sc
                 final_weight_path = None
+        elif gguf_local_train and prev_gguf_path is not None and self.session is not None:
+            self.session._ensure_loaded(prev_gguf_path)
+            self.session.last_scorecard = before_sc
+            final_weight_path = None
 
         self._append_train_history(
             {
@@ -1052,6 +1281,9 @@ class SelfImprovingCycleRunner(AutonomousCycleRunner):
                 "final_loss": res.final_loss,
                 "duration_sec": res.duration_sec,
                 "output_weight_path": final_weight_path,
+                "trained_pth_path": str(trained_pth_path) if trained_pth_path else None,
+                "cand_gguf_path": str(cand_gguf_path) if cand_gguf_path else None,
+                "gguf_export_error": gguf_export_error,
                 "merge_error": merge_error,
                 "log_tail": res.log_tail,
             }

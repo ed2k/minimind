@@ -195,6 +195,12 @@ def stage_from_weight_for_trainer(
     return target_out
 
 
+def _effective_max_seq_len(profile: ComputeProfile, training_cfg: dict) -> int:
+    req_seq = int(training_cfg.get("max_seq_len", profile.max_seq_len))
+    cap = 768 if training_cfg.get("allow_seq_override") else profile.max_seq_len
+    return min(cap, req_seq)
+
+
 def promote_lora_adapter(
     base_weight: Path,
     lora_weight: Path,
@@ -283,7 +289,7 @@ def build_trainer_command(
 
     lr = str(training_cfg.get("learning_rate", 5e-5))
     bs = str(training_cfg.get("batch_size", profile.batch_size))
-    seq = str(min(profile.max_seq_len, int(training_cfg.get("max_seq_len", profile.max_seq_len))))
+    seq = str(_effective_max_seq_len(profile, training_cfg))
     epochs = str(training_cfg.get("epochs", 1))
     grad_clip = str(training_cfg.get("grad_clip", 1.0))
     acc = str(training_cfg.get("accumulation_steps", 1))
@@ -448,7 +454,7 @@ def run_training_stage(
     if enforce_data_gate and stage in ("pretrain", "full_sft", "lora", "dpo", "distill"):
         from selfchange.bootstrap.data_quality import review_and_record_dataset
 
-        seq_int = min(profile.max_seq_len, int(training_cfg.get("max_seq_len", profile.max_seq_len)))
+        seq_int = _effective_max_seq_len(profile, training_cfg)
         fmt = "dpo" if stage == "dpo" else ("pretrain" if stage == "pretrain" else "sft")
         heldout_raw = training_cfg.get("heldout_path")
         review = review_and_record_dataset(
@@ -520,6 +526,20 @@ def run_training_stage(
     trainer_env = os.environ.copy()
     trainer_env["PYTHONPATH"] = str(repo_root) + (os.pathsep + trainer_env["PYTHONPATH"] if trainer_env.get("PYTHONPATH") else "")
     trainer_env["PYTHONUNBUFFERED"] = "1"
+    if profile.device == "cpu":
+        cpu_threads = str(max(1, min(8, int(training_cfg.get("cpu_threads", 2)))))
+        if "cpu_threads" in training_cfg:
+            trainer_env["OMP_NUM_THREADS"] = cpu_threads
+            trainer_env["MKL_NUM_THREADS"] = cpu_threads
+            trainer_env["OPENBLAS_NUM_THREADS"] = cpu_threads
+        else:
+            trainer_env.setdefault("OMP_NUM_THREADS", cpu_threads)
+            trainer_env.setdefault("MKL_NUM_THREADS", cpu_threads)
+            trainer_env.setdefault("OPENBLAS_NUM_THREADS", cpu_threads)
+
+    timeout_sec = float(profile.subprocess_timeout_sec)
+    if training_cfg.get("timeout_sec") is not None:
+        timeout_sec = max(timeout_sec, min(3600.0, float(training_cfg["timeout_sec"])))
 
     t_proc0 = time.monotonic()
     proc = subprocess.Popen(
@@ -533,7 +553,7 @@ def run_training_stage(
     )
     timed_out = False
     try:
-        stdout, stderr = proc.communicate(timeout=float(profile.subprocess_timeout_sec))
+        stdout, stderr = proc.communicate(timeout=timeout_sec)
         returncode = proc.returncode
     except subprocess.TimeoutExpired:
         timed_out = True

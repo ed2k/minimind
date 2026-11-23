@@ -11,7 +11,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
 
-from selfchange.colab.colab_launcher import launch_colab_session, resolve_model_checkpoint
+from selfchange.colab.colab_launcher import MiniMindProposerSession, launch_colab_session, resolve_model_checkpoint
 from selfchange.colab.run_colab_cli import run_colab_cli_pipeline
 from selfchange.kernel.budgets import get_profile
 from selfchange.kernel.integrity import KERNEL_MANIFEST_FILENAME
@@ -22,6 +22,7 @@ from selfchange.training.llamacpp_backend import (
     restore_open_thinking_text,
 )
 from selfchange.training.model_loader import estimate_minimind_params, save_model_config
+from selfchange.training.self_train_runner import TrainingRunResult
 
 
 def _start_mock_llama_server(handler_fn) -> tuple[ThreadingHTTPServer, str, threading.Thread]:
@@ -293,6 +294,176 @@ class TestLowEndIntelMacGGUF(unittest.TestCase):
             fake_bin.chmod(0o755)
             found = find_llama_binary("llama-server", search_dirs=[Path(tmp)])
             self.assertEqual(found, fake_bin.resolve())
+
+    def test_gguf_local_cpu_train_closes_server_trains_exports_and_promotes(self) -> None:
+        improved = {"flag": False}
+        events: list[str] = []
+        captured_cfg: dict = {}
+
+        def _handle(req: dict) -> dict:
+            p = req.get("prompt", "")
+            if "get_system_state" in p and "submit_candidate" in p and "Observed" not in p:
+                txt = (
+                    "Observe workspace status from context.\n</think>\n\n"
+                    '<tool_call>\n{"name": "get_system_state", "arguments": {}}\n</tool_call>'
+                )
+            elif "<tool_response>" in p and "patch_config" in p and '"patched"' not in p:
+                txt = (
+                    "Apply minimal config update.\n</think>\n\n"
+                    '<tool_call>\n{"name": "patch_config", "arguments": {"updates": {"temperature": 0.15}}}\n</tool_call>'
+                )
+            elif "batch_size=4" in p and "accumulation_steps=1" in p:
+                txt = "Batch=4->2->1, accum=1->2->4.\n</think>\n\nFinal batch_size=1, accumulation_steps=4."
+            elif "batch_size=16 and accumulation_steps=2" in p:
+                if improved["flag"]:
+                    txt = "Halve twice: 16->8->4, accum 2->4->8.\n</think>\n\nFinal batch_size=4 and accumulation_steps=8."
+                else:
+                    txt = "Halve once.\n</think>\n\nFinal batch_size=8 and accumulation_steps=4."
+            elif "cap(" in p or "clamp" in p or "exp_bound_val" in p:
+                txt = (
+                    "Fix max to min on line 4.\n</think>\n\n"
+                    '<tool_call>\n{"name": "replace_line_range", "arguments": {"path": "x.py", "start_line": 4, "end_line": 4, "lines": ["    return min(val, hi)"]}}\n</tool_call>'
+                )
+            elif "status=healthy" in p:
+                txt = "Healthy run, no edits required.\n</think>\n\nSystem is healthy. No edits required."
+            elif "submit_candidate" in p:
+                txt = (
+                    "Submitting verified update.\n</think>\n\n"
+                    '<tool_call>\n{"name": "submit_candidate", "arguments": {"hypothesis": "gguf local train test"}}\n</tool_call>'
+                )
+            else:
+                txt = "Checked context carefully.\n</think>\n\nVerified response."
+            return {"content": txt, "stopped_eos": True, "timings": {"predicted_per_second": 48.0}}
+
+        srv, url, thread = _start_mock_llama_server(_handle)
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                tmp_p = Path(tmp).resolve()
+                real_repo = Path(__file__).resolve().parents[2]
+                kdir = tmp_p / "kernel"
+                shutil.copytree(real_repo / "selfchange" / "kernel", kdir, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+
+                repo = tmp_p / "repo"
+                repo.mkdir(parents=True)
+                subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True, text=True)
+                subprocess.run(["git", "config", "user.name", "test-user"], cwd=repo, check=True, capture_output=True, text=True)
+                subprocess.run(["git", "config", "user.email", "test@local"], cwd=repo, check=True, capture_output=True, text=True)
+                shutil.copytree(
+                    real_repo / "selfchange" / "mutable",
+                    repo / "selfchange" / "mutable",
+                    ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+                )
+                subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True, text=True)
+                subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True, text=True)
+
+                ws = tmp_p / "ws"
+                gguf_dir = ws / "promoted_models" / "gguf"
+                gguf_dir.mkdir(parents=True)
+                champ_gguf = gguf_dir / "champion.gguf"
+                champ_gguf.write_bytes(b"GGUF\x03\x00\x00\x00BASE0")
+                arch = estimate_minimind_params(128, 4, 384, 4, 2)
+                save_model_config(champ_gguf.with_suffix(".config.json"), arch)
+                (gguf_dir / "latest_gguf.json").write_text(json.dumps({"champion_gguf": str(champ_gguf)}), encoding="utf-8")
+
+                out_dir = repo / "out"
+                out_dir.mkdir(parents=True)
+                base_pth = out_dir / "minimal_cpu_champion.pth"
+                base_pth.write_bytes(b"PTH" * 500)
+                save_model_config(base_pth.with_suffix(".config.json"), arch)
+
+                orig_close = MiniMindProposerSession.close
+
+                def _spy_close(self_sess):
+                    events.append("close")
+                    return orig_close(self_sess)
+
+                def _mock_train(**kwargs):
+                    events.append("train")
+                    captured_cfg.update(kwargs["training_cfg"])
+                    cand_dir = ws / "models" / "candidates"
+                    cand_dir.mkdir(parents=True, exist_ok=True)
+                    out_w = cand_dir / f"{kwargs['save_weight']}_{arch['hidden_size']}.pth"
+                    out_w.write_bytes(b"PTH" * 600)
+                    return TrainingRunResult(
+                        stage=kwargs["stage"],
+                        ok=True,
+                        exit_code=0,
+                        output_weight_path=str(out_w),
+                        resume_ckpt_path=None,
+                        final_loss=0.42,
+                        oom_detected=False,
+                        nan_detected=False,
+                        timed_out=False,
+                        duration_sec=1.5,
+                        log_tail="Epoch:[1/1](24/24), loss: 0.4200",
+                        dry_run=False,
+                    )
+
+                def _mock_merge(**kwargs):
+                    events.append("merge")
+                    m_out = Path(kwargs["merged_out"])
+                    m_out.parent.mkdir(parents=True, exist_ok=True)
+                    m_out.write_bytes(b"PTH_MERGED" * 400)
+                    return m_out
+
+                def _mock_export(**kwargs):
+                    events.append("export")
+                    out_gguf = Path(kwargs["out_gguf_path"])
+                    out_gguf.parent.mkdir(parents=True, exist_ok=True)
+                    out_gguf.write_bytes(b"GGUF\x03\x00\x00\x00CAND1")
+                    save_model_config(out_gguf.with_suffix(".config.json"), kwargs["model_config"])
+                    improved["flag"] = True
+                    return out_gguf
+
+                with (
+                    patch("selfchange.colab.colab_launcher._torch_available", return_value=False),
+                    patch.object(MiniMindProposerSession, "close", new=_spy_close),
+                    patch("selfchange.colab.autonomous_engine.run_training_stage", side_effect=_mock_train),
+                    patch("selfchange.colab.autonomous_engine.promote_lora_adapter", side_effect=_mock_merge),
+                    patch("selfchange.colab.export_gguf.export_pth_to_single_gguf", side_effect=_mock_export),
+                ):
+                    out = launch_colab_session(
+                        repo_root=repo,
+                        workspace_dir=ws,
+                        profile_name="local_intel_cpu",
+                        max_cycles=1,
+                        train_every_n_cycles=1,
+                        eval_with_model=True,
+                        require_model=True,
+                        kernel_dir=kdir,
+                        manifest_path=kdir / KERNEL_MANIFEST_FILENAME,
+                        llama_base_url=url,
+                        enable_local_cpu_train=True,
+                        local_cpu_sft_count=24,
+                        local_cpu_timeout_sec=1200,
+                        local_cpu_threads=2,
+                    )
+
+                self.assertEqual(out["backend"], "llamacpp_gguf+local_cpu_train")
+                self.assertIn("close", events)
+                self.assertIn("train", events)
+                self.assertIn("export", events)
+                self.assertLess(events.index("close"), events.index("train"))
+                self.assertLess(events.index("train"), events.index("export"))
+                self.assertEqual(captured_cfg["batch_size"], 1)
+                self.assertTrue(captured_cfg["allow_seq_override"])
+                self.assertEqual(captured_cfg["max_seq_len"], 512)
+                self.assertEqual(captured_cfg["timeout_sec"], 1200)
+                self.assertEqual(captured_cfg["cpu_threads"], 2)
+
+                hist = [json.loads(ln) for ln in (ws / "logs" / "train_history.jsonl").read_text(encoding="utf-8").splitlines() if ln.strip()]
+                train_rows = [h for h in hist if h.get("stage") in ("lora", "dpo")]
+                self.assertEqual(len(train_rows), 1)
+                self.assertTrue(train_rows[0]["ok"])
+                self.assertTrue(train_rows[0]["accepted"])
+                self.assertIsNone(train_rows[0]["gguf_export_error"])
+                self.assertEqual(champ_gguf.read_bytes(), b"GGUF\x03\x00\x00\x00CAND1")
+                self.assertTrue((ws / "models" / "local_train_base.pth").is_file())
+                self.assertTrue((ws / "curated_data" / "verified_selfchange_episodes.jsonl").is_file())
+        finally:
+            srv.shutdown()
+            srv.server_close()
+            thread.join(timeout=2)
 
 
 if __name__ == "__main__":

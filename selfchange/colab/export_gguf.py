@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import urllib.request
 from pathlib import Path
 
@@ -13,7 +14,7 @@ from selfchange.colab.autonomous_engine import evaluate_model_strict_suite
 from selfchange.kernel.budgets import get_profile
 from selfchange.kernel.integrity import atomic_write_text
 from selfchange.training.llamacpp_backend import LlamaCppServerSession, download_llamacpp_prebuilt, find_llama_binary
-from selfchange.training.model_loader import estimate_minimind_params, load_model_config
+from selfchange.training.model_loader import estimate_minimind_params, load_model_config, save_model_config
 
 
 def export_pth_to_hf_qwen3(
@@ -83,8 +84,29 @@ def export_pth_to_hf_qwen3(
     return hf_out_dir
 
 
+def _resolve_llamacpp_converter_repo(llama_cpp_repo: Path | None) -> Path:
+    if llama_cpp_repo is not None:
+        cand = Path(llama_cpp_repo).resolve()
+        if (cand / "convert_hf_to_gguf.py").is_file():
+            return cand
+    repo_root = Path(__file__).resolve().parents[2]
+    offline_conv = (repo_root / "selfchange" / "workspace" / "bin" / "llama.cpp" / "converter").resolve()
+    if (offline_conv / "convert_hf_to_gguf.py").is_file():
+        return offline_conv
+    return Path(llama_cpp_repo or Path("/content/llama.cpp")).resolve()
+
+
+def _resolve_llamacpp_bin_dir(llama_bin_dir: Path | None, fallback_dir: Path) -> Path:
+    if llama_bin_dir is not None:
+        return Path(llama_bin_dir).resolve()
+    found_q = find_llama_binary("llama-quantize")
+    if found_q is not None:
+        return found_q.parent
+    return Path(fallback_dir).resolve()
+
+
 def _ensure_llamacpp_converter_and_bins(llama_cpp_repo: Path, bin_dir: Path) -> tuple[Path, Path]:
-    llama_cpp_repo = Path(llama_cpp_repo).resolve()
+    llama_cpp_repo = _resolve_llamacpp_converter_repo(llama_cpp_repo)
     converter = llama_cpp_repo / "convert_hf_to_gguf.py"
     if not converter.is_file():
         llama_cpp_repo.parent.mkdir(parents=True, exist_ok=True)
@@ -97,14 +119,12 @@ def _ensure_llamacpp_converter_and_bins(llama_cpp_repo: Path, bin_dir: Path) -> 
     except ImportError:
         subprocess.run([sys.executable, "-m", "pip", "install", "-q", "gguf", "pyyaml", "sentencepiece"], check=False)
 
-    quant_bin = find_llama_binary("llama-quantize", search_dirs=[bin_dir])
-    srv_bin = find_llama_binary("llama-server", search_dirs=[bin_dir])
-    if quant_bin is None or srv_bin is None:
+    quant_bin = find_llama_binary("llama-quantize", search_dirs=[bin_dir]) or find_llama_binary("llama-quantize")
+    if quant_bin is None:
         info = download_llamacpp_prebuilt(bin_dir)
-        if not info.get("llama_quantize") or not info.get("llama_server"):
-            raise RuntimeError(f"Failed to acquire prebuilt llama-quantize / llama-server: {info}")
+        if not info.get("llama_quantize"):
+            raise RuntimeError(f"Failed to acquire llama-quantize: {info}")
         quant_bin = Path(info["llama_quantize"])
-        srv_bin = Path(info["llama_server"])
     return converter, quant_bin.parent
 
 
@@ -121,7 +141,8 @@ def convert_hf_to_quantized_ggufs(
     hf_dir = Path(hf_dir).resolve()
     out_dir = Path(out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
-    eff_bin_dir = Path(llama_bin_dir).resolve() if llama_bin_dir else (out_dir / "_llama_bin")
+    llama_cpp_repo = _resolve_llamacpp_converter_repo(llama_cpp_repo)
+    eff_bin_dir = _resolve_llamacpp_bin_dir(llama_bin_dir, out_dir / "_llama_bin")
 
     converter, actual_bin_dir = _ensure_llamacpp_converter_and_bins(llama_cpp_repo, eff_bin_dir)
     quant_bin = find_llama_binary("llama-quantize", search_dirs=[actual_bin_dir])
@@ -310,6 +331,55 @@ def export_and_verify_gguf(
     }
     atomic_write_text(out_dir / f"{stem}_gguf_report.json", json.dumps(report, indent=2, ensure_ascii=False) + "\n")
     return report
+
+
+def export_pth_to_single_gguf(
+    pth_path: Path,
+    out_gguf_path: Path,
+    tokenizer_dir: Path = Path("model"),
+    quant: str = "Q4_K_M",
+    model_config: dict | None = None,
+    llama_cpp_repo: Path | None = None,
+    llama_bin_dir: Path | None = None,
+) -> Path:
+    """Export one MiniMind .pth checkpoint to a single quantized GGUF with sibling .config.json."""
+    pth_path = Path(pth_path).resolve()
+    out_gguf_path = Path(out_gguf_path).resolve()
+    out_gguf_path.parent.mkdir(parents=True, exist_ok=True)
+    arch = dict(model_config) if model_config else (load_model_config(pth_path) or None)
+
+    tmp_root = Path(tempfile.mkdtemp(prefix=f"gguf_{out_gguf_path.stem}_", dir=str(out_gguf_path.parent)))
+    try:
+        hf_dir = tmp_root / "hf"
+        gguf_dir = tmp_root / "gguf"
+        export_pth_to_hf_qwen3(pth_path, hf_dir, tokenizer_dir=tokenizer_dir, model_config=arch)
+        conv_repo = _resolve_llamacpp_converter_repo(llama_cpp_repo)
+        eff_bin_dir = _resolve_llamacpp_bin_dir(llama_bin_dir, out_gguf_path.parent / "_llama_bin")
+        q_info = convert_hf_to_quantized_ggufs(
+            hf_dir=hf_dir,
+            out_dir=gguf_dir,
+            stem=out_gguf_path.stem,
+            quants=(quant,),
+            llama_cpp_repo=conv_repo,
+            llama_bin_dir=eff_bin_dir,
+            keep_f16=False,
+        )
+        artifacts = q_info.get("artifacts") or []
+        if not artifacts:
+            raise RuntimeError(f"No GGUF artifacts generated from {pth_path}")
+        produced = Path(artifacts[0]["path"]).resolve()
+        tmp_gguf = out_gguf_path.with_name(f".{out_gguf_path.name}.{os.getpid()}.tmp")
+        try:
+            shutil.copy2(produced, tmp_gguf)
+            os.replace(tmp_gguf, out_gguf_path)
+        finally:
+            if tmp_gguf.exists():
+                tmp_gguf.unlink(missing_ok=True)
+        if arch:
+            save_model_config(out_gguf_path.with_suffix(".config.json"), arch)
+        return out_gguf_path
+    finally:
+        shutil.rmtree(tmp_root, ignore_errors=True)
 
 
 def main() -> int:
