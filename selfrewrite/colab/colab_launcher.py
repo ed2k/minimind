@@ -132,16 +132,17 @@ def _make_target_for_repair(
         damaged_target = MockTargetBackend(clean_target._base_model, target_tensors=damaged_w, damage_mode=True)
         return damaged_target, damaged_w, spec
 
-    # HF GPU Backend: materialize ONLY the single corrupted layer matrix into a CanonicalWeightReader overlay.
-    from selfrewrite.backends.hf_gpu_backend import CanonicalWeightReader, HFGPUBackend, HybridWeightOverlay
-    from selfrewrite.tasks.corruption import apply_block_corruption, CorruptionSpec
+    # HF / MiniMind Backend: materialize ONLY the single corrupted layer matrix into a CanonicalWeightReader overlay.
+    from selfrewrite.backends.base import EditorBackend, GenerationRecord, ReadResult, TargetBackend
+    from selfrewrite.backends.hf_gpu_backend import CanonicalWeightReader
+    from selfrewrite.tasks.corruption import CorruptionSpec, apply_block_corruption
 
-    hf: HFGPUBackend = raw_map["_hf_backend"]
-    candidates = [nm for nm in hf.tensor_shapes() if f"layers.{layer_idx}." in nm and nm.endswith("mlp.down_proj.weight")]
+    base_backend = raw_map.get("_hf_backend") or raw_map.get("_mm_backend")
+    candidates = [nm for nm in base_backend.tensor_shapes() if f"layers.{layer_idx}." in nm and nm.endswith("mlp.down_proj.weight")]
     if not candidates:
-        candidates = [nm for nm in hf.tensor_shapes() if f"layers.{layer_idx}." in nm and nm.endswith(".down_proj.weight")]
+        candidates = [nm for nm in base_backend.tensor_shapes() if f"layers.{layer_idx}." in nm and nm.endswith(".down_proj.weight")]
     tname = candidates[0]
-    orig_t = hf.canonical_reader.load_tensor(tname)
+    orig_t = base_backend.canonical_reader.load_tensor(tname)
     out_dim = int(orig_t.shape[0])
     r0 = random.Random(seed).randint(0, max(0, out_dim - num_rows))
     init_spec = CorruptionSpec(layer_idx=layer_idx, tensor_name=tname, row_start=r0, num_rows=min(num_rows, out_dim), sigma_mult=sigma_mult, mode=mode, seed=seed)
@@ -175,8 +176,6 @@ def _make_target_for_repair(
             if spec["mode"] == "safetensors_dir":
                 spec["weight_map"][self._ov_name] = dmg_file.name
                 if Path(spec["base_dir"]) != Path(dest_dir).resolve():
-                    # Point relative paths back cleanly or write merged spec: all non-overridden shards keep absolute/relative?
-                    # Keep canonical shard copy-free by copying weight_map paths only if same dir; else materialize damaged only.
                     spec["base_dir"] = "/"
                     new_map = {}
                     base_d = Path(self._base.weight_dir) if self._base.weight_dir else Path(dest_dir)
@@ -186,29 +185,48 @@ def _make_target_for_repair(
             atomic_write_text(base_spec_path, json.dumps(spec, indent=2))
             return base_spec_path
 
-    class _DamagedHFTarget(HFGPUBackend):
-        def generate_batch(self, problems, edit_tensors, n_samples, max_tokens, config, seed_base=0):
-            merged = {tname: corrupted_t}
+    dmg_reader = _CorruptedCanonicalReader(base_backend.canonical_reader, tname, corrupted_t)
+
+    class _DamagedBackendProxy(TargetBackend, EditorBackend):
+        def __init__(self, inner: Any, reader: _CorruptedCanonicalReader, ov_name: str, ov_tensor: Any):
+            self._inner = inner
+            self.canonical_reader = reader
+            self._ov_name = ov_name
+            self._ov_t = ov_tensor
+
+        @property
+        def arch_summary(self) -> str:
+            return f"{self._inner.arch_summary} [damaged]"
+
+        @property
+        def num_layers(self) -> int:
+            return int(self._inner.num_layers)
+
+        def tensor_shapes(self) -> dict[str, tuple[int, ...]]:
+            return self.canonical_reader.tensor_shapes()
+
+        def export_sandbox_weights_spec(self, dest_dir: Path) -> Path:
+            return self.canonical_reader.export_weights_spec(dest_dir)
+
+        def generate_batch(self, problems: list[Any], edit_tensors: dict[str, Any] | None, n_samples: int, max_tokens: int, config: SessionConfig, seed_base: int = 0) -> list[GenerationRecord]:
+            merged = {self._ov_name: self._ov_t}
             if edit_tensors:
                 merged.update(edit_tensors)
-            return super().generate_batch(problems, merged, n_samples, max_tokens, config, seed_base=seed_base)
+            return self._inner.generate_batch(problems, merged, n_samples, max_tokens, config, seed_base=seed_base)
 
-        def read_activations(self, texts, layers, target, pooling, k, edit_tensors, max_tokens, pass_id):
-            merged = {tname: corrupted_t}
+        def read_activations(self, texts: list[str], layers: list[int] | None, target: str, pooling: str, k: int, edit_tensors: dict[str, Any] | None, max_tokens: int, pass_id: int) -> ReadResult:
+            merged = {self._ov_name: self._ov_t}
             if edit_tensors:
                 merged.update(edit_tensors)
-            return super().read_activations(texts, layers, target, pooling, k, merged, max_tokens, pass_id)
+            return self._inner.read_activations(texts, layers, target, pooling, k, merged, max_tokens, pass_id)
 
-    dmg_reader = _CorruptedCanonicalReader(hf.canonical_reader, tname, corrupted_t)
-    dmg_target = _DamagedHFTarget(
-        model=hf.model,
-        tokenizer=hf.tokenizer,
-        profile=hf.profile,
-        canonical_reader=dmg_reader,
-        editor_model=hf.editor_model,
-        editor_tokenizer=hf.editor_tokenizer,
-        model_id=f"{hf.model_id}-damaged",
-    )
+        def complete_turn(self, messages: list[dict[str, str]], config: SessionConfig, turn_index: int = 0) -> str:
+            return self._inner.complete_turn(messages, config, turn_index=turn_index)
+
+        def __getattr__(self, item: str) -> Any:
+            return getattr(self._inner, item)
+
+    dmg_target = _DamagedBackendProxy(base_backend, dmg_reader, tname, corrupted_t)
     return dmg_target, {}, final_spec
 
 
@@ -223,17 +241,36 @@ def run_reproduce_and_harvest_pipeline(
     num_harvest_improve: int = 2,
     num_harvest_repair: int = 2,
     use_programmatic_teacher: bool = False,
+    starting_diagnosis_n: int | None = None,
+    answer_max_tokens: int | None = None,
+    max_turns: int | None = None,
+    use_builtin_splits: bool = False,
+    canary_max_problems: int | None = None,
+    fast_harvest_profile: bool = False,
     seed: int = 2026,
 ) -> dict[str, Any]:
     """Execute Colab A100 reproduction and/or disjoint distillation trace harvesting."""
     ws = Path(workspace_dir).resolve()
     ws.mkdir(parents=True, exist_ok=True)
     profile = get_profile(profile_name)
+    harvest_profile = (
+        get_profile(f"{profile.name}_harvest")
+        if fast_harvest_profile and profile.name in ("colab_a100_80g", "colab_a100_40g")
+        else profile
+    )
     sync = DriveMirrorSync(ws, drive_dir)
+    restored_from_drive = False
     if sync.enabled:
-        sync.restore_from_drive()
+        restore_res = sync.restore_from_drive()
+        restored_from_drive = bool(restore_res.get("restored"))
 
-    splits = _prepare_splits(ws, use_deepscaler=(backend_kind == "hf"), seed=seed)
+    splits = _prepare_splits(ws, use_deepscaler=(backend_kind == "hf" and not use_builtin_splits), seed=seed)
+    if canary_max_problems is not None and int(canary_max_problems) > 0:
+        cap = int(canary_max_problems)
+        splits = {
+            k: (v[: max(4, cap)] if k == "distill_train" else v[:cap])
+            for k, v in splits.items()
+        }
     raw_root = ws / "raw_sessions"
     sessions_root = ws / "sessions"
     clean_ctx = _build_backends(backend_kind=backend_kind, model_id=model_id, profile=profile)
@@ -259,19 +296,49 @@ def run_reproduce_and_harvest_pipeline(
         transfer_list: list[Problem] | None = None,
         corruption_spec: Any = None,
         s_seed: int = 0,
+        run_heldout_eval: bool = True,
+        step_profile: ComputeProfile | None = None,
     ) -> dict[str, Any]:
+        eff_prof = step_profile or profile
+        s_dir = raw_root / sid
+        res_file = s_dir / "session_result.json"
+        eval_file = s_dir / "eval_result.json"
+        if restored_from_drive and res_file.is_file() and (not run_heldout_eval or eval_file.is_file()):
+            res = json.loads(res_file.read_text(encoding="utf-8"))
+            if eval_file.is_file() and run_heldout_eval:
+                res["heldout_eval"] = json.loads(eval_file.read_text(encoding="utf-8"))
+            else:
+                res.setdefault("heldout_eval", None)
+            recorded_sessions.append(res)
+            return res
+
         s_work = sessions_root / sid / "WORK"
+        eff_max_tokens = (
+            int(answer_max_tokens)
+            if answer_max_tokens is not None
+            else min(eff_prof.answer_max_tokens, 512 if backend_kind == "mock" else eff_prof.answer_max_tokens)
+        )
+        eff_diag_n = min(
+            len(practice_list),
+            int(starting_diagnosis_n) if starting_diagnosis_n is not None else eff_prof.starting_diagnosis_n,
+        )
+        eff_res_n = min(
+            len(reserved_list or []),
+            int(starting_diagnosis_n) if starting_diagnosis_n is not None else eff_prof.starting_diagnosis_n,
+        )
+        eff_max_turns = int(max_turns) if max_turns is not None else 160
         cfg = SessionConfig(
             task=task,
             protocol=2,
-            answer_max_tokens=min(profile.answer_max_tokens, 512 if backend_kind == "mock" else profile.answer_max_tokens),
-            starting_diagnosis_n=min(len(practice_list), profile.starting_diagnosis_n),
-            reserved_check_n=min(len(reserved_list or []), profile.starting_diagnosis_n),
+            max_turns=eff_max_turns,
+            answer_max_tokens=eff_max_tokens,
+            starting_diagnosis_n=eff_diag_n,
+            reserved_check_n=eff_res_n,
             reserved_check_samples=1 if backend_kind == "mock" else 2,
             model_arch_summary=target_backend.arch_summary,
             session_id=sid,
             seed=s_seed,
-            wall_time_limit_sec=float(profile.max_wall_time_sec),
+            wall_time_limit_sec=float(eff_prof.max_wall_time_sec),
         )
         harvester = SessionHarvester(
             raw_root=raw_root,
@@ -282,7 +349,7 @@ def run_reproduce_and_harvest_pipeline(
                 "task": task,
                 "model_id": model_id,
                 "backend_kind": backend_kind,
-                "profile": profile.name,
+                "profile": eff_prof.name,
                 "corruption_spec": corruption_spec.to_dict() if hasattr(corruption_spec, "to_dict") else corruption_spec,
             },
         )
@@ -295,15 +362,38 @@ def run_reproduce_and_harvest_pipeline(
             config=cfg,
             harvester=harvester,
         )
-        res = orch.run()
-        edit_tensors = orch._host_edit_store.load_edit_tensors(target_torch=(backend_kind != "mock")) if res["decision"] == "SUBMIT" else None
-        held_eval = _evaluate_on_split(target_backend, edit_tensors, eval_list, cfg, seed_base=9000 + s_seed)
-        if transfer_list:
-            held_eval["transfer"] = _evaluate_on_split(target_backend, edit_tensors, transfer_list, cfg, seed_base=9500 + s_seed)
-        updated_ladder = score_emergence_ladder(res, heldout_eval=held_eval)
-        res["heldout_eval"] = held_eval
-        res["ladder"] = updated_ladder
-        harvester.record_eval(held_eval, updated_ladder)
+        res = orch.run(resume=(restored_from_drive and (s_work / "session_state.json").is_file()))
+        if run_heldout_eval:
+            edit_tensors = orch._host_edit_store.load_edit_tensors(target_torch=(backend_kind != "mock")) if res["decision"] == "SUBMIT" else None
+            held_eval = _evaluate_on_split(target_backend, edit_tensors, eval_list, cfg, seed_base=9000 + s_seed)
+            if transfer_list:
+                held_eval["transfer"] = _evaluate_on_split(target_backend, edit_tensors, transfer_list, cfg, seed_base=9500 + s_seed)
+            updated_ladder = score_emergence_ladder(res, heldout_eval=held_eval)
+            res["heldout_eval"] = held_eval
+            res["ladder"] = updated_ladder
+            harvester.record_eval(held_eval, updated_ladder)
+        else:
+            updated_ladder = score_emergence_ladder(res, heldout_eval=None)
+            res["heldout_eval"] = None
+            res["ladder"] = updated_ladder
+            atomic_write_text(s_dir / "ladder_score.json", json.dumps(updated_ladder, indent=2) + "\n")
+
+        atomic_write_text(
+            ws / "HEARTBEAT.json",
+            json.dumps(
+                {
+                    "updated_at": _utc_now(),
+                    "profile": eff_prof.name,
+                    "mode": mode,
+                    "status": "running",
+                    "last_completed_session": sid,
+                },
+                indent=2,
+            )
+            + "\n",
+        )
+        if sync.enabled:
+            sync.sync_all()
         recorded_sessions.append(res)
         return res
 
@@ -370,6 +460,8 @@ def run_reproduce_and_harvest_pipeline(
                 reserved_list=distill_reserved,
                 eval_list=splits["heldout_eval"],
                 s_seed=seed + 200 + i,
+                run_heldout_eval=False,
+                step_profile=harvest_profile,
             )
 
         for i in range(num_harvest_repair):
@@ -395,6 +487,8 @@ def run_reproduce_and_harvest_pipeline(
                 eval_list=splits["heldout_eval"],
                 corruption_spec=h_spec,
                 s_seed=seed + 300 + i,
+                run_heldout_eval=False,
+                step_profile=harvest_profile,
             )
 
         # Capture authentic small-model failure sessions on distill_train for DPO negative pairs
@@ -409,6 +503,8 @@ def run_reproduce_and_harvest_pipeline(
                 reserved_list=distill_reserved,
                 eval_list=splits["heldout_eval"],
                 s_seed=seed + 500,
+                run_heldout_eval=False,
+                step_profile=harvest_profile,
             )
 
     bundle_res: dict[str, Any] = {}
@@ -429,10 +525,10 @@ def run_reproduce_and_harvest_pipeline(
             "task": r["task"],
             "decision": r["decision"],
             "ladder_score": r["ladder"]["ladder_score"],
-            "delta_hat": r.get("heldout_eval", {}).get("delta_hat"),
-            "perm_p": r.get("heldout_eval", {}).get("perm_p"),
-            "sign_p": r.get("heldout_eval", {}).get("sign_p"),
-            "transfer_delta": (r.get("heldout_eval", {}).get("transfer") or {}).get("delta_hat"),
+            "delta_hat": (r.get("heldout_eval") or {}).get("delta_hat"),
+            "perm_p": (r.get("heldout_eval") or {}).get("perm_p"),
+            "sign_p": (r.get("heldout_eval") or {}).get("sign_p"),
+            "transfer_delta": ((r.get("heldout_eval") or {}).get("transfer") or {}).get("delta_hat"),
         }
         for r in recorded_sessions
     ]
@@ -476,35 +572,90 @@ def run_reproduce_and_harvest_pipeline(
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Colab A100 self-rewriting reproduce & harvest runner")
+    parser = argparse.ArgumentParser(description="Colab A100 self-rewriting reproduce, harvest & downsize runner")
     parser.add_argument("--workspace-dir", default="selfrewrite/workspace")
     parser.add_argument(
         "--mode",
-        choices=("smoke", "reproduce", "harvest", "reproduce-and-harvest", "build-bundle"),
+        choices=("smoke", "reproduce", "harvest", "reproduce-and-harvest", "build-bundle", "train-student", "bracket"),
         default="reproduce-and-harvest",
     )
     parser.add_argument("--backend", choices=("hf", "mock"), default="hf")
     parser.add_argument("--model-id", default="Qwen/Qwen3.5-27B")
     parser.add_argument("--profile", default="auto")
     parser.add_argument("--drive-dir", default=None)
+    parser.add_argument("--bundle-dir", default=None)
+    parser.add_argument("--rung-id", default="R2")
+    parser.add_argument("--rungs", default="R1,R2,R3,R4")
+    parser.add_argument("--output-dir", default=None)
     parser.add_argument("--num-reproduce-improve", type=int, default=2)
     parser.add_argument("--num-harvest-improve", type=int, default=4)
     parser.add_argument("--num-harvest-repair", type=int, default=4)
     parser.add_argument("--programmatic-teacher", action="store_true")
+    parser.add_argument("--starting-diagnosis-n", type=int, default=None)
+    parser.add_argument("--answer-max-tokens", type=int, default=None)
+    parser.add_argument("--max-turns", type=int, default=None)
+    parser.add_argument("--use-builtin-splits", action="store_true")
+    parser.add_argument("--fast-harvest-profile", action="store_true")
+    parser.add_argument("--bootstrap-next-rung", action="store_true")
     parser.add_argument("--seed", type=int, default=2026)
     args = parser.parse_args(argv)
 
+    ws = Path(args.workspace_dir).resolve()
+    bundle_dir = Path(args.bundle_dir) if args.bundle_dir else (ws / "distill_bundle" / "v1")
+    drive_dir = Path(args.drive_dir) if args.drive_dir else None
+
+    if args.mode == "train-student":
+        from selfrewrite.distill.train_student import StudentTrainConfig, train_downsize_student
+
+        out_dir = Path(args.output_dir) if args.output_dir else (ws / "students" / args.rung_id)
+        out = train_downsize_student(
+            StudentTrainConfig(
+                rung_id=args.rung_id,
+                base_model_id="" if args.model_id == "Qwen/Qwen3.5-27B" else args.model_id,
+                bundle_dir=bundle_dir,
+                output_dir=out_dir,
+                splits_dir=ws / "splits",
+                backend=args.backend,
+                profile_name=args.profile,
+                seed=args.seed,
+            )
+        )
+        print(json.dumps(out, indent=2))
+        return 0
+
+    if args.mode == "bracket":
+        from selfrewrite.colab.downsize_bracket import run_downsize_bracket
+
+        rungs = tuple(r.strip() for r in str(args.rungs).split(",") if r.strip())
+        out = run_downsize_bracket(
+            workspace_dir=ws,
+            bundle_dir=bundle_dir,
+            rungs=rungs,
+            backend_kind=args.backend,
+            profile_name=None if args.profile == "auto" else args.profile,
+            drive_dir=drive_dir,
+            bootstrap_next_rung=bool(args.bootstrap_next_rung),
+            seed=args.seed,
+        )
+        print(json.dumps(out, indent=2))
+        return 0
+
     out = run_reproduce_and_harvest_pipeline(
-        workspace_dir=Path(args.workspace_dir),
+        workspace_dir=ws,
         mode=args.mode,
         backend_kind=args.backend,
         model_id=args.model_id,
         profile_name=None if args.profile == "auto" else args.profile,
-        drive_dir=Path(args.drive_dir) if args.drive_dir else None,
+        drive_dir=drive_dir,
         num_reproduce_improve=args.num_reproduce_improve,
         num_harvest_improve=args.num_harvest_improve,
         num_harvest_repair=args.num_harvest_repair,
         use_programmatic_teacher=bool(args.programmatic_teacher),
+        starting_diagnosis_n=args.starting_diagnosis_n,
+        answer_max_tokens=args.answer_max_tokens,
+        max_turns=args.max_turns,
+        use_builtin_splits=bool(args.use_builtin_splits),
+        fast_harvest_profile=bool(args.fast_harvest_profile),
         seed=args.seed,
     )
     print(json.dumps(out, indent=2))

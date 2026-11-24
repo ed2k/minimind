@@ -26,7 +26,7 @@ _FORBIDDEN_SUBSTRINGS = (
     "lm_head",
 )
 _FINAL_NORM_RE = re.compile(
-    r"^(?:(?:language_model\.)?model\.|transformer\.)?(?:norm|ln_f)\.(?:weight|bias)$"
+    r"^(?:(?:model\.)?language_model\.(?:model\.)?|model\.|transformer\.)?(?:norm|ln_f)\.(?:weight|bias)$"
 )
 _TOP_OUTPUT_RE = re.compile(r"^(?:output|embed_out)\.(?:weight|bias)$")
 
@@ -48,15 +48,33 @@ def is_forbidden_tensor_name(name: str) -> bool:
 def _frobenius_metrics(original: Any, candidate: Any) -> dict[str, float]:
     orig_mod = getattr(type(original), "__module__", "")
     cand_mod = getattr(type(candidate), "__module__", "")
-    if orig_mod.startswith("torch") and cand_mod.startswith("torch"):
+    if orig_mod.startswith("torch") or cand_mod.startswith("torch"):
         import torch  # type: ignore[import-not-found]
 
-        o = original.detach().float().reshape(-1)
-        w = candidate.detach().float().reshape(-1)
+        def _to_t(val: Any, mod_name: str):
+            if mod_name.startswith("torch"):
+                return val.detach().cpu().float().reshape(-1)
+            if mod_name.startswith("numpy"):
+                import numpy as np  # type: ignore[import-not-found]
+
+                return torch.from_numpy(np.ascontiguousarray(val)).float().reshape(-1)
+            return torch.tensor(flatten_floats(val), dtype=torch.float32)
+
+        o = _to_t(original, orig_mod)
+        w = _to_t(candidate, cand_mod)
         orig_sq = float(torch.dot(o, o).item())
         cand_sq = float(torch.dot(w, w).item())
         diff_sq = float(torch.dot(w - o, w - o).item())
         dot = float(torch.dot(w, o).item())
+    elif orig_mod.startswith("numpy") or cand_mod.startswith("numpy"):
+        import numpy as np  # type: ignore[import-not-found]
+
+        o = np.asarray(original if orig_mod.startswith("numpy") else to_nested_list(original), dtype="float64").reshape(-1)
+        w = np.asarray(candidate if cand_mod.startswith("numpy") else to_nested_list(candidate), dtype="float64").reshape(-1)
+        orig_sq = float(np.dot(o, o))
+        cand_sq = float(np.dot(w, w))
+        diff_sq = float(np.dot(w - o, w - o))
+        dot = float(np.dot(w, o))
     else:
         o_vals = flatten_floats(original)
         w_vals = flatten_floats(candidate)
@@ -133,12 +151,18 @@ def _safe_filename(name: str) -> str:
 
 def _serialize_tensor(tensor: Any, base_path: Path) -> tuple[Path, str]:
     mod = getattr(type(tensor), "__module__", "")
-    if mod.startswith("torch"):
+    if mod.startswith("torch") or mod.startswith("numpy"):
         try:
             from safetensors.torch import save as st_save  # type: ignore[import-not-found]
 
             out = base_path.with_suffix(".safetensors")
-            target_t = tensor.detach().cpu()
+            if mod.startswith("torch"):
+                target_t = tensor.detach().cpu()
+            else:
+                import numpy as np  # type: ignore[import-not-found]
+                import torch  # type: ignore[import-not-found]
+
+                target_t = torch.from_numpy(np.ascontiguousarray(tensor))
             raw = st_save({"tensor": target_t})
             atomic_write_bytes(out, raw)
             return out, "safetensors"
@@ -159,7 +183,7 @@ def _deserialize_tensor(path: Path, fmt: str, target_torch: bool = False) -> Any
     if target_torch:
         import torch  # type: ignore[import-not-found]
 
-        return torch.tensor(data, dtype=torch.bfloat16)
+        return torch.tensor(data, dtype=torch.float32)
     return data
 
 

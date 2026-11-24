@@ -125,7 +125,7 @@ class SessionHarvester:
         if work_dir is not None and Path(work_dir).is_dir():
             work_dst = self.session_dir / "WORK_snapshot"
             work_dst.mkdir(parents=True, exist_ok=True)
-            for fname in ("census_summary.json", "notes.md", "pass_log.jsonl", "session_state.json"):
+            for fname in ("census.jsonl", "census_summary.json", "notes.md", "pass_log.jsonl", "practice_problems.jsonl", "session_state.json"):
                 src = Path(work_dir) / fname
                 if src.is_file():
                     shutil.copy2(src, work_dst / fname)

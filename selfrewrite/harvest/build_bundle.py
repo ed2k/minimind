@@ -15,6 +15,58 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     return [json.loads(ln) for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
 
 
+def _approx_tokens(messages: Iterable[dict[str, Any]]) -> int:
+    return max(1, sum(len(str(m.get("content", ""))) for m in messages) // 3)
+
+
+def _compact_primitive_prefix(
+    prefix: list[dict[str, str]],
+    notes_text: str,
+    pass_log_so_far: list[dict[str, Any]],
+    active_edit_names: list[str],
+    max_approx_tokens: int = 3200,
+) -> list[dict[str, str]]:
+    """Compact oversized multi-turn prefixes into <=3.5k-token sliding windows preserving role alternation."""
+    if len(prefix) <= 3 or _approx_tokens(prefix) <= max_approx_tokens:
+        return list(prefix)
+
+    sys_msg = dict(prefix[0])
+    notes_trimmed = (notes_text or "").strip()[-1500:]
+    summary_body = (
+        "=== COMPACTED SESSION WINDOW ===\n"
+        f"Active edits: {json.dumps(list(active_edit_names))}\n"
+        f"Recent pass log:\n{json.dumps(pass_log_so_far[-10:], indent=2)}\n\n"
+        f"WORK/notes.md:\n{notes_trimmed or '(empty)'}"
+    )
+    summary_msg = {"role": "user", "content": summary_body}
+
+    # Walk backwards keeping whole (assistant, user) pairs so returned sequence ends on 'user' cleanly.
+    rest = list(prefix[1:])
+    pairs: list[tuple[dict[str, str], dict[str, str]]] = []
+    idx = len(rest) - 1
+    while idx - 1 >= 0 and rest[idx].get("role") == "user" and rest[idx - 1].get("role") == "assistant":
+        pairs.append((dict(rest[idx - 1]), dict(rest[idx])))
+        idx -= 2
+
+    kept_tail: list[dict[str, str]] = []
+    for asst_m, usr_m in pairs:
+        candidate = [sys_msg, summary_msg, asst_m, usr_m, *kept_tail]
+        if _approx_tokens(candidate) <= max_approx_tokens:
+            kept_tail = [asst_m, usr_m, *kept_tail]
+        else:
+            break
+
+    if kept_tail:
+        return [sys_msg, summary_msg, *kept_tail]
+
+    last_obs = str(prefix[-1].get("content", ""))
+    budget_chars = max(400, (max_approx_tokens - _approx_tokens([sys_msg])) * 3 - len(summary_body) - 40)
+    if len(last_obs) > budget_chars:
+        last_obs = last_obs[-budget_chars:]
+    merged_user = {"role": "user", "content": f"{summary_body}\n\nLatest observation:\n{last_obs}"}
+    return [sys_msg, merged_user]
+
+
 def _classify_primitive(action_kind: str, reply: str, code_row: dict[str, Any] | None, fwd_row: dict[str, Any] | None) -> str:
     lower = reply.lower()
     if action_kind == "python":
@@ -81,13 +133,13 @@ def build_distill_bundle(
         result = json.loads(result_path.read_text(encoding="utf-8"))
         ladder_path = sdir / "ladder_score.json"
         ladder = json.loads(ladder_path.read_text(encoding="utf-8")) if ladder_path.is_file() else result.get("ladder", {})
-        eval_path = sdir / "eval_result.json"
-        eval_res = json.loads(eval_path.read_text(encoding="utf-8")) if eval_path.is_file() else {}
 
         transcript = _read_jsonl(sdir / "transcript.jsonl")
         observations = _read_jsonl(sdir / "observations.jsonl")
         code_runs = _read_jsonl(sdir / "code_executions.jsonl")
         fwd_passes = _read_jsonl(sdir / "forward_passes.jsonl")
+        notes_path = sdir / "WORK_snapshot" / "notes.md"
+        notes_text = notes_path.read_text(encoding="utf-8") if notes_path.is_file() else ""
 
         obs_by_turn = {int(r["turn_index"]): r for r in observations}
         code_by_turn = {int(r["turn_index"]): r for r in code_runs}
@@ -101,12 +153,17 @@ def build_distill_bundle(
 
         ladder_score = int(ladder.get("ladder_score", 0))
         acts_on_tests = bool(ladder.get("steps", {}).get("acts_on_tests", False))
-        eval_delta = float(eval_res.get("delta_hat", 0.0)) if eval_res else None
+        # Strict non-leakage gating: rely ONLY on reserved_check (or paired practice tests), NEVER heldout_eval.
+        res_check = result.get("reserved_check") if isinstance(result.get("reserved_check"), dict) else None
+        res_delta = float(res_check.get("delta_hat", 0.0)) if res_check is not None else None
+        paired_hist = result.get("paired_test_history") or []
+        last_paired = float(paired_hist[-1].get("delta_hat", 0.0)) if paired_hist else None
+        gate_delta = res_delta if res_delta is not None else last_paired
         is_gold = (
             ladder_score >= 5
             and acts_on_tests
             and (
-                (decision == "SUBMIT" and (eval_delta is None or eval_delta > 0.0))
+                (decision == "SUBMIT" and gate_delta is not None and gate_delta > 0.0)
                 or (decision == "WITHDRAW" and int(result.get("paired_tests_count", 0)) >= 1)
             )
         )
@@ -115,6 +172,9 @@ def build_distill_bundle(
         convo: list[dict[str, str]] = []
         if transcript:
             convo = list(transcript[0].get("messages_prefix", []))
+
+        pass_log_so_far: list[dict[str, Any]] = []
+        active_edit_names: list[str] = []
 
         for t_row in transcript:
             t_idx = int(t_row["turn_index"])
@@ -125,6 +185,13 @@ def build_distill_bundle(
             skill = _classify_primitive(ak, reply, c_row, f_row)
 
             prefix = list(t_row.get("messages_prefix", []))
+            compact_prefix = _compact_primitive_prefix(
+                prefix=prefix,
+                notes_text=notes_text,
+                pass_log_so_far=pass_log_so_far,
+                active_edit_names=active_edit_names,
+                max_approx_tokens=3200,
+            )
             if is_gold and ak != "invalid" and (c_row is None or c_row.get("ok", True)):
                 turn_primitives.append(
                     {
@@ -134,19 +201,22 @@ def build_distill_bundle(
                         "turn_index": t_idx,
                         "corruption_layer": corruption_layer,
                         "target_tensors": target_tensors,
-                        "messages": prefix + [{"role": "assistant", "content": reply}],
+                        "messages": compact_prefix + [{"role": "assistant", "content": reply}],
                     }
                 )
                 gold_turns_by_skill.setdefault(skill, []).append(
-                    {"session_id": sid, "task": task, "messages": prefix, "reply": reply}
+                    {"session_id": sid, "task": task, "messages": compact_prefix, "reply": reply}
                 )
             elif not is_gold or (ak == "python" and any(p in reply for p in ("np.random.randn", "rng.gauss"))):
                 bad_turns_by_skill.setdefault(skill, []).append(
-                    {"session_id": sid, "task": task, "messages": prefix, "reply": reply}
+                    {"session_id": sid, "task": task, "messages": compact_prefix, "reply": reply}
                 )
 
-            if t_idx == 0 or (len(convo) < len(prefix) + 1):
-                pass
+            if c_row is not None and isinstance(c_row.get("active_edits"), list):
+                active_edit_names = [str(e.get("name", "")) for e in c_row["active_edits"] if e.get("name")]
+            if f_row is not None:
+                pass_log_so_far.append({"turn": t_idx, "pass_id": f_row.get("pass_id"), "summary": f_row.get("summary", {})})
+
             if prefix:
                 last_prefix = prefix[-1]
                 if not convo or convo[-1] != last_prefix:
@@ -166,10 +236,29 @@ def build_distill_bundle(
                     "ladder_score": ladder_score,
                     "corruption_layer": corruption_layer,
                     "target_tensors": target_tensors,
-                    "eval_delta": eval_delta,
+                    "reserved_delta": res_delta,
                     "messages": convo,
                 }
             )
+            if _approx_tokens(convo) > 3800:
+                sys_m = dict(convo[0])
+                tail_slice: list[dict[str, str]] = [dict(m) for m in convo[-5:]]
+                while len(tail_slice) > 2 and _approx_tokens([sys_m, *tail_slice]) > 3500:
+                    tail_slice = tail_slice[2:]
+                if tail_slice and tail_slice[0].get("role") == "assistant":
+                    tail_slice = [{"role": "user", "content": f"Resume {task} verification window cleanly."}, *tail_slice]
+                if tail_slice and tail_slice[-1].get("role") == "assistant":
+                    turn_primitives.append(
+                        {
+                            "session_id": sid,
+                            "task": task,
+                            "skill": "trajectory_window",
+                            "turn_index": len(transcript),
+                            "corruption_layer": corruption_layer,
+                            "target_tensors": target_tensors,
+                            "messages": [sys_m, *tail_slice],
+                        }
+                    )
             rlvr_episodes.append(
                 {
                     "session_id": sid,
@@ -179,6 +268,8 @@ def build_distill_bundle(
                     "corruption_layer": corruption_layer,
                     "target_tensors": target_tensors,
                     "expected_decision": decision,
+                    "reserved_delta": res_delta,
+                    "work_snapshot_dir": str((sdir / "WORK_snapshot").resolve()),
                 }
             )
         else:
@@ -218,6 +309,7 @@ def build_distill_bundle(
         bundle_dir=out_dir,
         forbidden_eval_texts=forbidden_eval_texts,
         forbidden_eval_layers=forbidden_eval_layers,
+        raw_sessions_dir=raw_root,
     )
 
     manifest = {

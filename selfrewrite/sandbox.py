@@ -24,6 +24,7 @@ from selfrewrite.edit_store import EditStore
 from selfrewrite.helpers import (
     clip_outliers_median,
     layer_output_matrices,
+    layer_state_tensors,
     mean_diff_direction,
     outlier_ratios,
     remove_direction,
@@ -146,6 +147,54 @@ FORBIDDEN_DUNDERS = {
     "__dict__",
 }
 
+_ALWAYS_FORBIDDEN_DUNDERS = {
+    "__subclasses__",
+    "__globals__",
+    "__builtins__",
+    "__code__",
+    "__closure__",
+    "__import__",
+}
+
+_ALWAYS_FORBIDDEN_ATTRS = {
+    "backward",
+    "requires_grad_",
+    "enable_grad",
+    "from_pretrained",
+    "AutoModel",
+    "AutoModelForCausalLM",
+    "AutoModelForImageTextToText",
+    "system",
+    "popen",
+    "fork",
+    "forkpty",
+    "kill",
+    "killpg",
+    "environ",
+    "getenv",
+    "putenv",
+    "chdir",
+}
+
+_ALWAYS_FORBIDDEN_MODULES = {
+    "subprocess",
+    "socket",
+    "urllib",
+    "http",
+    "requests",
+    "httpx",
+    "aiohttp",
+    "ftplib",
+    "smtplib",
+    "telnetlib",
+    "vllm",
+    "sglang",
+    "peft",
+    "trl",
+    "accelerate",
+    "bitsandbytes",
+}
+
 _SENTINEL_PREFIX = "__SELFREWRITE_IPC__:"
 
 
@@ -260,6 +309,7 @@ def _install_work_jail(work_dir: Path) -> dict[str, Any]:
     raw_os_remove = os.remove
     raw_getattr = builtins.getattr
     raw_import = builtins.__import__
+    raw_getframe = sys._getframe
 
     def _assert_inside_work(p: Any) -> Path:
         candidate = Path(os.fspath(p))
@@ -323,14 +373,27 @@ def _install_work_jail(work_dir: Path) -> dict[str, Any]:
     def _jailed_os_stat(path, *args, **kwargs):
         return raw_os_stat(_assert_inside_work(path), *args, **kwargs)
 
+    def _caller_is_sandbox() -> bool:
+        try:
+            return raw_getframe(2).f_code.co_filename == "<sandbox>"
+        except Exception:
+            return True
+
     def _safe_getattr(obj, name, *default):
-        if name in FORBIDDEN_DUNDERS or name in FORBIDDEN_ATTRS:
+        if _caller_is_sandbox():
+            if name in FORBIDDEN_DUNDERS or name in FORBIDDEN_ATTRS:
+                raise SandboxPolicyError(f"Dynamic access to {name!r} is forbidden")
+        elif name in _ALWAYS_FORBIDDEN_DUNDERS or name in _ALWAYS_FORBIDDEN_ATTRS:
             raise SandboxPolicyError(f"Dynamic access to {name!r} is forbidden")
         return raw_getattr(obj, name, *default)
 
     def _safe_import(name, globals=None, locals=None, fromlist=(), level=0):
         root = str(name).split(".", 1)[0]
-        if root in FORBIDDEN_MODULES or any(str(name) == p or str(name).startswith(p + ".") for p in FORBIDDEN_MODULE_PREFIXES):
+        if _caller_is_sandbox():
+            bad_mod = root in FORBIDDEN_MODULES
+        else:
+            bad_mod = root in _ALWAYS_FORBIDDEN_MODULES
+        if bad_mod or any(str(name) == p or str(name).startswith(p + ".") for p in FORBIDDEN_MODULE_PREFIXES):
             raise SandboxPolicyError(f"Dynamic import of {name!r} is forbidden")
         return raw_import(name, globals, locals, fromlist, level)
 
@@ -345,11 +408,20 @@ def _install_work_jail(work_dir: Path) -> dict[str, Any]:
             return raw_compile_fn(source, filename, mode, *args, **kwargs)
         raise SandboxPolicyError("Call to 'compile' is forbidden")
 
+    def _safe_exec(*args, **kwargs):
+        try:
+            caller_file = raw_getframe(1).f_code.co_filename
+        except Exception:
+            caller_file = "<sandbox>"
+        if caller_file.startswith("<frozen importlib."):
+            return raw_exec(*args, **kwargs)
+        raise SandboxPolicyError("Call to 'exec' is forbidden")
+
     builtins.open = _jailed_open
     builtins.getattr = _safe_getattr
     builtins.__import__ = _safe_import
     builtins.eval = _blocked_fn("eval")
-    builtins.exec = _blocked_fn("exec")
+    builtins.exec = _safe_exec  # type: ignore[assignment]
     builtins.compile = _safe_compile  # type: ignore[assignment]
     builtins.breakpoint = _blocked_fn("breakpoint")
     builtins.input = _blocked_fn("input")
@@ -438,6 +510,10 @@ class SealedPythonSandbox:
             cwd=str(self.work_dir),
             env=env,
         )
+        assert self._proc.stdin is not None
+        self._proc.stdin.write(json.dumps({"cmd": "ping"}) + "\n")
+        self._proc.stdin.flush()
+        self._read_response(max(30.0, self.timeout_sec))
 
     def _read_response(self, timeout_sec: float) -> dict[str, Any]:
         assert self._proc is not None and self._proc.stdout is not None
@@ -562,6 +638,12 @@ def _run_worker_loop(work_dir: Path, weights_spec: Path) -> int:
     except Exception:
         np = None  # type: ignore[assignment]
 
+    for _mod in ("zipfile", "encodings.cp437", "safetensors", "safetensors.torch"):
+        try:
+            __import__(_mod)
+        except Exception:
+            pass
+
     work_root = work_dir.resolve()
     raw_eval = builtins.eval
     raw_exec = builtins.exec
@@ -591,7 +673,8 @@ def _run_worker_loop(work_dir: Path, weights_spec: Path) -> int:
             return [json.loads(line) for line in gen_file.read_text(encoding="utf-8").splitlines() if line.strip()]
         read_npz = work_root / f"read_{int(pass_id)}.npz"
         if read_npz.is_file() and np is not None:
-            return dict(np.load(str(read_npz), allow_pickle=False))
+            with np.load(str(read_npz), allow_pickle=False) as z:
+                return {k: z[k] for k in z.files}
         read_json = work_root / f"read_{int(pass_id)}.json"
         if read_json.is_file():
             return json.loads(read_json.read_text(encoding="utf-8"))
@@ -624,6 +707,7 @@ def _run_worker_loop(work_dir: Path, weights_spec: Path) -> int:
         "load_pass": _load_pass,
         "load_problems": _load_problems,
         "layer_output_matrices": lambda layer_idx: layer_output_matrices(layer_idx, sorted_names),
+        "layer_state_tensors": lambda layer_idx: layer_state_tensors(layer_idx, sorted_names),
         "unit_vector": unit_vector,
         "mean_diff_direction": mean_diff_direction,
         "remove_direction": remove_direction,
@@ -645,6 +729,10 @@ def _run_worker_loop(work_dir: Path, weights_spec: Path) -> int:
         if not raw_line:
             continue
         req = json.loads(raw_line)
+        if req.get("cmd") == "ping":
+            proto_out.write(_SENTINEL_PREFIX + json.dumps({"ok": True, "ready": True}) + "\n")
+            proto_out.flush()
+            continue
         if req.get("cmd") == "shutdown":
             proto_out.write(_SENTINEL_PREFIX + json.dumps({"ok": True}) + "\n")
             proto_out.flush()

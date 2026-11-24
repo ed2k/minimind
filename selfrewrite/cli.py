@@ -111,6 +111,11 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--num-harvest-improve", type=int, default=4)
         p.add_argument("--num-harvest-repair", type=int, default=4)
         p.add_argument("--programmatic-teacher", action="store_true")
+        p.add_argument("--starting-diagnosis-n", type=int, default=None)
+        p.add_argument("--answer-max-tokens", type=int, default=None)
+        p.add_argument("--max-turns", type=int, default=None)
+        p.add_argument("--use-builtin-splits", action="store_true")
+        p.add_argument("--fast-harvest-profile", action="store_true")
         p.add_argument("--seed", type=int, default=2026)
 
         def _make_runner(m: str):
@@ -126,6 +131,11 @@ def main(argv: list[str] | None = None) -> int:
                     num_harvest_improve=a.num_harvest_improve,
                     num_harvest_repair=a.num_harvest_repair,
                     use_programmatic_teacher=bool(a.programmatic_teacher),
+                    starting_diagnosis_n=a.starting_diagnosis_n,
+                    answer_max_tokens=a.answer_max_tokens,
+                    max_turns=a.max_turns,
+                    use_builtin_splits=bool(a.use_builtin_splits),
+                    fast_harvest_profile=bool(a.fast_harvest_profile),
                     seed=a.seed,
                 )
                 print(json.dumps(out, indent=2))
@@ -179,6 +189,91 @@ def main(argv: list[str] | None = None) -> int:
     p_ev.add_argument("--seed-base", type=int, default=9000)
     p_ev.add_argument("--n-samples", type=int, default=1)
     p_ev.set_defaults(func=_cmd_eval)
+
+    def _cmd_train_student(a: argparse.Namespace) -> int:
+        from selfrewrite.distill.train_student import StudentTrainConfig, train_downsize_student
+
+        cfg = StudentTrainConfig(
+            rung_id=a.rung_id,
+            base_model_id=a.model_id,
+            bundle_dir=Path(a.bundle_dir),
+            output_dir=Path(a.output_dir),
+            splits_dir=Path(a.splits_dir) if a.splits_dir else None,
+            backend=a.backend,
+            profile_name=a.profile,
+            run_rlvr=bool(a.run_rlvr),
+            seed=a.seed,
+        )
+        res = train_downsize_student(cfg)
+        print(json.dumps(res, indent=2))
+        return 0
+
+    p_tr = sub.add_parser("train-student", help="Specialize, merge, and freeze a downsized student model")
+    p_tr.add_argument("--rung-id", default="R2")
+    p_tr.add_argument("--model-id", default="")
+    p_tr.add_argument("--bundle-dir", required=True)
+    p_tr.add_argument("--output-dir", required=True)
+    p_tr.add_argument("--splits-dir", default="")
+    p_tr.add_argument("--backend", choices=("hf", "mock"), default="hf")
+    p_tr.add_argument("--profile", default="auto")
+    p_tr.add_argument("--run-rlvr", action="store_true")
+    p_tr.add_argument("--seed", type=int, default=42)
+    p_tr.set_defaults(func=_cmd_train_student)
+
+    def _cmd_compress(a: argparse.Namespace) -> int:
+        from selfrewrite.distill.compress_model import plan_compression
+
+        res = plan_compression(
+            {
+                "hidden_size": a.hidden_size,
+                "num_layers": a.num_layers,
+                "intermediate_size": a.intermediate_size,
+                "vocab_size": a.vocab_size,
+            },
+            target_mlp_ratio=a.mlp_ratio,
+            keep_layer_ratio=a.layer_ratio,
+        )
+        print(json.dumps(res, indent=2))
+        return 0
+
+    p_cmp = sub.add_parser("compress", help="Compute structural pruning plan for student compression")
+    p_cmp.add_argument("--hidden-size", type=int, required=True)
+    p_cmp.add_argument("--num-layers", type=int, required=True)
+    p_cmp.add_argument("--intermediate-size", type=int, required=True)
+    p_cmp.add_argument("--vocab-size", type=int, default=151936)
+    p_cmp.add_argument("--mlp-ratio", type=float, default=0.75)
+    p_cmp.add_argument("--layer-ratio", type=float, default=1.0)
+    p_cmp.set_defaults(func=_cmd_compress)
+
+    def _cmd_bracket(a: argparse.Namespace) -> int:
+        from selfrewrite.colab.downsize_bracket import run_downsize_bracket
+
+        rungs = tuple(r.strip() for r in str(a.rungs).split(",") if r.strip())
+        res = run_downsize_bracket(
+            workspace_dir=Path(a.workspace_dir),
+            bundle_dir=Path(a.bundle_dir),
+            rungs=rungs,
+            backend_kind=a.backend,
+            profile_name=None if a.profile == "auto" else a.profile,
+            drive_dir=Path(a.drive_dir) if a.drive_dir else None,
+            improve_sessions=a.improve_sessions,
+            bootstrap_next_rung=bool(a.bootstrap_next_rung),
+            seed=a.seed,
+        )
+        print(json.dumps(res, indent=2))
+        return 0
+
+    p_br = sub.add_parser("bracket", help="Run parameter-ladder downsizing bracket evaluation")
+    p_br.add_argument("--workspace-dir", default="selfrewrite/workspace")
+    p_br.add_argument("--bundle-dir", default="selfrewrite/workspace/distill_bundle/v1")
+    p_br.add_argument("--rungs", default="R1,R2,R3,R4")
+    p_br.add_argument("--backend", choices=("hf", "mock"), default="hf")
+    p_br.add_argument("--profile", default="auto")
+    p_br.add_argument("--drive-dir", default=None)
+    p_br.add_argument("--improve-sessions", type=int, default=2)
+    p_br.add_argument("--bootstrap-next-rung", action="store_true")
+    p_br.add_argument("--seed", type=int, default=2026)
+    p_br.set_defaults(func=_cmd_bracket)
 
     args = parser.parse_args(argv)
     return int(args.func(args))

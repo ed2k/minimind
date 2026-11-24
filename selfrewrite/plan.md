@@ -37,13 +37,15 @@ Key empirical findings across `Qwen3.5` (`2B`, `4B`, `9B`, `27B`):
 
 ### 2.1 Hardware Profiles (`config.py`)
 
-| Profile | GPU / Memory | Intended Role | 27B Precision Strategy | Default Context / Gen Budget |
+| Profile | GPU / Memory | Intended Role | 27B Precision & Kernel Strategy | Default Context / Gen Budget |
 |---|---|---|---|---|
-| `colab_a100_80g` | NVIDIA A100 `80 GB` VRAM | **Primary Paper Reproduction & Teacher Harvest** | Native `bfloat16` (~54 GB weights + ~20 GB KV cache, 1:1 paper fidelity) | Editor ctx `>= 32k–90k`; answer `L = 4096` / `16384` |
-| `colab_a100_40g` | NVIDIA A100 `40 GB` VRAM | **A100 Standard Reproduction & Harvest** | 4-bit NF4 base (~15.5 GB) + canonical `bf16` disk/CPU weight store + dynamic `bf16` edited-layer overlay | Editor ctx `>= 32k`, CPU offload fallback; `L = 4096` / `16384` |
-| `colab_l4` | NVIDIA L4 `24 GB` VRAM | Student `9B`/`4B` training & frozen eval | 4-bit NF4 for `9B` or native `bf16` for `4B`/`2B` | `L = 4096` |
-| `colab_t4` | NVIDIA T4 `16 GB` VRAM | Downsized `4B`/`2B`/`0.6B` LoRA SFT/DPO & eval | Native `float16`/`bfloat16` (`4B` fits in ~9–11 GB; `2B` in ~5–6 GB) | `L = 4096` |
-| `local_cpu_smoke` | Intel/Apple CPU (stdlib / 2M–64M torch) | Fast local CI, unit tests & MiniMind floor probes | Pure stdlib mock or `float32` MiniMind | Scaled smoke budgets |
+| `colab_a100_80g` | NVIDIA A100 `80 GB` VRAM | **Batch 1 Paper Reproduction & Eval** | Native `bfloat16` + PyTorch SDPA + optional `flash-linear-attention` / `causal-conv1d` | Editor ctx `90k`; answer `L = 4096`; `N_0 = 256`; `gen_batch_size = 32` |
+| `colab_a100_80g_harvest` | NVIDIA A100 `80 GB` VRAM | **Batch 2 Fast Teacher Harvest (`--fast-harvest-profile`)** | Native `bfloat16` + fast Gated-DeltaNet kernels | Editor ctx `64k`; answer `L = 2048`; `N_0 = 64`; `gen_batch_size = 32` |
+| `colab_a100_40g` | NVIDIA A100 `40 GB` VRAM | **Batch 1 Standard A100 Repro** | 4-bit NF4 base + canonical `bf16` store + dynamic `bf16` edited overlay | Editor ctx `64k`; answer `L = 4096`; `N_0 = 256`; `gen_batch_size = 16` |
+| `colab_a100_40g_harvest` | NVIDIA A100 `40 GB` VRAM | **Batch 2 Standard Fast Harvest (`--fast-harvest-profile`)** | 4-bit NF4 base + canonical `bf16` store + dynamic `bf16` edited overlay | Editor ctx `48k`; answer `L = 2048`; `N_0 = 64`; `gen_batch_size = 16` |
+| `colab_l4` | NVIDIA L4 `24 GB` VRAM | Student `9B`/`4B` training & frozen eval | 4-bit NF4 (`9B`) or native `bf16` (`4B`/`2B`) | `L = 4096`; `gen_batch_size = 8` |
+| `colab_t4` | NVIDIA T4 `16 GB` VRAM | Downsized `4B`/`2B`/`0.6B` LoRA SFT/DPO/RLVR & eval | Native `float16` (`4B` ~9–11 GB; `2B` ~5 GB) | `L = 4096`; `gen_batch_size = 4` |
+| `local_cpu_smoke` | Intel/Apple CPU (stdlib / 2M–64M torch) | Fast local CI & MiniMind floor probes | Pure stdlib mock or `float32` MiniMind | Scaled smoke budgets |
 
 ### 2.2 `HybridWeightOverlay`: Zero-Reload Paired & Side-by-Side Swapping
 Neither A100-40GB nor A100-80GB should waste minutes reloading checkpoints from disk to compare `original`, `edited`, and up to 4 Protocol 2 candidate edits:
@@ -59,8 +61,8 @@ Neither A100-40GB nor A100-80GB should waste minutes reloading checkpoints from 
 
 ### 2.3 Google Drive Continuity & Headless Orchestration
 - **`colab/drive_sync.py`**: Mirrors `raw_sessions/`, `distill_bundle/`, `checkpoints/`, `HEARTBEAT.json`, and active `WORK/` snapshots atomically (`.tmp` + `os.replace`) with SHA-256 verification to `/content/drive/MyDrive/minimind_selfrewrite/`.
-- **`colab/colab_launcher.py`**: Idempotent Colab GPU launcher that mounts Drive, clones/updates repo, installs pinned dependencies, auto-detects `colab_a100_80g` vs. `colab_a100_40g` vs. `L4`/`T4`, restores incomplete `raw_sessions/` state after Colab preemptions, and refunds downtime per Algorithm 2.
-- **`colab/run_colab_cli.py` & `colab/run_selfrewrite.ipynb`**: Headless CLI driver leveraging local `/Users/admin/.local/bin/colab` alongside a clean 5-cell Colab notebook for interactive A100 execution.
+- **`colab/colab_launcher.py`**: Idempotent Colab GPU launcher that mounts Drive, clones/updates repo, installs pinned dependencies (plus fast `flash-linear-attention` / `causal-conv1d` kernels when available), auto-detects `colab_a100_80g` vs. `colab_a100_40g` vs. `L4`/`T4`, checkpoints `HEARTBEAT.json` + Drive sync after every completed session, and restores/resumes interrupted `raw_sessions/` state after Colab preemptions with downtime refunded per Algorithm 2.
+- **`colab/run_colab_cli.py`, `colab-mcp` & `colab/run_selfrewrite.ipynb`**: Headless CLI driver (`--detached` + `--fast-harvest-profile` avoiding WebSocket reply timeouts) alongside a live-paired `colab-mcp` browser notebook (`HF_TOKEN` & Drive mount native in UI).
 
 ---
 
@@ -76,6 +78,7 @@ Neither A100-40GB nor A100-80GB should waste minutes reloading checkpoints from 
 - **Context Compaction (`> 90k` tokens or profile `compaction_tokens`)**: Automatically restarts conversation cleanly from `(task_prompt, starting_diagnosis, WORK/notes.md, b, c, list_edits(), pass_log, last_obs)`.
 - **Helper Library Exposed Inside Sandbox (`helpers.py`)**:
   - `layer_output_matrices(layer_idx)` (architecture-aware: Qwen3.5 Gated DeltaNet `linear_attn.out_proj` + full attention `o_proj` + MLP `down_proj`, Qwen2.5/3, Llama, and MiniMind Dense/MoE).
+  - `layer_state_tensors(layer_idx)` (Qwen3.5 Gated DeltaNet `.dt_bias`, `.A_log`, `.conv1d.*`, `.in_proj_a/b/z` state parameters).
   - `unit_vector(v)`
   - `mean_diff_direction(pos_vectors, neg_vectors)`
   - `remove_direction(W, u, alpha)` computing `W - alpha * (u @ u.T @ W)`
@@ -116,17 +119,14 @@ To prevent any held-out or layer contamination:
 ### 4.2 Three-Batch A100 Execution Plan
 
 1. **Batch 1 — Reference Reproduction (`Qwen3.5-27B` on A100)**:
-   - Run 8 consecutive Protocol 2 `improve` sessions (`practice_eval` + `reserved_eval`, seeds `0..7`) and evaluate submitted edits on `heldout_eval` (confirming `+4` to `+6.6` pt recovery curve, `SUBMIT`/`WITHDRAW` behavior, and `6/6` ladder).
-   - Run `Qwen3.5-27B` `repair` session on layer `30 mlp.down_proj` (`8` rows, `200 * sigma`), evaluating held-out math recovery (`0% -> 33%+`) and unseen cross-domain transfer (e.g., unseen code/logic or multimodal benchmark if VLM loaded).
-2. **Batch 2 — Diverse Teacher & Failure Harvesting on Disjoint `distill_train` & `train_layers`**:
-   - **27B `improve` harvest (`12–16` sessions)**: Protocol 2 sessions across disjoint shards of `distill_train`, capturing diverse successful direction/projection/gating/time-step edits **plus** genuine evidence-backed `WITHDRAW` abstentions when candidate edits fail reserved validation.
-   - **27B `repair` harvest (`16–24` sessions)**: Randomized target layers `L in train_layers`, varied target matrices (`mlp.down_proj`, `self_attn.o_proj`, `linear_attn.out_proj`), varied block widths (`4`, `8`, `16` rows), and varied fault mechanisms (`100–300*sigma` Gaussian corruption, extreme outlier spikes, dead/zeroed rows) so downsized students learn the **general weight-inspection principle**, not a hardcoded layer number.
-   - **Small-Model Failure Harvest (`4–8` unmodified `9B`/`4B`/`2B` sessions on `distill_train`)**: Capture authentic small-model failure turns (random noise edits, missing state reads, ignored negative paired tests, broken code) as hard negatives for DPO.
-   - **Grounded Programmatic Supplement (optional gap-filler)**: If any diagnostic corner case is underrepresented on A100, run deterministic reference policies through the identical sandbox & GPU hooks so every single number/tensor output in every example remains 100% real and execution-grounded.
-3. **Batch 3 — Offline Downsizing & Frozen Ladder Evaluation**:
+   - Run 2–4 Protocol 2 `improve` sessions (`practice_eval` + `reserved_eval`, scaling up to 8) + unseen `layer 30 mlp.down_proj` (`8` rows, `200 * sigma`) `repair` session first on A100 to verify `6/6` Emergence Ladder and positive `heldout_eval` delta before full harvest volume.
+2. **Batch 2 — Disjoint Harvest on `distill_train` & `train_layers` (Zero `heldout_eval` Calls)**:
+   - **27B `improve` harvest (`8–12` sessions via `--fast-harvest-profile`)**: Protocol 2 sessions across disjoint shards of `distill_train`, gated strictly on `reserved_check` (never evaluating or selecting on `heldout_eval` during harvest).
+   - **27B `repair` harvest (`12–16` sessions)**: Randomized target layers `L in train_layers`, varied target matrices, widths (`4`, `8`, `16` rows), and fault mechanisms (`100–300*sigma`).
+   - **Small-Model Failure Harvest (`4–8` unmodified `9B`/`4B`/`2B` sessions on `distill_train`)**: Authentic DPO negatives.
+3. **Batch 3 — Offline Downsizing (`R2: 4B` & `R3: 2B` First, then `R1: 9B` / `R4: 0.6B` / `R4m: MiniMind`)**:
    - Compile `raw_sessions/` -> `distill_bundle/v<N>/` via `harvest/`.
-   - Train `9B -> 4B -> 2B -> 0.6B/MiniMind` students offline on A100/L4/T4 (`distill/`).
-   - Freeze and evaluate each student inside the Batch 1 unseen `eval` harness.
+   - Probe high-leverage T4-friendly rungs (`R2: Qwen3.5-4B` and `R3: Qwen3.5-2B`) first via `downsize_bracket.py --rungs R2,R3,R1,R4` (and `MiniMindBackend` for `R4m`), evaluating frozen students strictly in the Batch 1 unseen `eval` harness.
 
 ### 4.3 Lossless Raw Telemetry Archive (`raw_sessions/<session_id>/`)
 Every session writes a self-contained, Drive-synced directory:
@@ -142,25 +142,17 @@ Every session writes a self-contained, Drive-synced directory:
 `harvest/build_bundle.py` converts `raw_sessions/` into four training datasets plus a mandatory audit report:
 
 1. **`sft_gold_trajectories.jsonl` (Full Multi-Turn Reasoning + Tool Traces)**:
-   - Filtered strictly to verified `distill_train` sessions that achieve either (`SUBMIT` with positive reserved delta and non-degrading held-out check) or (calibrated `WITHDRAW` after catching a negative/overfit edit).
-   - Preserves full `<think>` chain-of-thought, exact ```` ```python ```` / ```` ```forward ```` turns, context-compaction transitions, and scientific recovery after failed first edits (e.g., `27B` seeing `5x` clip fail -> loosening to `15x` clip; late-layer edit fail -> scanning early layers).
-2. **`sft_turn_primitives.jsonl` (Compact Single/Few-Turn Skill Primitives, `<= 4k–8k` tokens)**:
-   - Decomposes long `30–60` turn sessions into modular self-contained training examples so smaller context/capacity models (`2B–4B`) master each atomic skill without losing attention over `60k` tokens:
-     - *Primitive A — Census Diagnosis*: Reading `census.jsonl`, distinguishing timeout/loop failures from reasoning errors, writing reproducible inspection scripts.
-     - *Primitive B — Anomaly Localization (`repair`)*: Computing `max(|W|) / median(|W|)` and per-layer activation explosions without peeking outside `WORK/`, naming the corrupted layer/matrix.
-     - *Primitive C — Hidden-State Contrast (`improve`)*: Requesting minimal `read` passes across finished vs. looping/timed-out answers, computing `mean_diff_direction` and cross-layer norm divergence.
-     - *Primitive D — Safe Structured Edit Synthesis*: Proposing gentle rank-1 damping (`remove_direction`), bias/gate nudges, or `k*median` clipping via `save_edit`, respecting forbidden layers & anti-rescaling rules.
-     - *Primitive E — Evidence-Based Gate (`SUBMIT` / `REVERT` / `WITHDRAW`)*: Interpreting paired `(delta_hat, SE, n_up, n_down)` and reserved checks to revert harmful edits or abstain cleanly.
+   - Filtered strictly to verified `distill_train` sessions achieving (`SUBMIT` with positive `reserved_check.delta_hat` — **never** `heldout_eval`) or (calibrated `WITHDRAW` after catching a negative/overfit edit).
+   - Preserves full `<think>` chain-of-thought, exact ```` ```python ```` / ```` ```forward ```` turns, context-compaction transitions, and scientific recovery after failed first edits.
+2. **`sft_turn_primitives.jsonl` (Compacted `<= 3,500`-Token Sliding-Window Primitives & Trajectory Windows)**:
+   - Compacts long `20k–90k` prefixes via `_compact_primitive_prefix` (`system + WORK/notes.md + compact pass_log + trailing alternating turns <= 3.2k tokens`) plus `trajectory_window` slices so smaller `4B`/`2B`/`0.6B` context budgets keep late-turn `evidence_gate` and `SUBMIT`/`WITHDRAW` supervision without getting filtered out:
+     - *Primitive A — Census Diagnosis*, *B — Anomaly Localization*, *C — Hidden-State Contrast*, *D — Safe Structured Edit Synthesis*, *E — Evidence-Based Gate*, *F — Trajectory Window*.
 3. **`dpo_contrastive_pairs.jsonl` (Step-Level Preference Optimization Pairs)**:
-   - Prompt-matched `(prompt, chosen_turn, rejected_turn)` triples constructed from:
-     - Verified `27B` turns vs. unmodified `4B`/`9B` failure turns on matched turn types (systematic weight scan vs. `np.random.randn() * 0.01`; reading hidden states vs. blind guessing; dropping an edit on `n_down > n_up` vs. keeping destructive weights; abstaining on flat reserved check vs. blindly submitting).
-     - Verified `27B` recovered late turns vs. `27B`'s own dropped/harmful early hypotheses within the same session.
-4. **`rlvr_episodes.jsonl` (Verifiable Reward Replay Tasks)**:
-   - Task snapshots `(census, state_files, target_ground_truth_in_harness)` for offline outcome/process RLVR training where rewards come strictly from real sandbox execution (`syntax_valid`, `localized_fault`, `paired_delta_improved`, `calibration_correct`, `heldout_positive`).
-5. **`manifest.json` & `quality_audit.json` (Mandatory Anti-Leakage Gate)**:
-   - Exact SHA/text/normalized checks proving **zero** overlap with `heldout_eval`, `reserved_eval`, and `eval_layers`.
-   - Numerical grounding audit checking that numbers cited in final `SUBMIT`/`WITHDRAW` rationales match actual recorded `WORK/` outputs.
-   - Token length distribution, schema validity, `<think>` balance, and train/val/session counts.
+   - Prompt-matched compacted `(prompt, chosen_turn, rejected_turn)` triples constructed from verified `27B` turns vs. unmodified `4B`/`9B` failure turns and dropped early hypotheses.
+4. **`rlvr_episodes.jsonl` (Verifiable `SealedPythonSandbox`-Executed Replay Tasks)**:
+   - Task snapshots `(census_summary, work_snapshot_dir, reserved_delta, corruption_layer)` executed inside `SealedPythonSandbox` during Stage C (`G=4` group-normalized rollouts).
+5. **`manifest.json` & `quality_audit.json` (Mandatory Anti-Leakage & Numerical Grounding Gate)**:
+   - Proves **zero** overlap with `heldout_eval`, `reserved_eval`, `practice_eval`, and `eval_layers`; forbids `"eval_delta"`/`"heldout_eval"` selection fields (`heldout_selection_field_leakage`); and cross-checks cited `delta_hat=...` numbers against recorded session pass/reserved outputs (`numerical_grounding_mismatch`).
 
 ---
 
@@ -182,10 +174,10 @@ Every session writes a self-contained, Drive-synced directory:
    - Rank `r = 32–64`, all linear projections (`q/k/v/o/gate/up/down` + `linear_attn` projections if Qwen3.5), cosine LR (`1e-4 -> 1e-5` on `9B/4B`, `2e-4` on `<= 2B`).
 2. **Stage B — Mechanistic Contrastive DPO (`beta = 0.1–0.15`, `lr <= 5e-6`)**:
    - Directly suppresses the failure attractors observed by Fan et al. at `2B/4B/9B`: blind `np.random.randn()` edits, refusing weights, ignoring failed paired tests, and hallucinating tensor stats without running code/reads.
-3. **Stage C — Sandbox-Grounded RLVR (Optional Refinement for `2B / 0.6B / MiniMind`)**:
-   - Generates multi-turn rollouts on `distill_train` episodes using the real sandbox & GPU target, rewarding verifiable outcomes (`valid_code`, `read_before_edit`, `fault_matrix_recall`, `paired_test_delta`, `clean_withdraw_when_harmful`) via GRPO/CISPO with KL penalty to Stage B reference weights.
-4. **Stage D — Merge, Freeze & Optional Structural Pruning (`distill/compress_model.py`)**:
-   - Merge LoRA cleanly back into standalone base weights, save FP16/BF16 model, verify zero gradient hooks remain during `eval`, and support optional width/depth pruning + KL logit distillation if bridging intermediate sizes (e.g., `4B -> 2.5B`).
+3. **Stage C — Group-Normalized (`G=4`) `SealedPythonSandbox`-Executed RLVR (`2B / 0.6B / MiniMind`)**:
+   - Samples `G=4` rollouts on `distill_train` `WORK_snapshot/` episodes, executes generated Python inside a real `SealedPythonSandbox`, scores verifiable syntax, safety, fault-layer localization, and calibrated `SUBMIT`/`WITHDRAW` rewards against `reserved_delta`, and optimizes group-normalized advantages with KL anchoring.
+4. **Stage D — Merge, Freeze & Same-Tokenizer Structural Pruning (`distill/compress_model.py`)**:
+   - Merge LoRA cleanly back into standalone base weights, save FP16/BF16 model, verify zero gradient hooks remain during `eval`. Logit KL distillation (`distill_kl_ce_step`) applies strictly within same-tokenizer families (`Qwen3.5 -> Qwen3.5`), while cross-vocabulary rungs (`R4: Qwen3-0.6B`, `R4m: MiniMind`) use trajectory SFT + DPO + Sandbox RLVR (with `MiniMindBackend` wired directly into `downsize_bracket.py`).
 
 ### 5.3 Student Promotion Gates (Unseen Eval Only)
 A downsized student clears rung `R_k` **only** when frozen and tested inside the exact Algorithm 1–4 harness on unseen tasks/layers with:
@@ -298,15 +290,14 @@ selfrewrite/
   - Zero-download smoke command (`python3 -m selfrewrite.cli smoke`) passing locally and on Colab.
 - **Verify**: Dry-run `run_colab_cli.py --dry-run`, `py_compile` across all files, full `unittest discover -s selfrewrite/tests -v`, and live A100 Batch 1 + Batch 2 launch verifying `raw_sessions/` -> `distill_bundle/v1/quality_audit.json` (`passed: true`) on Drive.
 
-### Phase 6 — Downsizing Student Trainer & Frozen Bracket Search
-- **Files**: `distill/{train_student,compress_model}.py`, `colab/downsize_bracket.py`.
-- **Key Deliverables**:
-  - Multi-stage trainer (LoRA SFT -> Contrastive DPO -> optional Sandbox RLVR -> merge & freeze) consuming `distill_bundle/v<N>/` cleanly on A100/L4/T4.
-  - Bracket orchestrator testing frozen downsized students (`9B -> 4B -> 2B -> 0.6B/MiniMind`) against the Promotion Gates (§5.3) and producing a unified `downsize_report.md` & `leaderboard.json`.
-- **Verify**: Small-scale PyTorch/GPU training + merge + frozen eval smoke test on A100 (or `9B`/`4B` canary), verifying non-zero held-out repair recovery and zero gradient/leakage flags in `eval`.
+### Phase 6 — Downsizing Student Trainer & Frozen Bracket Search (Implemented)
+- **Files**: `distill/{train_student,compress_model}.py`, `colab/downsize_bracket.py`, `tests/test_distill_and_bracket.py`.
+- **Verified**: `smoke`, `bracket` (`R1..R4`), and Colab T4 CUDA (`20/20` unit tests + live `Qwen/Qwen3.5-2B` SFT/DPO/RLVR/merge canary).
+
+### Phase 6.5 — Pre-A100 Hardening (Current Implementation)
+- **Changes**: Two-tier `*_harvest` A100 profiles + PyTorch SDPA + optional `flash-linear-attention`/`causal-conv1d`, `layer_state_tensors` (`linear_attn.dt_bias`), zero-variance census fallback, zero-`heldout_eval` Batch 2 harvesting (`reserved_check`-only gating + `heldout_selection_field_leakage` & `numerical_grounding_mismatch` audit rules), compacted `<= 3.5k`-token sliding-window primitives, `G=4` `SealedPythonSandbox`-executed RLVR, `MiniMindBackend` wiring in `downsize_bracket.py`, and `--detached` background Colab runner + `colab-mcp` workflow.
 
 ---
 
-## 8. Immediate Next Step (Once Approved)
-1. Implement **Phases 1–2** (`selfrewrite/` core sandbox, edit store, protocol, stats, task splits, grader, corruption harness, mock session E2E) and verify 100% pass locally.
-2. Implement **Phases 3–5** (`hf_gpu_backend.py` for A100-40G/80G, `harvest/` distillation bundle pipeline, `colab/` Drive sync & launcher, `run_selfrewrite.ipynb`), then kick off **Colab A100 Batch 1 Reproduction + Batch 2 Harvesting** so verified `raw_sessions/` and `distill_bundle/v1/` are saved directly to Google Drive for **Phase 6** student downsizing.
+## 8. Immediate Next Step — Live Colab A100 Run
+1. Open [run_selfrewrite.ipynb](file:///Users/admin/Documents/GitHub/minimind/selfrewrite/colab/run_selfrewrite.ipynb) via `colab-mcp` (native Colab UI `HF_TOKEN` & Drive mount) or run `python3 -m selfrewrite.colab.run_colab_cli --gpu A100 --fast-harvest-profile --detached` to execute **Batch 1 Reference Check -> Batch 2 Harvest (`distill_bundle/v1/`) -> Batch 3 Downsizing (`R2,R3,R1,R4`)**.

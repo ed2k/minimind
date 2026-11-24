@@ -60,37 +60,90 @@ def apply_block_corruption(weight_tensor: Any, spec: CorruptionSpec) -> tuple[An
     if len(shape) != 2:
         raise ValueError(f"Expected 2D matrix for corruption, got {shape}")
     out_dim, in_dim = shape
-    r0 = max(0, min(out_dim - spec.num_rows, int(spec.row_start)))
-    r1 = r0 + int(spec.num_rows)
+    eff_rows = max(0, min(out_dim, int(spec.num_rows)))
+    r0 = max(0, min(out_dim - eff_rows, int(spec.row_start)))
+    r1 = r0 + eff_rows
 
-    vals = flatten_floats(weight_tensor)
-    orig_std = float(statistics.pstdev(vals)) if len(vals) > 1 else 0.01
-    sigma = max(1e-6, orig_std)
-    noise_scale = float(spec.sigma_mult) * sigma
+    kind = _container_kind(weight_tensor)
+    if kind == "torch":
+        import torch  # type: ignore[import-not-found]
 
-    rng = random.Random(int(spec.seed))
-    rows = to_nested_list(weight_tensor)
-    for r in range(r0, r1):
-        if spec.mode == "gaussian_noise":
-            rows[r] = [rng.gauss(0.0, noise_scale) for _ in range(in_dim)]
-        elif spec.mode == "saturation":
-            rows[r] = [(noise_scale if (j % 2 == 0) else -noise_scale) for j in range(in_dim)]
-        elif spec.mode == "zero_rows":
-            rows[r] = [0.0 for _ in range(in_dim)]
-        else:
-            raise ValueError(f"Unknown corruption mode {spec.mode!r}")
+        wf = weight_tensor.detach().clone()
+        orig_std = float(wf.float().std(unbiased=False).item()) if wf.numel() > 1 else 0.01
+        sigma = max(1e-6, orig_std)
+        noise_scale = float(spec.sigma_mult) * sigma
+        with torch.no_grad():
+            if eff_rows > 0:
+                if spec.mode == "gaussian_noise":
+                    gen = torch.Generator().manual_seed(int(spec.seed))
+                    block = torch.randn((eff_rows, in_dim), generator=gen, dtype=torch.float32) * noise_scale
+                    wf[r0:r1].copy_(block.to(device=wf.device, dtype=wf.dtype))
+                elif spec.mode == "saturation":
+                    pattern = torch.where(
+                        (torch.arange(in_dim, device=wf.device) % 2) == 0,
+                        torch.tensor(noise_scale, device=wf.device, dtype=torch.float32),
+                        torch.tensor(-noise_scale, device=wf.device, dtype=torch.float32),
+                    ).to(dtype=wf.dtype)
+                    wf[r0:r1].copy_(pattern.unsqueeze(0).expand(eff_rows, in_dim))
+                elif spec.mode == "zero_rows":
+                    wf[r0:r1].zero_()
+                else:
+                    raise ValueError(f"Unknown corruption mode {spec.mode!r}")
+        abs_after = wf.float().abs()
+        damaged_max = float(abs_after.max().item()) if wf.numel() else 0.0
+        damaged_med = float(abs_after.median().item()) if wf.numel() else 0.0
+        updated = wf
+    elif kind == "numpy":
+        import numpy as np  # type: ignore[import-not-found]
 
-    flat_after = [v for row in rows for v in row]
-    abs_after = [abs(v) for v in flat_after]
-    damaged_max = max(abs_after) if abs_after else 0.0
-    damaged_med = float(statistics.median(abs_after)) if abs_after else 0.0
+        arr = np.array(weight_tensor, copy=True)
+        orig_std = float(arr.astype("float64").std()) if arr.size > 1 else 0.01
+        sigma = max(1e-6, orig_std)
+        noise_scale = float(spec.sigma_mult) * sigma
+        if eff_rows > 0:
+            if spec.mode == "gaussian_noise":
+                rng_np = np.random.default_rng(int(spec.seed))
+                arr[r0:r1] = rng_np.normal(0.0, noise_scale, size=(eff_rows, in_dim)).astype(arr.dtype)
+            elif spec.mode == "saturation":
+                pat = np.where((np.arange(in_dim) % 2) == 0, noise_scale, -noise_scale).astype(arr.dtype)
+                arr[r0:r1] = pat[None, :]
+            elif spec.mode == "zero_rows":
+                arr[r0:r1] = 0.0
+            else:
+                raise ValueError(f"Unknown corruption mode {spec.mode!r}")
+        abs_after = np.abs(arr.astype("float64"))
+        damaged_max = float(abs_after.max()) if arr.size else 0.0
+        damaged_med = float(np.median(abs_after)) if arr.size else 0.0
+        updated = arr
+    else:
+        vals = flatten_floats(weight_tensor)
+        orig_std = float(statistics.pstdev(vals)) if len(vals) > 1 else 0.01
+        sigma = max(1e-6, orig_std)
+        noise_scale = float(spec.sigma_mult) * sigma
 
-    updated = from_nested_like(rows, weight_tensor) if _container_kind(weight_tensor) != "list" else rows
+        rng = random.Random(int(spec.seed))
+        rows = to_nested_list(weight_tensor)
+        for r in range(r0, r1):
+            if spec.mode == "gaussian_noise":
+                rows[r] = [rng.gauss(0.0, noise_scale) for _ in range(in_dim)]
+            elif spec.mode == "saturation":
+                rows[r] = [(noise_scale if (j % 2 == 0) else -noise_scale) for j in range(in_dim)]
+            elif spec.mode == "zero_rows":
+                rows[r] = [0.0 for _ in range(in_dim)]
+            else:
+                raise ValueError(f"Unknown corruption mode {spec.mode!r}")
+
+        flat_after = [v for row in rows for v in row]
+        abs_after = [abs(v) for v in flat_after]
+        damaged_max = max(abs_after) if abs_after else 0.0
+        damaged_med = float(statistics.median(abs_after)) if abs_after else 0.0
+        updated = rows
+
     new_spec = CorruptionSpec(
         layer_idx=spec.layer_idx,
         tensor_name=spec.tensor_name,
         row_start=r0,
-        num_rows=spec.num_rows,
+        num_rows=eff_rows,
         sigma_mult=spec.sigma_mult,
         mode=spec.mode,
         seed=spec.seed,

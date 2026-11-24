@@ -160,18 +160,22 @@ class HybridWeightOverlay:
                         if key not in self._module_backups:
                             self._module_backups[key] = mod
                         dev = mod.weight.device
+                        if dev.type == "cuda":
+                            promo_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+                        else:
+                            promo_dtype = torch.float32
                         bias = getattr(mod, "bias", None)
                         cand_t = candidate if isinstance(candidate, torch.Tensor) else torch.tensor(candidate)
                         new_lin = nn.Linear(
                             mod.in_features,
                             mod.out_features,
                             bias=(bias is not None),
-                            dtype=torch.bfloat16,
+                            dtype=promo_dtype,
                             device=dev,
                         )
-                        new_lin.weight.copy_(cand_t.to(device=dev, dtype=torch.bfloat16))
+                        new_lin.weight.copy_(cand_t.to(device=dev, dtype=promo_dtype))
                         if bias is not None and new_lin.bias is not None:
-                            new_lin.bias.copy_(bias.detach().to(device=dev, dtype=torch.bfloat16))
+                            new_lin.bias.copy_(bias.detach().to(device=dev, dtype=promo_dtype))
                         setattr(parent_mod, child_attr, new_lin)
                         continue
 
@@ -194,6 +198,7 @@ class HybridWeightOverlay:
             return
         import torch  # type: ignore[import-not-found]
 
+        had_module_backups = bool(self._module_backups)
         with torch.no_grad():
             for (parent_mod, child_attr), orig_mod in list(self._module_backups.items()):
                 setattr(parent_mod, child_attr, orig_mod)
@@ -207,6 +212,9 @@ class HybridWeightOverlay:
                         p.data.copy_(orig_cpu.to(device=p.device, dtype=p.dtype, non_blocking=False))
                 self._param_backups.clear()
 
+        if had_module_backups and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     @contextmanager
     def applied(self, edit_tensors: dict[str, Any] | None) -> Iterator[None]:
         self.apply(edit_tensors)
@@ -216,11 +224,55 @@ class HybridWeightOverlay:
             self.restore()
 
 
+def load_hf_model(model_id_or_dir: str, **load_kwargs: Any) -> Any:
+    """Load causal or conditional-generation HuggingFace model (including Qwen3.5) cleanly."""
+    from transformers import AutoConfig, AutoModelForCausalLM  # type: ignore[import-not-found]
+
+    trust_remote = bool(load_kwargs.get("trust_remote_code", True))
+    cfg = AutoConfig.from_pretrained(str(model_id_or_dir), trust_remote_code=trust_remote)
+    model_type = str(getattr(cfg, "model_type", "") or "").lower()
+    archs = [str(a) for a in (getattr(cfg, "architectures", None) or [])]
+    loader_cls: Any = AutoModelForCausalLM
+    if model_type.startswith("qwen3_5") or any(a.endswith("ForConditionalGeneration") for a in archs):
+        try:
+            from transformers import AutoModelForImageTextToText  # type: ignore[import-not-found]
+
+            loader_cls = AutoModelForImageTextToText
+        except ImportError:
+            loader_cls = AutoModelForCausalLM
+
+    use_cuda = "cuda" in str(load_kwargs.get("device_map", "")).lower()
+    if not use_cuda:
+        try:
+            import torch  # type: ignore[import-not-found]
+
+            use_cuda = bool(torch.cuda.is_available())
+        except Exception:
+            use_cuda = False
+
+    def _call_loader(cls: Any, kwargs: dict[str, Any]) -> Any:
+        if use_cuda and "attn_implementation" not in kwargs:
+            try:
+                return cls.from_pretrained(str(model_id_or_dir), **{**kwargs, "attn_implementation": "sdpa"})
+            except (TypeError, ValueError):
+                pass
+        return cls.from_pretrained(str(model_id_or_dir), **kwargs)
+
+    if loader_cls is not AutoModelForCausalLM:
+        try:
+            return _call_loader(loader_cls, dict(load_kwargs))
+        except (ImportError, ValueError):
+            pass
+    return _call_loader(AutoModelForCausalLM, dict(load_kwargs))
+
+
 def resolve_decoder_layers(model: Any) -> list[Any]:
     """Find transformer decoder ModuleList across Qwen3.5, Qwen3, Llama, GPT, and MiniMind."""
     for attr_chain in (
         ("model", "language_model", "model", "layers"),
         ("language_model", "model", "layers"),
+        ("model", "language_model", "layers"),
+        ("language_model", "layers"),
         ("model", "layers"),
         ("layers",),
         ("transformer", "h"),
@@ -271,11 +323,15 @@ class HFGPUBackend(TargetBackend, EditorBackend):
     ):
         self.model = model.eval()
         self.tokenizer = tokenizer
+        if hasattr(self.tokenizer, "padding_side"):
+            self.tokenizer.padding_side = "left"
         self.profile = profile
         self.canonical_reader = canonical_reader or CanonicalWeightReader(model=self.model)
         self.overlay = HybridWeightOverlay(self.model)
         self.editor_model = (editor_model or self.model).eval()
         self.editor_tokenizer = editor_tokenizer or self.tokenizer
+        if hasattr(self.editor_tokenizer, "padding_side"):
+            self.editor_tokenizer.padding_side = "left"
         self.model_id = model_id
         self._layers = resolve_decoder_layers(self.model)
 
@@ -291,12 +347,13 @@ class HFGPUBackend(TargetBackend, EditorBackend):
         """Load HF open-weights model on Colab A100 (BF16 on 80G; 4-bit hybrid on 40G/L4)."""
         import torch  # type: ignore[import-not-found]
         from huggingface_hub import snapshot_download  # type: ignore[import-not-found]
-        from transformers import AutoModelForCausalLM, AutoTokenizer  # type: ignore[import-not-found]
+        from transformers import AutoTokenizer  # type: ignore[import-not-found]
 
         local_dir = Path(canonical_dir) if canonical_dir else Path(
             snapshot_download(repo_id=model_id, cache_dir=str(cache_dir) if cache_dir else None)
         )
         tokenizer = AutoTokenizer.from_pretrained(str(local_dir), trust_remote_code=trust_remote_code)
+        tokenizer.padding_side = "left"
         if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
             tokenizer.pad_token_id = tokenizer.eos_token_id
 
@@ -318,14 +375,15 @@ class HFGPUBackend(TargetBackend, EditorBackend):
         else:
             load_kwargs["torch_dtype"] = dtype
 
-        model = AutoModelForCausalLM.from_pretrained(str(local_dir), **load_kwargs)
+        model = load_hf_model(str(local_dir), **load_kwargs)
         reader = CanonicalWeightReader(weight_dir=local_dir, model=model)
         return cls(model=model, tokenizer=tokenizer, profile=profile, canonical_reader=reader, model_id=model_id)
 
     @property
     def arch_summary(self) -> str:
         cfg = getattr(self.model, "config", None)
-        hs = getattr(cfg, "hidden_size", "?")
+        text_cfg = getattr(cfg, "text_config", cfg)
+        hs = getattr(text_cfg, "hidden_size", "?")
         nl = len(self._layers)
         return f"{self.model_id} (layers={nl}, hidden_size={hs}, profile={self.profile.name})"
 
@@ -344,12 +402,15 @@ class HFGPUBackend(TargetBackend, EditorBackend):
             return p.device
         return "cpu"
 
-    def _format_user_prompt(self, question: str) -> str:
+    def _format_user_prompt(self, question: str, require_thinking: bool = True) -> str:
         messages = [{"role": "user", "content": question}]
         if hasattr(self.tokenizer, "apply_chat_template"):
             try:
                 return self.tokenizer.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=True
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    enable_thinking=bool(require_thinking),
                 )
             except TypeError:
                 return self.tokenizer.apply_chat_template(
@@ -368,25 +429,44 @@ class HFGPUBackend(TargetBackend, EditorBackend):
     ) -> list[GenerationRecord]:
         import torch  # type: ignore[import-not-found]
 
+        if hasattr(self.tokenizer, "padding_side"):
+            self.tokenizer.padding_side = "left"
+        pad_tok = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id
+        eos_tok = self.tokenizer.eos_token_id
+        batch_size = max(1, int(self.profile.gen_batch_size))
+
         dev = self._model_device(self.model)
         out: list[GenerationRecord] = []
         with self.overlay.applied(edit_tensors), torch.no_grad():
-            for prob in problems:
-                pid = str(prob["problem_id"] if isinstance(prob, dict) else getattr(prob, "problem_id"))
-                question = str(prob["question"] if isinstance(prob, dict) else getattr(prob, "question"))
-                prompt_text = self._format_user_prompt(question)
-                enc = self.tokenizer(prompt_text, return_tensors="pt")
+            for start in range(0, len(problems), batch_size):
+                chunk = problems[start : start + batch_size]
+                pids = [
+                    str(p["problem_id"] if isinstance(p, dict) else getattr(p, "problem_id"))
+                    for p in chunk
+                ]
+                questions = [
+                    str(p["question"] if isinstance(p, dict) else getattr(p, "question"))
+                    for p in chunk
+                ]
+                prompts = [
+                    self._format_user_prompt(q, require_thinking=bool(config.require_thinking))
+                    for q in questions
+                ]
+                if len(prompts) > 1:
+                    enc = self.tokenizer(prompts, return_tensors="pt", padding=True)
+                else:
+                    enc = self.tokenizer(prompts[0], return_tensors="pt")
                 input_ids = enc["input_ids"].to(dev)
                 attn_mask = enc.get("attention_mask")
                 if attn_mask is not None:
                     attn_mask = attn_mask.to(dev)
-                prompt_len = int(input_ids.shape[1])
+                prompt_width = int(input_ids.shape[1])
 
                 for j in range(int(n_samples)):
-                    s = problem_seed(pid, seed_base=seed_base)
-                    torch.manual_seed(s + j * 1009)
+                    batch_seed = problem_seed("|".join(pids), seed_base=seed_base) + j * 1009
+                    torch.manual_seed(batch_seed)
                     if torch.cuda.is_available():
-                        torch.cuda.manual_seed_all(s + j * 1009)
+                        torch.cuda.manual_seed_all(batch_seed)
                     gen_kwargs: dict[str, Any] = {
                         "input_ids": input_ids,
                         "max_new_tokens": int(max_tokens),
@@ -394,22 +474,38 @@ class HFGPUBackend(TargetBackend, EditorBackend):
                         "temperature": float(config.sampling_temperature),
                         "top_p": float(config.sampling_top_p),
                         "top_k": int(config.sampling_top_k),
-                        "pad_token_id": self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
                     }
+                    if pad_tok is not None:
+                        gen_kwargs["pad_token_id"] = pad_tok
                     if attn_mask is not None:
                         gen_kwargs["attention_mask"] = attn_mask
                     gen_ids = self.model.generate(**gen_kwargs)
-                    new_ids = gen_ids[0][prompt_len:]
-                    text = self.tokenizer.decode(new_ids, skip_special_tokens=False)
-                    out.append(
-                        GenerationRecord(
-                            problem_id=pid,
-                            sample_idx=j,
-                            seed=s,
-                            response_text=text,
-                            num_tokens=int(new_ids.shape[0]),
+
+                    for b_idx, pid in enumerate(pids):
+                        new_ids = gen_ids[b_idx][prompt_width:]
+                        if pad_tok is not None and new_ids.numel() > 0:
+                            end = int(new_ids.shape[0])
+                            if pad_tok != eos_tok:
+                                while end > 0 and int(new_ids[end - 1].item()) == int(pad_tok):
+                                    end -= 1
+                            else:
+                                while (
+                                    end > 1
+                                    and int(new_ids[end - 1].item()) == int(pad_tok)
+                                    and int(new_ids[end - 2].item()) == int(pad_tok)
+                                ):
+                                    end -= 1
+                            new_ids = new_ids[:end]
+                        text = self.tokenizer.decode(new_ids, skip_special_tokens=False)
+                        out.append(
+                            GenerationRecord(
+                                problem_id=pid,
+                                sample_idx=j,
+                                seed=batch_seed,
+                                response_text=text,
+                                num_tokens=int(new_ids.shape[0]),
+                            )
                         )
-                    )
         return out
 
     def read_activations(
@@ -441,7 +537,6 @@ class HFGPUBackend(TargetBackend, EditorBackend):
                     max_length=int(max_tokens),
                 )
                 input_ids = enc["input_ids"].to(dev)
-                seq_len = int(input_ids.shape[1])
 
                 hooks = []
                 cur_captures: dict[int, Any] = {}
@@ -453,7 +548,7 @@ class HFGPUBackend(TargetBackend, EditorBackend):
                             def _mk_hook(idx: int):
                                 def _hook(_mod, _inp, out):
                                     t = out[0] if isinstance(out, (tuple, list)) else out
-                                    cur_captures[idx] = t[0].detach().cpu().float()
+                                    cur_captures[idx] = (t[0] if t.ndim == 3 else t).detach().cpu().float()
                                 return _hook
 
                             hooks.append(layer_mod.register_forward_hook(_mk_hook(l_idx)))
@@ -463,7 +558,7 @@ class HFGPUBackend(TargetBackend, EditorBackend):
                             def _mk_pre(idx: int):
                                 def _pre(_mod, inp):
                                     t = inp[0]
-                                    cur_captures[idx] = t[0].detach().cpu().float()
+                                    cur_captures[idx] = (t[0] if t.ndim == 3 else t).detach().cpu().float()
                                 return _pre
 
                             hooks.append(mlp_down.register_forward_pre_hook(_mk_pre(l_idx)))
@@ -493,7 +588,14 @@ class HFGPUBackend(TargetBackend, EditorBackend):
             if len({tuple(x.shape) for x in items}) == 1:
                 arrays[key] = torch.stack(items, dim=0).numpy()
             else:
-                arrays[key] = torch.stack([x.mean(dim=0) if x.ndim > 1 else x for x in items], dim=0).numpy()
+                lengths = [int(x.shape[0]) for x in items]
+                max_len = max(lengths)
+                tail_shape = tuple(items[0].shape[1:])
+                padded = torch.zeros((len(items), max_len, *tail_shape), dtype=items[0].dtype)
+                for idx_item, item in enumerate(items):
+                    padded[idx_item, : int(item.shape[0])] = item
+                arrays[key] = padded.numpy()
+                arrays[f"{key}_lengths"] = torch.tensor(lengths, dtype=torch.int64).numpy()
 
         return ReadResult(
             pass_id=pass_id,
@@ -515,7 +617,17 @@ class HFGPUBackend(TargetBackend, EditorBackend):
         ed_mod = self.editor_model
         dev = self._model_device(ed_mod)
         if hasattr(ed_tok, "apply_chat_template"):
-            prompt_text = ed_tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            try:
+                prompt_text = ed_tok.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    enable_thinking=bool(config.require_thinking),
+                )
+            except TypeError:
+                prompt_text = ed_tok.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True
+                )
         else:
             prompt_text = "\n".join(f"{m['role'].upper()}: {m['content']}" for m in messages) + "\nASSISTANT:\n"
 
@@ -527,15 +639,19 @@ class HFGPUBackend(TargetBackend, EditorBackend):
         )
         input_ids = enc["input_ids"].to(dev)
         prompt_len = int(input_ids.shape[1])
+        pad_tok = ed_tok.pad_token_id if ed_tok.pad_token_id is not None else ed_tok.eos_token_id
         with torch.no_grad():
-            gen = ed_mod.generate(
-                input_ids=input_ids,
-                attention_mask=enc["attention_mask"].to(dev) if "attention_mask" in enc else None,
-                max_new_tokens=int(config.editor_max_new_tokens),
-                do_sample=True,
-                temperature=float(config.sampling_temperature),
-                top_p=float(config.sampling_top_p),
-                top_k=int(config.sampling_top_k),
-                pad_token_id=ed_tok.pad_token_id or ed_tok.eos_token_id,
-            )
+            gen_kwargs: dict[str, Any] = {
+                "input_ids": input_ids,
+                "max_new_tokens": int(config.editor_max_new_tokens),
+                "do_sample": True,
+                "temperature": float(config.sampling_temperature),
+                "top_p": float(config.sampling_top_p),
+                "top_k": int(config.sampling_top_k),
+            }
+            if "attention_mask" in enc:
+                gen_kwargs["attention_mask"] = enc["attention_mask"].to(dev)
+            if pad_tok is not None:
+                gen_kwargs["pad_token_id"] = pad_tok
+            gen = ed_mod.generate(**gen_kwargs)
         return ed_tok.decode(gen[0][prompt_len:], skip_special_tokens=False)

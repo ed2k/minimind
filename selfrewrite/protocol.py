@@ -193,6 +193,7 @@ def build_task_prompt(
         "   Helpers: `list_tensors()`, `tensor_shapes()`, `load_original(name)`, `save_edit(name, tensor)`, "
         "`drop_edit(name=None)`, `list_edits()`, `save_named_edit(tag)`, `load_named_edit(tag)`, `list_named_edits()`, "
         "`load_census()`, `load_pass(pass_id)`, `load_problems()`, `layer_output_matrices(layer_idx)`, "
+        "`layer_state_tensors(layer_idx)` (for linear-attention `dt_bias` / `A_log` / `conv1d` state tuning), "
         "`unit_vector(v)`, `mean_diff_direction(pos, neg)`, `remove_direction(W, u, alpha)`, "
         "`outlier_ratios(tensors_dict)`, `clip_outliers_median(W, factor)`.\n"
         "2. ```forward: JSON object with `mode`: `\"generate\"` (supports `weights`: `\"original\"|\"edited\"|\"both\"` "

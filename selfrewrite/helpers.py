@@ -105,6 +105,26 @@ def layer_output_matrices(layer_idx: int, tensor_names: Iterable[str]) -> list[s
     return selected
 
 
+def layer_state_tensors(layer_idx: int, tensor_names: Iterable[str]) -> list[str]:
+    """Return Gated DeltaNet / recurrent state parameters (dt_bias, A_log, conv1d, in_proj) for a layer."""
+    idx_int = int(layer_idx)
+    suffixes = (
+        ".dt_bias",
+        ".A_log",
+        ".conv1d.weight",
+        ".conv1d.bias",
+        ".in_proj_a.weight",
+        ".in_proj_b.weight",
+        ".in_proj_z.weight",
+    )
+    selected: list[str] = []
+    for name in sorted(tensor_names):
+        m = _LAYER_IDX_RE.search(name)
+        if m and int(m.group(1)) == idx_int and name.endswith(suffixes):
+            selected.append(name)
+    return selected
+
+
 def unit_vector(vec: Any) -> Any:
     """Normalize a 1D vector to unit L2 norm."""
     kind = _container_kind(vec)

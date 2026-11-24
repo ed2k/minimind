@@ -6,9 +6,13 @@ import unittest
 from pathlib import Path
 
 from selfrewrite.backends.mock_backend import MockTargetBackend, MockTransformerModel
+from selfrewrite.config import SessionConfig
+from selfrewrite.distill.programmatic_teacher import ProgrammaticImproveEditor
 from selfrewrite.edit_store import EditStore, EditValidationError, is_forbidden_tensor_name
-from selfrewrite.helpers import clip_outliers_median, remove_direction
+from selfrewrite.helpers import clip_outliers_median, layer_state_tensors, remove_direction
 from selfrewrite.sandbox import SealedPythonSandbox, scan_sandbox_code
+from selfrewrite.session import SessionOrchestrator
+from selfrewrite.tasks.datasets import build_builtin_suites
 
 
 class TestSandboxAndStore(unittest.TestCase):
@@ -45,9 +49,17 @@ class TestSandboxAndStore(unittest.TestCase):
             self.assertTrue(len(violations) > 0, f"Expected AST refusal for: {code}")
 
     def test_edit_store_enforces_algorithm4_tensor_gates(self) -> None:
-        for nm in ("model.embed_tokens.weight", "lm_head.weight", "model.norm.weight", "language_model.model.norm.weight"):
+        for nm in (
+            "model.embed_tokens.weight",
+            "model.language_model.embed_tokens.weight",
+            "lm_head.weight",
+            "model.norm.weight",
+            "model.language_model.norm.weight",
+            "language_model.model.norm.weight",
+        ):
             self.assertTrue(is_forbidden_tensor_name(nm))
         self.assertFalse(is_forbidden_tensor_name("model.layers.0.input_layernorm.weight"))
+        self.assertFalse(is_forbidden_tensor_name("model.language_model.layers.0.linear_attn.norm.weight"))
         self.assertFalse(is_forbidden_tensor_name("model.layers.3.mlp.down_proj.weight"))
 
         store = EditStore(
@@ -130,6 +142,56 @@ class TestSandboxAndStore(unittest.TestCase):
             self.assertIn("recovered_after_timeout", r3["output"])
         finally:
             sb.close()
+
+    def test_layer_state_tensors_and_zero_variance_census_fallback(self) -> None:
+        q35_names = [
+            "model.language_model.layers.0.linear_attn.dt_bias",
+            "model.language_model.layers.0.linear_attn.A_log",
+            "model.language_model.layers.0.linear_attn.conv1d.weight",
+            "model.language_model.layers.0.linear_attn.out_proj.weight",
+            "model.language_model.layers.0.mlp.down_proj.weight",
+            "model.language_model.layers.1.linear_attn.dt_bias",
+        ]
+        st = layer_state_tensors(0, q35_names)
+        self.assertEqual(
+            st,
+            [
+                "model.language_model.layers.0.linear_attn.A_log",
+                "model.language_model.layers.0.linear_attn.conv1d.weight",
+                "model.language_model.layers.0.linear_attn.dt_bias",
+            ],
+        )
+
+        # Sandbox exposes layer_state_tensors
+        spec_file = self.root / "q35_spec.json"
+        data_file = self.root / "q35_data.json"
+        data_file.write_text(json.dumps({nm: [0.1, 0.2] for nm in q35_names}), encoding="utf-8")
+        spec_file.write_text(
+            json.dumps({"mode": "json_tensors", "data_path": str(data_file), "shapes": {nm: [2] for nm in q35_names}}),
+            encoding="utf-8",
+        )
+        sb = SealedPythonSandbox(self.work_dir, spec_file, timeout_sec=5.0)
+        try:
+            res = sb.run("print(json.dumps(layer_state_tensors(0)))")
+            self.assertTrue(res["ok"], res)
+            self.assertIn("dt_bias", res["output"])
+        finally:
+            sb.close()
+
+        # All-finished (timeout_rate=0.0) and all-cut (timeout_rate=1.0) census must not raise zero-norm error
+        suites = build_builtin_suites(seed=9, practice_n=8, reserved_n=4, heldout_n=8, distill_n=8)
+        for rate in (0.0, 1.0):
+            tgt = MockTargetBackend(self.model, damage_mode=False, base_timeout_rate=rate)
+            orch = SessionOrchestrator(
+                work_dir=self.root / f"zv_{int(rate)}" / "WORK",
+                target=tgt,
+                editor=ProgrammaticImproveEditor(alpha=0.25),
+                practice_problems=suites["practice_eval"],
+                reserved_problems=suites["reserved_eval"],
+                config=SessionConfig(task="improve", protocol=2, answer_max_tokens=256, starting_diagnosis_n=6, reserved_check_samples=1, seed=9),
+            )
+            out = orch.run()
+            self.assertEqual(out["code_errors"], 0, out)
 
 
 if __name__ == "__main__":
