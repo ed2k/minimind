@@ -1,0 +1,27 @@
+{
+  "schema_targets": {
+    "sft_27b_steps_raw_arch.jsonl": "dataset.lm_dataset.SFTDataset",
+    "sft_minimind_adapted.jsonl": "dataset.lm_dataset.SFTDataset",
+    "dpo_minimind_pairs.jsonl": "dataset.lm_dataset.DPODataset",
+    "rlaif_minimind_prompts.jsonl": "dataset.lm_dataset.RLAIFDataset"
+  },
+  "minimind_ready_counts": {
+    "sft_27b_steps_raw_arch": 15,
+    "sft_minimind_adapted": 31,
+    "dpo_minimind_pairs": 12,
+    "rlaif_minimind_prompts": 15
+  },
+  "max_char_lengths": {
+    "sft_27b_steps_raw_arch": 11904,
+    "sft_minimind_adapted": 7613,
+    "dpo_minimind_pairs_chosen": 4550,
+    "dpo_minimind_pairs_rejected": 4860,
+    "rlaif_minimind_prompts": 7613
+  },
+  "sha256": {
+    "sft_27b_steps_raw_arch.jsonl": "ffbc5f77e2b392ace5744f9da48033e9df056b64172b341deb79ddb99d740ddf",
+    "sft_minimind_adapted.jsonl": "9ebe20862a4010ca0b889d0d1387d8164c1da832ace4f01ab7110c914929baa2",
+    "dpo_minimind_pairs.jsonl": "4aad43668a8bb8e8171754b2116e64d88ccbd29348ccdaf7ab8d7c04b201aabd",
+    "rlaif_minimind_prompts.jsonl": "6b7d3a2f3c0cdb3db649103b98859045af36da8165c4beea783f03801cdaa88e"
+  }
+}

@@ -1,0 +1,82 @@
+[
+  {
+    "session_id": "reproduce_improve_s00",
+    "task": "improve",
+    "decision": "WITHDRAW",
+    "ladder_score": 2,
+    "delta_hat": 0.0,
+    "perm_p": 1.0,
+    "sign_p": 1.0,
+    "transfer_delta": null
+  },
+  {
+    "session_id": "reproduce_repair_eval",
+    "task": "repair",
+    "decision": "WITHDRAW",
+    "ladder_score": 1,
+    "delta_hat": 0.0,
+    "perm_p": 1.0,
+    "sign_p": 1.0,
+    "transfer_delta": 0.0
+  },
+  {
+    "session_id": "harvest_improve_00",
+    "task": "improve",
+    "decision": "WITHDRAW",
+    "ladder_score": 2,
+    "delta_hat": null,
+    "perm_p": null,
+    "sign_p": null,
+    "transfer_delta": null
+  },
+  {
+    "session_id": "harvest_improve_01",
+    "task": "improve",
+    "decision": "WITHDRAW",
+    "ladder_score": 5,
+    "delta_hat": null,
+    "perm_p": null,
+    "sign_p": null,
+    "transfer_delta": null
+  },
+  {
+    "session_id": "harvest_repair_00",
+    "task": "repair",
+    "decision": "WITHDRAW",
+    "ladder_score": 1,
+    "delta_hat": null,
+    "perm_p": null,
+    "sign_p": null,
+    "transfer_delta": null
+  },
+  {
+    "session_id": "harvest_repair_01",
+    "task": "repair",
+    "decision": "WITHDRAW",
+    "ladder_score": 5,
+    "delta_hat": null,
+    "perm_p": null,
+    "sign_p": null,
+    "transfer_delta": null
+  },
+  {
+    "session_id": "harvest_fail_random_noise_4b",
+    "task": "improve",
+    "decision": "WITHDRAW",
+    "ladder_score": 3,
+    "delta_hat": null,
+    "perm_p": null,
+    "sign_p": null,
+    "transfer_delta": null
+  },
+  {
+    "session_id": "harvest_fail_bad_submit_9b",
+    "task": "improve",
+    "decision": "SUBMIT",
+    "ladder_score": 4,
+    "delta_hat": null,
+    "perm_p": null,
+    "sign_p": null,
+    "transfer_delta": null
+  }
+]

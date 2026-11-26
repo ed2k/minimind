@@ -1,0 +1,46 @@
+{
+  "source_model": "Qwen/Qwen3.5-27B",
+  "counts": {
+    "sft_gold_trajectories": 2,
+    "sft_turn_primitives": 13,
+    "dpo_contrastive_pairs": 12,
+    "rlvr_episodes": 2
+  },
+  "included_sessions": [
+    "harvest_improve_01",
+    "harvest_repair_01"
+  ],
+  "skipped_or_negative_sessions": [
+    {
+      "session_id": "harvest_fail_bad_submit_9b",
+      "reason": "negative/failure session harvested for DPO (ladder=4)"
+    },
+    {
+      "session_id": "harvest_fail_random_noise_4b",
+      "reason": "negative/failure session harvested for DPO (ladder=3)"
+    },
+    {
+      "session_id": "harvest_improve_00",
+      "reason": "negative/failure session harvested for DPO (ladder=2)"
+    },
+    {
+      "session_id": "harvest_repair_00",
+      "reason": "negative/failure session harvested for DPO (ladder=1)"
+    },
+    {
+      "session_id": "reproduce_improve_s00",
+      "reason": "split_tag='practice_eval' not in allowed splits"
+    },
+    {
+      "session_id": "reproduce_repair_eval",
+      "reason": "split_tag='practice_eval' not in allowed splits"
+    }
+  ],
+  "sha256": {
+    "sft_gold_trajectories.jsonl": "333f3560b0ed2781407bc20e32d027954e3306758d938e1251c998f7bd259ab5",
+    "sft_turn_primitives.jsonl": "af3b951ae27f01aa3adef81305c26429967ae666a87d1fe3cc194bd9cedc55c7",
+    "dpo_contrastive_pairs.jsonl": "4195a291126401471ea0e9bf50fad8ec8f606b704fe416df41b4eb92b763746d",
+    "rlvr_episodes.jsonl": "89c7b1962d5632fd5f93e711baf7d7c6927f2e8533cf4f1a58a31847b8030c83"
+  },
+  "audit_passed": true
+}

@@ -1,0 +1,9 @@
+{
+  "n": 8,
+  "accuracy": 1.0,
+  "cut_rate": 0.0,
+  "loop_rate": 0.0,
+  "loop_rate_among_cuts": 0.0,
+  "finished_accuracy": 1.0,
+  "mean_tokens": 602.62
+}

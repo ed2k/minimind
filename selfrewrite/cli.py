@@ -275,6 +275,18 @@ def main(argv: list[str] | None = None) -> int:
     p_br.add_argument("--seed", type=int, default=2026)
     p_br.set_defaults(func=_cmd_bracket)
 
+    def _cmd_export_minimind(a: argparse.Namespace) -> int:
+        from selfrewrite.distill.export_minimind_data import export_qwen27b_dataset
+
+        res = export_qwen27b_dataset(workspace_dir=Path(a.workspace_dir), output_dir=Path(a.output_dir))
+        print(json.dumps(res, indent=2))
+        return 0 if res["audit"]["passed"] else 2
+
+    p_exp = sub.add_parser("export-minimind", help="Extract verified 27B bundle into repo & MiniMind schemas")
+    p_exp.add_argument("--workspace-dir", default="selfrewrite/workspace")
+    p_exp.add_argument("--output-dir", default="selfrewrite/data/qwen35_27b_v1")
+    p_exp.set_defaults(func=_cmd_export_minimind)
+
     args = parser.parse_args(argv)
     return int(args.func(args))
 

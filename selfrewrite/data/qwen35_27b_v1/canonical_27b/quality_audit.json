@@ -1,0 +1,38 @@
+{
+  "passed": true,
+  "num_violations": 0,
+  "violations": [],
+  "stats": {
+    "sft_gold_trajectories.jsonl": {
+      "count": 2,
+      "approx_mean_tokens": 3886.5,
+      "approx_max_tokens": 4057
+    },
+    "sft_turn_primitives.jsonl": {
+      "count": 13,
+      "approx_mean_tokens": 2554.5,
+      "approx_max_tokens": 3443
+    },
+    "dpo_contrastive_pairs.jsonl": {
+      "count": 12,
+      "approx_mean_tokens": 2398.5,
+      "approx_max_tokens": 3703
+    },
+    "rlvr_episodes.jsonl": {
+      "count": 2,
+      "approx_mean_tokens": 50.0,
+      "approx_max_tokens": 51
+    }
+  },
+  "eval_problems_checked": 48,
+  "eval_layers_checked": [
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33
+  ]
+}

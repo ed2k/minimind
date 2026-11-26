@@ -1,0 +1,105 @@
+{
+  "updated_at": "2026-11-25T09:42:57.284131+00:00",
+  "profile": "colab_l4",
+  "backend": "hf",
+  "bundle_dir": "selfrewrite/data/qwen35_27b_v1/canonical_27b",
+  "rungs": [
+    {
+      "rung_id": "R3",
+      "model_id": "Qwen/Qwen3.5-2B",
+      "params_b": 2.0,
+      "frozen_for_eval": false,
+      "base_unmodified_acc": 0.5625,
+      "base_ladder_score": 0,
+      "student_unedited_acc": 0.0,
+      "improve_sessions": [
+        {
+          "session_id": "bracket_R3_improve_s00",
+          "decision": "WITHDRAW",
+          "ladder_score": 0,
+          "heldout_delta": 0.0,
+          "perm_p": 1.0,
+          "sign_p": 1.0
+        }
+      ],
+      "repair_session": {
+        "session_id": "bracket_R3_repair",
+        "corrupted_eval_layer": 11,
+        "decision": "WITHDRAW",
+        "ladder_score": 0,
+        "heldout_base_acc": 0.0,
+        "heldout_edit_acc": 0.0,
+        "heldout_delta": 0.0,
+        "perm_p": 1.0,
+        "sign_p": 1.0,
+        "transfer_delta": 0.0
+      },
+      "promotion": {
+        "promoted": false,
+        "gates": {
+          "ladder_gate": false,
+          "improve_gate": true,
+          "repair_gate": false,
+          "retention_gate": false
+        },
+        "best_ladder_score": 0,
+        "repair_recovery_ratio": 0.0,
+        "base_forgetting": 0.5625,
+        "reasons": [
+          "ladder_score 0 < 6",
+          "repair recovery=0.00 p=1 transfer=+0.000",
+          "base_forgetting 0.562 > 0.02"
+        ]
+      }
+    },
+    {
+      "rung_id": "R2",
+      "model_id": "Qwen/Qwen3.5-4B",
+      "params_b": 4.0,
+      "frozen_for_eval": false,
+      "base_unmodified_acc": 0.875,
+      "base_ladder_score": 2,
+      "student_unedited_acc": 0.0,
+      "improve_sessions": [
+        {
+          "session_id": "bracket_R2_improve_s00",
+          "decision": "WITHDRAW",
+          "ladder_score": 0,
+          "heldout_delta": 0.0,
+          "perm_p": 1.0,
+          "sign_p": 1.0
+        }
+      ],
+      "repair_session": {
+        "session_id": "bracket_R2_repair",
+        "corrupted_eval_layer": 15,
+        "decision": "WITHDRAW",
+        "ladder_score": 0,
+        "heldout_base_acc": 0.0,
+        "heldout_edit_acc": 0.0,
+        "heldout_delta": 0.0,
+        "perm_p": 1.0,
+        "sign_p": 1.0,
+        "transfer_delta": 0.0
+      },
+      "promotion": {
+        "promoted": false,
+        "gates": {
+          "ladder_gate": false,
+          "improve_gate": true,
+          "repair_gate": false,
+          "retention_gate": false
+        },
+        "best_ladder_score": 0,
+        "repair_recovery_ratio": 0.0,
+        "base_forgetting": 0.875,
+        "reasons": [
+          "ladder_score 0 < 6",
+          "repair recovery=0.00 p=1 transfer=+0.000",
+          "base_forgetting 0.875 > 0.02"
+        ]
+      }
+    }
+  ],
+  "pareto_winner": null
+}
