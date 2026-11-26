@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import math
 import random
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -287,16 +287,28 @@ def _enable_cuda_grad_checkpointing(model: Any) -> None:
     is_cuda = any(getattr(p, "is_cuda", False) for p in model.parameters())
     if not is_cuda:
         return
-    if hasattr(model, "enable_input_require_grads"):
-        try:
-            model.enable_input_require_grads()
-        except Exception:
-            pass
-    if hasattr(model, "gradient_checkpointing_enable"):
-        try:
-            model.gradient_checkpointing_enable()
-        except Exception:
-            pass
+    targets = [model]
+    lm1 = getattr(model, "language_model", None)
+    lm2 = getattr(getattr(model, "model", None), "language_model", None)
+    for sub in (lm1, lm2):
+        if sub is not None and sub not in targets:
+            targets.append(sub)
+    for t in targets:
+        if hasattr(t, "enable_input_require_grads"):
+            try:
+                t.enable_input_require_grads()
+            except Exception:
+                pass
+        if hasattr(t, "gradient_checkpointing_enable"):
+            try:
+                t.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+            except TypeError:
+                try:
+                    t.gradient_checkpointing_enable()
+                except Exception:
+                    pass
+            except Exception:
+                pass
 
 
 def _attach_lora_for_training(model: Any, config: StudentTrainConfig) -> tuple[Any, str]:
@@ -343,8 +355,9 @@ def _attach_lora_for_training(model: Any, config: StudentTrainConfig) -> tuple[A
                 out = self.base(x)
                 if self.disabled:
                     return out
-                delta = (x.float() @ self.lora_A.t() @ self.lora_B.t()) * self.scaling
-                return out + delta.to(dtype=out.dtype)
+                h = x @ self.lora_A.to(dtype=x.dtype).t()
+                delta = (h @ self.lora_B.to(dtype=x.dtype).t()) * self.scaling
+                return out + delta
 
         for p in model.parameters():
             p.requires_grad_(False)
@@ -412,11 +425,22 @@ def run_hf_sft_stage(model: Any, tokenizer: Any, sft_rows: list[dict[str, Any]],
                 continue
 
             out = model(input_ids=full_ids, use_cache=False)
-            logits = out.logits[:, :-1, :].float()
-            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), tgt.reshape(-1), ignore_index=-100)
+            raw_logits = out.logits[:, :-1, :]
+            valid_n = int((tgt != -100).sum().item())
+            loss_sum = raw_logits[:, :0, :1].sum().float() * 0.0
+            seq_l = int(raw_logits.size(1))
+            for c_start in range(0, seq_l, 256):
+                c_end = min(seq_l, c_start + 256)
+                c_tgt = tgt[:, c_start:c_end].reshape(-1)
+                if int((c_tgt != -100).sum().item()) == 0:
+                    continue
+                c_logits = raw_logits[:, c_start:c_end, :].float().reshape(-1, raw_logits.size(-1))
+                loss_sum = loss_sum + F.cross_entropy(c_logits, c_tgt, ignore_index=-100, reduction="sum")
+            loss = loss_sum / float(max(1, valid_n))
             loss_scaled = loss / max(1, int(config.grad_accum_steps))
             loss_scaled.backward()
             losses.append(float(loss.item()))
+            del out, raw_logits, loss, loss_sum, loss_scaled
 
             if step % max(1, int(config.grad_accum_steps)) == 0 or step == total_steps:
                 lr_mult = 0.1 + 0.9 * 0.5 * (1.0 + math.cos(math.pi * step / total_steps))
@@ -440,12 +464,19 @@ def _seq_logprob(model: Any, tokenizer: Any, prompt_msgs: list[dict[str, str]], 
     if full_ids.shape[1] < 2:
         return None
     pref_len = min(len(tokenizer(pref_txt, truncation=True, max_length=max_len)["input_ids"]), full_ids.shape[1] - 1)
-    logits = model(input_ids=full_ids, use_cache=False).logits[:, :-1, :].float()
-    targets = full_ids[:, 1:].unsqueeze(-1)
-    tok_lp = F.log_softmax(logits, dim=-1).gather(-1, targets).squeeze(-1)
-    mask = torch.zeros_like(tok_lp)
-    mask[:, max(0, pref_len - 1) :] = 1.0
-    return (tok_lp * mask).sum(dim=-1).squeeze(0)
+    raw_logits = model(input_ids=full_ids, use_cache=False).logits[:, :-1, :]
+    start_pos = max(0, pref_len - 1)
+    seq_l = int(raw_logits.size(1))
+    if start_pos >= seq_l:
+        return None
+    lp_sum = raw_logits[:, :0, :1].sum().float() * 0.0
+    for c_start in range(start_pos, seq_l, 256):
+        c_end = min(seq_l, c_start + 256)
+        c_logits = raw_logits[:, c_start:c_end, :].float()
+        c_tgts = full_ids[:, c_start + 1 : c_end + 1].unsqueeze(-1)
+        c_lp = F.log_softmax(c_logits, dim=-1).gather(-1, c_tgts).squeeze(-1)
+        lp_sum = lp_sum + c_lp.sum()
+    return lp_sum
 
 
 def run_hf_dpo_stage(model: Any, tokenizer: Any, dpo_rows: list[dict[str, Any]], config: StudentTrainConfig) -> dict[str, Any]:
@@ -467,19 +498,35 @@ def run_hf_dpo_stage(model: Any, tokenizer: Any, dpo_rows: list[dict[str, Any]],
 
     for _ in range(int(config.dpo_epochs)):
         for idx, row in enumerate(dpo_rows, start=1):
-            with torch.no_grad(), model.disable_adapter():
-                ref_c = _seq_logprob(model, tokenizer, row["prompt"], row["chosen"], int(config.max_seq_tokens), dev)
-                ref_r = _seq_logprob(model, tokenizer, row["prompt"], row["rejected"], int(config.max_seq_tokens), dev)
-            if ref_c is None or ref_r is None:
-                continue
+            with torch.no_grad():
+                with model.disable_adapter():
+                    ref_c = _seq_logprob(model, tokenizer, row["prompt"], row["chosen"], int(config.max_seq_tokens), dev)
+                    ref_r = _seq_logprob(model, tokenizer, row["prompt"], row["rejected"], int(config.max_seq_tokens), dev)
+                if ref_c is None or ref_r is None:
+                    continue
+                pi_c_det = _seq_logprob(model, tokenizer, row["prompt"], row["chosen"], int(config.max_seq_tokens), dev)
+                pi_r_det = _seq_logprob(model, tokenizer, row["prompt"], row["rejected"], int(config.max_seq_tokens), dev)
+                if pi_c_det is None or pi_r_det is None:
+                    continue
+                adv_det = beta * ((pi_c_det - ref_c) - (pi_r_det - ref_r))
+                loss_val = float((-F.logsigmoid(adv_det)).item())
+                grad_scale = float((-beta * torch.sigmoid(-adv_det)).item()) / float(max(1, int(config.grad_accum_steps)))
+            del ref_c, ref_r, pi_c_det, pi_r_det, adv_det
+
             pi_c = _seq_logprob(model, tokenizer, row["prompt"], row["chosen"], int(config.max_seq_tokens), dev)
-            pi_r = _seq_logprob(model, tokenizer, row["prompt"], row["rejected"], int(config.max_seq_tokens), dev)
-            if pi_c is None or pi_r is None:
+            if pi_c is None:
                 continue
-            adv = beta * ((pi_c - ref_c) - (pi_r - ref_r))
-            loss = -F.logsigmoid(adv)
-            (loss / max(1, int(config.grad_accum_steps))).backward()
-            losses.append(float(loss.item()))
+            (pi_c * grad_scale).backward()
+            del pi_c
+
+            pi_r = _seq_logprob(model, tokenizer, row["prompt"], row["rejected"], int(config.max_seq_tokens), dev)
+            if pi_r is None:
+                optimizer.zero_grad(set_to_none=True)
+                continue
+            (pi_r * (-grad_scale)).backward()
+            del pi_r
+
+            losses.append(loss_val)
             if idx % max(1, int(config.grad_accum_steps)) == 0 or idx == len(dpo_rows):
                 torch.nn.utils.clip_grad_norm_(trainable, 1.0)
                 optimizer.step()
@@ -509,14 +556,18 @@ def _prepare_rlvr_episode_sandbox(tmp_root: Path, ep: dict[str, Any]) -> Any:
     data_path = weights_dir / "weights_data.json"
     spec_path = weights_dir / "weights_spec.json"
     c_layer = ep.get("corruption_layer")
+    model_tag = str(ep.get("model_id", "")).lower()
+    is_qwen35 = "qwen3.5" in model_tag or "qwen3_5" in model_tag
     layer_ids = sorted({0, 1, *( [int(c_layer)] if c_layer is not None else [] )})
     fake_tensors: dict[str, Any] = {}
     for l_idx in layer_ids:
         w = [[0.01 * ((r + c + 1) % 5) for c in range(4)] for r in range(4)]
         if ep.get("task") == "repair" and c_layer is not None and l_idx == int(c_layer):
             w[0] = [12.5, -12.5, 11.0, -11.0]
-        fake_tensors[f"model.layers.{l_idx}.mlp.down_proj.weight"] = w
-        fake_tensors[f"model.layers.{l_idx}.self_attn.o_proj.weight"] = [[0.02 for _ in range(4)] for _ in range(4)]
+        prefix = f"model.language_model.layers.{l_idx}" if is_qwen35 else f"model.layers.{l_idx}"
+        fake_tensors[f"{prefix}.mlp.down_proj.weight"] = w
+        out_sub = "linear_attn.out_proj.weight" if is_qwen35 else "self_attn.o_proj.weight"
+        fake_tensors[f"{prefix}.{out_sub}"] = [[0.02 for _ in range(4)] for _ in range(4)]
     atomic_write_text(data_path, json.dumps(fake_tensors))
     atomic_write_text(
         spec_path,
@@ -662,24 +713,30 @@ def run_hf_rlvr_stage(
         std_r = math.sqrt(sum((r - mean_r) ** 2 for r in cand_rewards) / len(cand_rewards))
         advs = [((r - mean_r) / (std_r + 1e-4)) if std_r > 1e-6 else r for r in cand_rewards]
 
-        term_losses: list[Any] = []
+        valid_terms = 0
+        step_loss_val = 0.0
+        denom = float(max(1, len(candidates)))
         for (completion, comp_len, _), adv_val in zip(candidates, advs):
             with torch.no_grad(), model.disable_adapter():
                 ref_lp = _seq_logprob(model, tokenizer, prompt_msgs, completion, int(config.max_seq_tokens), dev)
             if ref_lp is None:
                 continue
+            ref_lp_val = ref_lp.detach()
+            del ref_lp
             model.train()
             pi_lp = _seq_logprob(model, tokenizer, prompt_msgs, completion, int(config.max_seq_tokens), dev)
             if pi_lp is None:
                 continue
-            d_lp = (pi_lp - ref_lp.detach()) / float(max(1, comp_len))
-            term_losses.append(-(adv_val * d_lp) + float(kl_coef) * (d_lp ** 2))
+            d_lp = (pi_lp - ref_lp_val) / float(max(1, comp_len))
+            term_loss = (-(adv_val * d_lp) + float(kl_coef) * (d_lp ** 2)) / denom
+            step_loss_val += float(term_loss.item())
+            term_loss.backward()
+            valid_terms += 1
+            del pi_lp, d_lp, term_loss, ref_lp_val
 
-        if not term_losses:
+        if valid_terms == 0:
             continue
-        loss = sum(term_losses) / float(len(term_losses))
-        loss.backward()
-        losses.append(float(loss.item()))
+        losses.append(step_loss_val)
         torch.nn.utils.clip_grad_norm_(trainable, 1.0)
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
@@ -774,29 +831,36 @@ def train_downsize_student(config: StudentTrainConfig) -> dict[str, Any]:
         return prov
 
     # Real HF PyTorch training on Colab A100/L4/T4
+    import gc
+
     import torch  # type: ignore[import-not-found]
     from transformers import AutoTokenizer  # type: ignore[import-not-found]
     from selfrewrite.backends.hf_gpu_backend import load_hf_model
 
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     profile = get_profile(config.profile_name)
+    eff_cfg = replace(config, max_seq_tokens=min(int(config.max_seq_tokens), 3072)) if profile.vram_gb <= 24 else config
     dtype = torch.bfloat16 if profile.dtype == "bfloat16" else torch.float16
-    tok = AutoTokenizer.from_pretrained(config.base_model_id, trust_remote_code=True)
+    tok = AutoTokenizer.from_pretrained(eff_cfg.base_model_id, trust_remote_code=True)
     tok.padding_side = "left"
     if tok.pad_token_id is None and tok.eos_token_id is not None:
         tok.pad_token_id = tok.eos_token_id
 
     model = load_hf_model(
-        config.base_model_id,
+        eff_cfg.base_model_id,
         torch_dtype=dtype,
-        device_map="auto" if "cuda" in profile.device else "cpu",
+        device_map={"": 0} if "cuda" in profile.device else "cpu",
         trust_remote_code=True,
     )
-    lora_model, adapter_kind = _attach_lora_for_training(model, config)
-    sft_res = run_hf_sft_stage(lora_model, tok, sft_rows, config)
-    dpo_res = run_hf_dpo_stage(lora_model, tok, dpo_rows, config)
+    lora_model, adapter_kind = _attach_lora_for_training(model, eff_cfg)
+    sft_res = run_hf_sft_stage(lora_model, tok, sft_rows, eff_cfg)
+    dpo_res = run_hf_dpo_stage(lora_model, tok, dpo_rows, eff_cfg)
     rlvr_res = (
-        run_hf_rlvr_stage(lora_model, tok, rlvr_rows, config)
-        if config.run_rlvr
+        run_hf_rlvr_stage(lora_model, tok, rlvr_rows, eff_cfg)
+        if eff_cfg.run_rlvr
         else {"stage": "rlvr", "steps": 0, "skipped": True}
     )
     provenance["stages"] = {
@@ -804,5 +868,11 @@ def train_downsize_student(config: StudentTrainConfig) -> dict[str, Any]:
         "dpo": dpo_res,
         "rlvr": rlvr_res,
     }
-    merge_and_freeze_student(lora_model, tok, config.output_dir, provenance, adapter_kind=adapter_kind)
+    merge_and_freeze_student(lora_model, tok, eff_cfg.output_dir, provenance, adapter_kind=adapter_kind)
+
+    del lora_model, model, tok
+    gc.collect()
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     return provenance

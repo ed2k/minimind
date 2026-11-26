@@ -237,23 +237,47 @@ def outlier_ratios(tensors_by_name: dict[str, Any]) -> dict[str, dict[str, float
     """Compute max(|W|), median(|W|), std, and max/median ratio per weight tensor."""
     report: dict[str, dict[str, float]] = {}
     for name, tensor in tensors_by_name.items():
+        if isinstance(tensor, tuple):
+            raise TypeError(
+                f"outlier_ratios expects weight tensors (e.g. {{nm: load_original(nm)}}), got shape tuple for {name!r}"
+            )
         kind = _container_kind(tensor)
         if kind == "torch":
             import torch  # type: ignore[import-not-found]
 
-            tf = tensor.detach().float()
-            abs_t = tf.abs()
-            max_abs = float(abs_t.max().item()) if tf.numel() else 0.0
-            med_abs = float(abs_t.median().item()) if tf.numel() else 0.0
-            std_val = float(tf.std(unbiased=False).item()) if tf.numel() > 1 else 0.0
+            t = tensor.detach()
+            n = int(t.numel())
+            max_abs = float(t.abs().max().item()) if n else 0.0
+            if n == 0:
+                med_abs = 0.0
+                std_val = 0.0
+            elif n <= 262_144:
+                tf = t.float()
+                med_abs = float(tf.abs().median().item())
+                std_val = float(tf.std(unbiased=False).item()) if n > 1 else 0.0
+            else:
+                step = max(1, n // 262_144)
+                sub = t.reshape(-1)[::step].float()
+                med_abs = float(sub.abs().median().item())
+                std_val = float(sub.std(unbiased=False).item()) if sub.numel() > 1 else 0.0
         elif kind == "numpy":
             import numpy as np  # type: ignore[import-not-found]
 
-            arr = np.asarray(tensor, dtype="float64")
-            abs_a = np.abs(arr)
-            max_abs = float(abs_a.max()) if arr.size else 0.0
-            med_abs = float(np.median(abs_a)) if arr.size else 0.0
-            std_val = float(arr.std()) if arr.size > 1 else 0.0
+            arr = np.asarray(tensor)
+            n = int(arr.size)
+            max_abs = float(np.abs(arr).max()) if n else 0.0
+            if n == 0:
+                med_abs = 0.0
+                std_val = 0.0
+            elif n <= 262_144:
+                af = np.asarray(arr, dtype="float64")
+                med_abs = float(np.median(np.abs(af)))
+                std_val = float(af.std()) if n > 1 else 0.0
+            else:
+                step = max(1, n // 262_144)
+                sub = np.asarray(arr.reshape(-1)[::step], dtype="float64")
+                med_abs = float(np.median(np.abs(sub)))
+                std_val = float(sub.std()) if sub.size > 1 else 0.0
         else:
             vals = flatten_floats(tensor)
             abs_vals = [abs(v) for v in vals]
@@ -279,21 +303,43 @@ def clip_outliers_median(W: Any, factor: float = 15.0) -> Any:
     if kind == "torch":
         import torch  # type: ignore[import-not-found]
 
-        wf = W.detach().float()
-        med = float(wf.abs().median().item())
+        t = W.detach()
+        n = int(t.numel())
+        if n == 0:
+            return W.clone()
+        if n <= 262_144:
+            wf = t.float()
+            med = float(wf.abs().median().item())
+            if med <= 1e-12:
+                return W.clone()
+            bound = float(factor) * med
+            return torch.clamp(wf, min=-bound, max=bound).to(dtype=W.dtype, device=W.device)
+        step = max(1, n // 262_144)
+        med = float(t.reshape(-1)[::step].float().abs().median().item())
         if med <= 1e-12:
             return W.clone()
         bound = float(factor) * med
-        return torch.clamp(wf, min=-bound, max=bound).to(dtype=W.dtype, device=W.device)
+        return torch.clamp(t.float(), min=-bound, max=bound).to(dtype=W.dtype, device=W.device)
     if kind == "numpy":
         import numpy as np  # type: ignore[import-not-found]
 
-        arr = np.asarray(W, dtype="float64")
-        med = float(np.median(np.abs(arr)))
+        arr = np.asarray(W)
+        n = int(arr.size)
+        if n == 0:
+            return W.copy()
+        if n <= 262_144:
+            af = np.asarray(arr, dtype="float64")
+            med = float(np.median(np.abs(af)))
+            if med <= 1e-12:
+                return W.copy()
+            bound = float(factor) * med
+            return np.clip(af, -bound, bound).astype(W.dtype)
+        step = max(1, n // 262_144)
+        med = float(np.median(np.abs(np.asarray(arr.reshape(-1)[::step], dtype="float64"))))
         if med <= 1e-12:
             return W.copy()
         bound = float(factor) * med
-        return np.clip(arr, -bound, bound).astype(W.dtype)
+        return np.clip(np.asarray(arr, dtype="float64"), -bound, bound).astype(W.dtype)
 
     vals = flatten_floats(W)
     med = float(statistics.median(abs(v) for v in vals)) if vals else 0.0

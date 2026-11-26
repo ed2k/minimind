@@ -23,10 +23,9 @@ def extract_last_boxed(text: str, after_think: bool = True) -> str | None:
     """Extract the content of the last balanced \\boxed{...} expression."""
     raw = text or ""
     if after_think:
-        if "</think>" in raw:
-            raw = raw.rsplit("</think>", 1)[1]
-        elif "<think>" in raw.lower():
+        if "</think>" not in raw:
             return None
+        raw = raw.rsplit("</think>", 1)[1]
 
     last_content: str | None = None
     pos = 0

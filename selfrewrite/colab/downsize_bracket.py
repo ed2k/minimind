@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import gc
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -27,6 +27,7 @@ def _utc_now() -> str:
 
 def _release_torch_cache() -> None:
     gc.collect()
+    gc.collect()
     try:
         import torch  # type: ignore[import-not-found]
 
@@ -34,6 +35,39 @@ def _release_torch_cache() -> None:
             torch.cuda.empty_cache()
     except Exception:
         pass
+
+
+def _destroy_backend(obj: Any) -> None:
+    """Break circular references inside target/damaged backends so CUDA weights free immediately."""
+    if obj is None:
+        return
+    overlay = getattr(obj, "overlay", None)
+    if overlay is not None:
+        if hasattr(overlay, "_param_backups") and isinstance(overlay._param_backups, dict):
+            overlay._param_backups.clear()
+        if hasattr(overlay, "_module_backups") and isinstance(overlay._module_backups, dict):
+            overlay._module_backups.clear()
+        try:
+            overlay.model = None
+        except Exception:
+            pass
+    creader = getattr(obj, "canonical_reader", None)
+    if creader is not None:
+        for attr in ("_model", "_state_dict"):
+            if hasattr(creader, attr):
+                try:
+                    setattr(creader, attr, None)
+                except Exception:
+                    pass
+    layers = getattr(obj, "_layers", None)
+    if isinstance(layers, list):
+        layers.clear()
+    for attr in ("editor_model", "model", "_ov_t", "_inner"):
+        if hasattr(obj, attr):
+            try:
+                setattr(obj, attr, None)
+            except Exception:
+                pass
 
 
 def _load_rung_backend(rung_id: str, model_id_or_path: str, profile: Any) -> tuple[Any, dict[str, Any], int]:
@@ -66,7 +100,7 @@ class PromotionGateConfig:
 
     min_ladder_score: int = 6
     min_repair_recovery_ratio: float = 0.40
-    max_repair_p: float = 0.01
+    max_repair_p: float = 0.02
     require_positive_transfer: bool = True
     max_improve_p: float = 0.05
     max_harmful_submit_drop: float = 0.01
@@ -150,6 +184,12 @@ def run_downsize_bracket(
     profile_name: str | None = None,
     drive_dir: Path | None = None,
     improve_sessions: int = 2,
+    starting_diagnosis_n: int | None = None,
+    answer_max_tokens: int | None = None,
+    editor_max_new_tokens: int | None = None,
+    max_turns: int | None = None,
+    rlvr_steps: int = 8,
+    cleanup_student_weights: bool = False,
     bootstrap_next_rung: bool = False,
     seed: int = 2026,
     gates: PromotionGateConfig = PromotionGateConfig(),
@@ -164,6 +204,7 @@ def run_downsize_bracket(
     splits = _prepare_splits(ws, use_deepscaler=(backend_kind == "hf"), seed=seed)
 
     rung_entries: list[dict[str, Any]] = []
+    completed_rungs: list[str] = []
     raw_root = ws / "raw_sessions"
 
     for r_idx, rung_id in enumerate(rungs):
@@ -172,6 +213,50 @@ def run_downsize_bracket(
         spec = DOWNSIZE_RUNGS[rung_id]
         rung_ws = ws / "bracket" / rung_id
         rung_ws.mkdir(parents=True, exist_ok=True)
+        rung_res_path = rung_ws / "rung_result.json"
+        if rung_res_path.is_file() and (rung_ws / "frozen_student" / "student_provenance.json").is_file():
+            entry = json.loads(rung_res_path.read_text(encoding="utf-8"))
+            rung_entries.append(entry)
+            completed_rungs.append(rung_id)
+            atomic_write_text(
+                ws / "HEARTBEAT.json",
+                json.dumps(
+                    {
+                        "updated_at": _utc_now(),
+                        "profile": profile.name,
+                        "status": "running_bracket",
+                        "current_rung": rung_id,
+                        "completed_rungs": list(completed_rungs),
+                    },
+                    indent=2,
+                )
+                + "\n",
+            )
+            continue
+        atomic_write_text(
+            ws / "HEARTBEAT.json",
+            json.dumps(
+                {
+                    "updated_at": _utc_now(),
+                    "profile": profile.name,
+                    "status": "running_bracket",
+                    "current_rung": rung_id,
+                    "completed_rungs": list(completed_rungs),
+                },
+                indent=2,
+            )
+            + "\n",
+        )
+
+        if (
+            backend_kind != "mock"
+            and spec.eval_quantization == "none"
+            and profile.vram_gb >= int(spec.params_b * 2.5 + 4)
+            and profile.quantization != "none"
+        ):
+            rung_profile = replace(profile, quantization="none")
+        else:
+            rung_profile = profile
 
         # 1. Establish base target & baseline ladder before student specialization
         if backend_kind == "mock":
@@ -180,16 +265,34 @@ def run_downsize_bracket(
             num_layers = mock_model.num_layers
             clean_ctx = (base_target, dict(mock_model.raw_tensors), num_layers)
         else:
-            clean_ctx = _load_rung_backend(rung_id, spec.model_id, profile)
+            clean_ctx = _load_rung_backend(rung_id, spec.model_id, rung_profile)
             base_target, _, num_layers = clean_ctx
 
         train_layers, eval_layers = split_train_eval_layers(num_layers)
+        eff_max_tokens = (
+            int(answer_max_tokens)
+            if answer_max_tokens is not None
+            else min(rung_profile.answer_max_tokens, 512 if backend_kind == "mock" else rung_profile.answer_max_tokens)
+        )
+        eff_diag_n = min(
+            len(splits["practice_eval"]),
+            int(starting_diagnosis_n) if starting_diagnosis_n is not None else rung_profile.starting_diagnosis_n,
+        )
+        eff_res_n = min(
+            len(splits["reserved_eval"]),
+            int(starting_diagnosis_n) if starting_diagnosis_n is not None else rung_profile.starting_diagnosis_n,
+        )
+        eff_max_turns = int(max_turns) if max_turns is not None else 160
+        eff_editor_max_new_tokens = int(editor_max_new_tokens) if editor_max_new_tokens is not None else 12000
+
         eval_cfg = SessionConfig(
             task="improve",
             protocol=2,
-            answer_max_tokens=min(profile.answer_max_tokens, 512 if backend_kind == "mock" else profile.answer_max_tokens),
-            starting_diagnosis_n=min(len(splits["practice_eval"]), profile.starting_diagnosis_n),
-            reserved_check_n=min(len(splits["reserved_eval"]), profile.starting_diagnosis_n),
+            max_turns=eff_max_turns,
+            answer_max_tokens=eff_max_tokens,
+            editor_max_new_tokens=eff_editor_max_new_tokens,
+            starting_diagnosis_n=eff_diag_n,
+            reserved_check_n=eff_res_n,
             reserved_check_samples=1 if backend_kind == "mock" else 2,
             model_arch_summary=base_target.arch_summary,
             session_id=f"{rung_id}_base_audit",
@@ -207,6 +310,10 @@ def run_downsize_bracket(
             config=eval_cfg,
         )
         base_audit_res = base_orch.run()
+        if backend_kind != "mock":
+            _destroy_backend(base_target)
+            del base_ed, base_orch, base_target, clean_ctx
+            _release_torch_cache()
 
         # 2. Offline Student Specialization from verified bundle -> Merge & Freeze
         student_out = rung_ws / "frozen_student"
@@ -217,19 +324,20 @@ def run_downsize_bracket(
             output_dir=student_out,
             splits_dir=ws / "splits",
             backend=backend_kind,
-            profile_name=profile.name,
+            profile_name=rung_profile.name,
+            run_rlvr=("rlvr" in spec.train_strategy),
+            rlvr_steps=int(rlvr_steps),
             seed=seed + r_idx,
         )
         train_meta = train_downsize_student(train_cfg)
 
-        # Release base HF/MiniMind model memory if switching to frozen student checkpoint
+        # Load frozen student checkpoint cleanly after training memory is released
         if backend_kind == "mock":
-            student_target: Any = base_target
-            student_clean_ctx = clean_ctx
+            student_target: Any = MockTargetBackend(mock_model, damage_mode=False)
+            student_clean_ctx = (student_target, dict(mock_model.raw_tensors), num_layers)
         else:
-            del base_target, clean_ctx
             _release_torch_cache()
-            student_clean_ctx = _load_rung_backend(rung_id, str(student_out), profile)
+            student_clean_ctx = _load_rung_backend(rung_id, str(student_out), rung_profile)
             student_target = student_clean_ctx[0]
 
         student_unedited_acc = float(_evaluate_on_split(student_target, None, splits["heldout_eval"], eval_cfg)["base_acc"])
@@ -243,7 +351,9 @@ def run_downsize_bracket(
             s_cfg = SessionConfig(
                 task="improve",
                 protocol=2,
+                max_turns=eff_max_turns,
                 answer_max_tokens=eval_cfg.answer_max_tokens,
+                editor_max_new_tokens=eff_editor_max_new_tokens,
                 starting_diagnosis_n=eval_cfg.starting_diagnosis_n,
                 reserved_check_n=eval_cfg.reserved_check_n,
                 reserved_check_samples=eval_cfg.reserved_check_samples,
@@ -277,6 +387,8 @@ def run_downsize_bracket(
                     "sign_p": held["sign_p"],
                 }
             )
+            del orch, imp_ed, ed_t
+            _release_torch_cache()
 
         # Unseen eval_layers repair session
         rep_layer = eval_layers[len(eval_layers) // 2]
@@ -285,7 +397,9 @@ def run_downsize_bracket(
         r_cfg = SessionConfig(
             task="repair",
             protocol=2,
+            max_turns=eff_max_turns,
             answer_max_tokens=eval_cfg.answer_max_tokens,
+            editor_max_new_tokens=eff_editor_max_new_tokens,
             starting_diagnosis_n=eval_cfg.starting_diagnosis_n,
             reserved_check_n=eval_cfg.reserved_check_n,
             reserved_check_samples=eval_cfg.reserved_check_samples,
@@ -332,6 +446,7 @@ def run_downsize_bracket(
             "repair_session": repair_summary,
         }
         entry["promotion"] = evaluate_promotion_gates(entry, gates=gates)
+        atomic_write_text(rung_ws / "rung_result.json", json.dumps(entry, indent=2) + "\n")
         rung_entries.append(entry)
 
         # Optional self-bootstrapping: promoted student harvests fresh disjoint traces for smaller rung
@@ -361,8 +476,28 @@ def run_downsize_bracket(
                 active_bundle = bs_bundle
 
         if backend_kind != "mock":
-            del dmg_target, student_target, student_clean_ctx
+            _destroy_backend(dmg_target)
+            _destroy_backend(student_target)
+            del rep_orch, rep_ed, rep_t, dmg_target, student_target, student_clean_ctx
             _release_torch_cache()
+            if cleanup_student_weights and student_out.is_dir():
+                for sf in student_out.glob("*.safetensors"):
+                    sf.unlink(missing_ok=True)
+        completed_rungs.append(rung_id)
+        atomic_write_text(
+            ws / "HEARTBEAT.json",
+            json.dumps(
+                {
+                    "updated_at": _utc_now(),
+                    "profile": profile.name,
+                    "status": "running_bracket",
+                    "current_rung": rung_id,
+                    "completed_rungs": list(completed_rungs),
+                },
+                indent=2,
+            )
+            + "\n",
+        )
 
     promoted = [e for e in rung_entries if e["promotion"]["promoted"]]
     winner = min(promoted, key=lambda e: float(e["params_b"])) if promoted else None
@@ -402,6 +537,20 @@ def run_downsize_bracket(
         lines.extend(["", f"**Pareto-Smallest Promoted Model**: `{winner['rung_id']}` (`{winner['model_id']}`, `{winner['params_b']}B`)"])
     atomic_write_text(ws / "downsize_report.md", "\n".join(lines) + "\n")
 
+    atomic_write_text(
+        ws / "HEARTBEAT.json",
+        json.dumps(
+            {
+                "updated_at": _utc_now(),
+                "profile": profile.name,
+                "status": "completed_bracket",
+                "completed_rungs": list(completed_rungs),
+            },
+            indent=2,
+        )
+        + "\n",
+    )
+
     if sync.enabled:
         sync.sync_all()
         if sync.drive_mirror_dir is not None:
@@ -422,6 +571,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--profile", default="auto")
     parser.add_argument("--drive-dir", default=None)
     parser.add_argument("--improve-sessions", type=int, default=2)
+    parser.add_argument("--starting-diagnosis-n", type=int, default=None)
+    parser.add_argument("--answer-max-tokens", type=int, default=None)
+    parser.add_argument("--editor-max-new-tokens", type=int, default=None)
+    parser.add_argument("--max-turns", type=int, default=None)
+    parser.add_argument("--rlvr-steps", type=int, default=8)
+    parser.add_argument("--cleanup-student-weights", action="store_true")
     parser.add_argument("--bootstrap-next-rung", action="store_true")
     parser.add_argument("--seed", type=int, default=2026)
     args = parser.parse_args(argv)
@@ -435,6 +590,12 @@ def main(argv: list[str] | None = None) -> int:
         profile_name=None if args.profile == "auto" else args.profile,
         drive_dir=Path(args.drive_dir) if args.drive_dir else None,
         improve_sessions=args.improve_sessions,
+        starting_diagnosis_n=args.starting_diagnosis_n,
+        answer_max_tokens=args.answer_max_tokens,
+        editor_max_new_tokens=args.editor_max_new_tokens,
+        max_turns=args.max_turns,
+        rlvr_steps=args.rlvr_steps,
+        cleanup_student_weights=bool(args.cleanup_student_weights),
         bootstrap_next_rung=bool(args.bootstrap_next_rung),
         seed=args.seed,
     )

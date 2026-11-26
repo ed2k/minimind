@@ -60,16 +60,32 @@ def _evaluate_on_split(
     return {k: v for k, v in stats.items() if k != "per_problem_diffs"}
 
 
-def _prepare_splits(workspace_dir: Path, use_deepscaler: bool, seed: int = 2026) -> dict[str, list[Problem]]:
+def _prepare_splits(
+    workspace_dir: Path,
+    use_deepscaler: bool,
+    seed: int = 2026,
+    max_problems_per_split: int | None = None,
+) -> dict[str, list[Problem]]:
     splits_dir = workspace_dir / "splits"
     names = ("heldout_eval", "reserved_eval", "practice_eval", "distill_train", "transfer_eval")
     if all((splits_dir / f"{n}.jsonl").is_file() for n in names):
         return {n: load_jsonl_problems(splits_dir / f"{n}.jsonl") for n in names}
 
     if use_deepscaler:
-        splits = load_deepscaler_splits(seed=seed)
-        builtin = build_builtin_suites(seed=seed, practice_n=8, reserved_n=8, heldout_n=8, distill_n=8, transfer_n=32)
-        splits["transfer_eval"] = builtin["transfer_eval"]
+        try:
+            splits = load_deepscaler_splits(seed=seed)
+            builtin = build_builtin_suites(seed=seed, practice_n=8, reserved_n=8, heldout_n=8, distill_n=8, transfer_n=32)
+            splits["transfer_eval"] = builtin["transfer_eval"]
+        except Exception as exc:
+            print(f"[colab_launcher] DeepScaleR load failed ({exc}); falling back to builtin suites", flush=True)
+            splits = build_builtin_suites(
+                seed=seed,
+                practice_n=28,
+                reserved_n=16,
+                heldout_n=28,
+                distill_n=28,
+                transfer_n=16,
+            )
     else:
         splits = build_builtin_suites(
             seed=seed,
@@ -79,6 +95,13 @@ def _prepare_splits(workspace_dir: Path, use_deepscaler: bool, seed: int = 2026)
             distill_n=28,
             transfer_n=16,
         )
+
+    if max_problems_per_split is not None and int(max_problems_per_split) > 0:
+        cap = int(max_problems_per_split)
+        splits = {
+            k: (v[: max(8, int(cap * 4 // 3))] if k == "distill_train" else v[:cap])
+            for k, v in splits.items()
+        }
 
     for n, plist in splits.items():
         save_jsonl_problems(splits_dir / f"{n}.jsonl", plist)
@@ -241,9 +264,12 @@ def run_reproduce_and_harvest_pipeline(
     num_harvest_improve: int = 2,
     num_harvest_repair: int = 2,
     use_programmatic_teacher: bool = False,
+    hybrid_harvest_teacher: bool = False,
     starting_diagnosis_n: int | None = None,
     answer_max_tokens: int | None = None,
+    editor_max_new_tokens: int | None = None,
     max_turns: int | None = None,
+    max_problems_per_split: int | None = None,
     use_builtin_splits: bool = False,
     canary_max_problems: int | None = None,
     fast_harvest_profile: bool = False,
@@ -255,7 +281,7 @@ def run_reproduce_and_harvest_pipeline(
     profile = get_profile(profile_name)
     harvest_profile = (
         get_profile(f"{profile.name}_harvest")
-        if fast_harvest_profile and profile.name in ("colab_a100_80g", "colab_a100_40g")
+        if fast_harvest_profile and profile.name in ("colab_a100_80g", "colab_a100_40g", "colab_l4")
         else profile
     )
     sync = DriveMirrorSync(ws, drive_dir)
@@ -264,7 +290,12 @@ def run_reproduce_and_harvest_pipeline(
         restore_res = sync.restore_from_drive()
         restored_from_drive = bool(restore_res.get("restored"))
 
-    splits = _prepare_splits(ws, use_deepscaler=(backend_kind == "hf" and not use_builtin_splits), seed=seed)
+    splits = _prepare_splits(
+        ws,
+        use_deepscaler=(backend_kind == "hf" and not use_builtin_splits),
+        seed=seed,
+        max_problems_per_split=max_problems_per_split,
+    )
     if canary_max_problems is not None and int(canary_max_problems) > 0:
         cap = int(canary_max_problems)
         splits = {
@@ -298,17 +329,21 @@ def run_reproduce_and_harvest_pipeline(
         s_seed: int = 0,
         run_heldout_eval: bool = True,
         step_profile: ComputeProfile | None = None,
+        editor_mode: str = "autonomous_llm",
     ) -> dict[str, Any]:
         eff_prof = step_profile or profile
         s_dir = raw_root / sid
         res_file = s_dir / "session_result.json"
         eval_file = s_dir / "eval_result.json"
-        if restored_from_drive and res_file.is_file() and (not run_heldout_eval or eval_file.is_file()):
+        ladder_file = s_dir / "ladder_score.json"
+        if res_file.is_file() and (not run_heldout_eval or eval_file.is_file()):
             res = json.loads(res_file.read_text(encoding="utf-8"))
             if eval_file.is_file() and run_heldout_eval:
                 res["heldout_eval"] = json.loads(eval_file.read_text(encoding="utf-8"))
             else:
                 res.setdefault("heldout_eval", None)
+            if ladder_file.is_file():
+                res["ladder"] = json.loads(ladder_file.read_text(encoding="utf-8"))
             recorded_sessions.append(res)
             return res
 
@@ -327,14 +362,16 @@ def run_reproduce_and_harvest_pipeline(
             int(starting_diagnosis_n) if starting_diagnosis_n is not None else eff_prof.starting_diagnosis_n,
         )
         eff_max_turns = int(max_turns) if max_turns is not None else 160
+        eff_editor_max_new_tokens = int(editor_max_new_tokens) if editor_max_new_tokens is not None else 12000
         cfg = SessionConfig(
             task=task,
             protocol=2,
             max_turns=eff_max_turns,
             answer_max_tokens=eff_max_tokens,
+            editor_max_new_tokens=eff_editor_max_new_tokens,
             starting_diagnosis_n=eff_diag_n,
             reserved_check_n=eff_res_n,
-            reserved_check_samples=1 if backend_kind == "mock" else 2,
+            reserved_check_samples=1 if (backend_kind == "mock" or eff_prof.name.endswith("_harvest")) else 2,
             model_arch_summary=target_backend.arch_summary,
             session_id=sid,
             seed=s_seed,
@@ -350,6 +387,7 @@ def run_reproduce_and_harvest_pipeline(
                 "model_id": model_id,
                 "backend_kind": backend_kind,
                 "profile": eff_prof.name,
+                "editor_mode": editor_mode,
                 "corruption_spec": corruption_spec.to_dict() if hasattr(corruption_spec, "to_dict") else corruption_spec,
             },
         )
@@ -402,6 +440,11 @@ def run_reproduce_and_harvest_pipeline(
 
     # Batch 1: Reference Reproduction on unseen practice_eval / reserved_eval / heldout_eval / eval_layers
     if do_reproduce:
+        rep_editor_mode = (
+            "mechanistic_teacher_on_real_target"
+            if (backend_kind == "mock" or use_programmatic_teacher)
+            else "autonomous_llm"
+        )
         for i in range(num_reproduce_improve):
             ed = ProgrammaticImproveEditor(alpha=0.25 if i % 2 == 0 else 0.0) if (backend_kind == "mock" or use_programmatic_teacher) else clean_target
             if isinstance(ed, ProgrammaticImproveEditor) and i > 0:
@@ -417,6 +460,7 @@ def run_reproduce_and_harvest_pipeline(
                 reserved_list=splits["reserved_eval"],
                 eval_list=splits["heldout_eval"],
                 s_seed=seed + i,
+                editor_mode=rep_editor_mode,
             )
 
         rep_layer = eval_layers[len(eval_layers) // 2]
@@ -435,6 +479,7 @@ def run_reproduce_and_harvest_pipeline(
             transfer_list=splits["transfer_eval"],
             corruption_spec=dmg_spec,
             s_seed=seed + 50,
+            editor_mode=rep_editor_mode,
         )
 
     # Batch 2: Disjoint Distillation Data Harvesting on distill_train & train_layers
@@ -445,11 +490,24 @@ def run_reproduce_and_harvest_pipeline(
         distill_reserved = distill_all[mid:]
 
         for i in range(num_harvest_improve):
-            # Mix genuine positive edits and deliberate calibrated-withdraw sessions (force_wrong_alpha=-0.3)
+            # Mix genuine positive edits and deliberate calibrated-withdraw sessions (force_wrong_alpha=-0.35)
             if backend_kind == "mock" or use_programmatic_teacher:
                 ed = ProgrammaticImproveEditor(alpha=0.25) if i < max(1, num_harvest_improve - 1) else ProgrammaticImproveEditor(force_wrong_alpha=-0.35)
+                ed_mode = "mechanistic_teacher_on_real_target"
+            elif hybrid_harvest_teacher:
+                if i == 0:
+                    ed = clean_target
+                    ed_mode = "autonomous_llm"
+                else:
+                    ed = (
+                        ProgrammaticImproveEditor(force_wrong_alpha=-0.35)
+                        if (num_harvest_improve >= 3 and i == num_harvest_improve - 1)
+                        else ProgrammaticImproveEditor(alpha=0.25)
+                    )
+                    ed_mode = "mechanistic_teacher_on_real_target"
             else:
                 ed = clean_target
+                ed_mode = "autonomous_llm"
             _run_one(
                 sid=f"harvest_improve_{i:02d}",
                 split_tag="distill_train",
@@ -462,6 +520,7 @@ def run_reproduce_and_harvest_pipeline(
                 s_seed=seed + 200 + i,
                 run_heldout_eval=False,
                 step_profile=harvest_profile,
+                editor_mode=ed_mode,
             )
 
         for i in range(num_harvest_repair):
@@ -475,7 +534,19 @@ def run_reproduce_and_harvest_pipeline(
                 seed=seed + 300 + i,
                 sigma_mult=200.0 if i % 2 == 0 else 150.0,
             )
-            ed_r = ProgrammaticRepairEditor() if (backend_kind == "mock" or use_programmatic_teacher) else clean_target
+            if backend_kind == "mock" or use_programmatic_teacher:
+                ed_r: Any = ProgrammaticRepairEditor()
+                ed_r_mode = "mechanistic_teacher_on_real_target"
+            elif hybrid_harvest_teacher:
+                if i == 0:
+                    ed_r = dmg_t
+                    ed_r_mode = "autonomous_llm"
+                else:
+                    ed_r = ProgrammaticRepairEditor()
+                    ed_r_mode = "mechanistic_teacher_on_real_target"
+            else:
+                ed_r = dmg_t
+                ed_r_mode = "autonomous_llm"
             _run_one(
                 sid=f"harvest_repair_{i:02d}",
                 split_tag="distill_train",
@@ -489,6 +560,7 @@ def run_reproduce_and_harvest_pipeline(
                 s_seed=seed + 300 + i,
                 run_heldout_eval=False,
                 step_profile=harvest_profile,
+                editor_mode=ed_r_mode,
             )
 
         # Capture authentic small-model failure sessions on distill_train for DPO negative pairs
@@ -505,6 +577,7 @@ def run_reproduce_and_harvest_pipeline(
                 s_seed=seed + 500,
                 run_heldout_eval=False,
                 step_profile=harvest_profile,
+                editor_mode="failure_negative",
             )
 
     bundle_res: dict[str, Any] = {}
@@ -591,9 +664,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--num-harvest-improve", type=int, default=4)
     parser.add_argument("--num-harvest-repair", type=int, default=4)
     parser.add_argument("--programmatic-teacher", action="store_true")
+    parser.add_argument("--hybrid-harvest-teacher", action="store_true")
     parser.add_argument("--starting-diagnosis-n", type=int, default=None)
     parser.add_argument("--answer-max-tokens", type=int, default=None)
+    parser.add_argument("--editor-max-new-tokens", type=int, default=None)
     parser.add_argument("--max-turns", type=int, default=None)
+    parser.add_argument("--max-problems-per-split", type=int, default=None)
     parser.add_argument("--use-builtin-splits", action="store_true")
     parser.add_argument("--fast-harvest-profile", action="store_true")
     parser.add_argument("--bootstrap-next-rung", action="store_true")
@@ -634,6 +710,10 @@ def main(argv: list[str] | None = None) -> int:
             backend_kind=args.backend,
             profile_name=None if args.profile == "auto" else args.profile,
             drive_dir=drive_dir,
+            starting_diagnosis_n=args.starting_diagnosis_n,
+            answer_max_tokens=args.answer_max_tokens,
+            editor_max_new_tokens=args.editor_max_new_tokens,
+            max_turns=args.max_turns,
             bootstrap_next_rung=bool(args.bootstrap_next_rung),
             seed=args.seed,
         )
@@ -651,9 +731,12 @@ def main(argv: list[str] | None = None) -> int:
         num_harvest_improve=args.num_harvest_improve,
         num_harvest_repair=args.num_harvest_repair,
         use_programmatic_teacher=bool(args.programmatic_teacher),
+        hybrid_harvest_teacher=bool(args.hybrid_harvest_teacher),
         starting_diagnosis_n=args.starting_diagnosis_n,
         answer_max_tokens=args.answer_max_tokens,
+        editor_max_new_tokens=args.editor_max_new_tokens,
         max_turns=args.max_turns,
+        max_problems_per_split=args.max_problems_per_split,
         use_builtin_splits=bool(args.use_builtin_splits),
         fast_harvest_profile=bool(args.fast_harvest_profile),
         seed=args.seed,

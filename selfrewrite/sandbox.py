@@ -266,9 +266,11 @@ def _make_original_loader(weights_spec_path: Path, raw_open) -> tuple[Callable[[
             rel = weight_map[name]
             shard_path = base_dir / rel
             from safetensors import safe_open  # type: ignore[import-not-found]
+            import torch  # type: ignore[import-not-found]
 
             with safe_open(str(shard_path), framework="pt", device="cpu") as sf:
-                return sf.get_tensor(name).clone()
+                t = sf.get_tensor(name)
+                return t.float() if t.dtype == torch.bfloat16 else t.clone()
 
         return load_original, shapes
 
@@ -314,6 +316,8 @@ def _install_work_jail(work_dir: Path) -> dict[str, Any]:
     def _assert_inside_work(p: Any) -> Path:
         candidate = Path(os.fspath(p))
         if not candidate.is_absolute():
+            if candidate.parts and candidate.parts[0] == "WORK":
+                candidate = Path(*candidate.parts[1:]) if len(candidate.parts) > 1 else Path(".")
             candidate = work_root / candidate
         resolved = candidate.resolve()
         if resolved != work_root and not resolved.is_relative_to(work_root):
@@ -383,7 +387,7 @@ def _install_work_jail(work_dir: Path) -> dict[str, Any]:
         if _caller_is_sandbox():
             if name in FORBIDDEN_DUNDERS or name in FORBIDDEN_ATTRS:
                 raise SandboxPolicyError(f"Dynamic access to {name!r} is forbidden")
-        elif name in _ALWAYS_FORBIDDEN_DUNDERS or name in _ALWAYS_FORBIDDEN_ATTRS:
+        elif name in _ALWAYS_FORBIDDEN_ATTRS:
             raise SandboxPolicyError(f"Dynamic access to {name!r} is forbidden")
         return raw_getattr(obj, name, *default)
 

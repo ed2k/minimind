@@ -72,41 +72,41 @@ def deduplicate_splits(splits: dict[str, list[Problem]]) -> dict[str, list[Probl
 def _make_disjoint_math_problem(split_tag: str, idx: int, rng: random.Random) -> Problem:
     # Disjoint offset bands per split guarantee zero algebraic collision even under normalization.
     band = {
-        "heldout_eval": 7000,
-        "reserved_eval": 5000,
-        "practice_eval": 3000,
-        "distill_train": 1000,
-    }.get(split_tag, 9000)
+        "heldout_eval": 700,
+        "reserved_eval": 500,
+        "practice_eval": 300,
+        "distill_train": 100,
+    }.get(split_tag, 900)
 
     kind = idx % 3
     pid = f"{split_tag}_{idx:04d}"
     if kind == 0:
-        a = band + idx * 7 + rng.randint(1, 5)
-        b = 11 + (idx % 19)
-        c = 13 + (idx % 23)
+        a = band + idx * 3 + rng.randint(1, 3)
+        b = 6 + (idx % 9)
+        c = 5 + (idx % 13)
         ans = a * b + c
         q = (
             f"Compute the exact value of {a} * {b} + {c}. "
-            "Please reason step by step, and put your final answer within \\boxed{}."
+            "Do not show steps in your final reply; output only the final number inside \\boxed{}."
         )
     elif kind == 1:
-        x = band // 10 + idx + rng.randint(2, 9)
-        k = 3 + (idx % 7)
-        rhs = k * x + (17 + idx % 13)
-        b_term = rhs - k * x
+        x = band + idx * 2 + rng.randint(1, 2)
+        k = 3 + (idx % 6)
+        b_term = 11 + (idx % 13)
+        rhs = k * x + b_term
         ans = x
         q = (
             f"Solve for x: {k}*x + {b_term} = {rhs}. "
-            "Please reason step by step, and put your final answer within \\boxed{}."
+            "Do not show steps in your final reply; output only the final number inside \\boxed{}."
         )
     else:
-        n = 5 + (idx % 14)
+        n = 4 + (idx % 7)
         base_m = band + idx * 3
         total = n * (2 * base_m + (n - 1)) // 2
         ans = total
         q = (
             f"Find the sum of the {n} consecutive integers starting at {base_m}. "
-            "Please reason step by step, and put your final answer within \\boxed{}."
+            "Do not show steps in your final reply; output only the final number inside \\boxed{}."
         )
 
     return Problem(
@@ -126,15 +126,15 @@ def _make_transfer_problem(idx: int) -> Problem:
         vals = [idx + 3, idx + 7, idx + 11, idx + 19]
         ans = sum(v * v for v in vals if v % 2 == 1)
         q = (
-            f"Given the Python list `nums = {vals}`, compute `sum(v*v for v in nums if v % 2 == 1)` "
-            "and put your final answer within \\boxed{}."
+            f"Given the Python list `nums = {vals}`, compute `sum(v*v for v in nums if v % 2 == 1)`. "
+            "Do not show steps in your final reply; output only the final number inside \\boxed{}."
         )
     else:
         a = 100 + idx * 5
         b = 4 + (idx % 9)
         q = (
             f"What does the Python expression `({a} // {b}) + ({a} % {b})` evaluate to? "
-            "Put your final answer within \\boxed{}."
+            "Do not show steps in your final reply; output only the final number inside \\boxed{}."
         )
         ans = (a // b) + (a % b)
     return Problem(

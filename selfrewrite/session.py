@@ -133,8 +133,16 @@ class SessionOrchestrator:
 
     def _select_problems(self, req: dict[str, Any]) -> list[dict[str, Any]]:
         by_id = {str(p["problem_id"]): p for p in self.practice}
-        if req.get("problem_ids"):
-            selected = [by_id[str(pid)] for pid in req["problem_ids"] if str(pid) in by_id]
+        if req.get("problem_ids") is not None:
+            selected: list[dict[str, Any]] = []
+            for pid in req["problem_ids"]:
+                spid = str(pid)
+                if spid in by_id:
+                    selected.append(by_id[spid])
+                elif isinstance(pid, int) and 0 <= pid < len(self.practice):
+                    selected.append(self.practice[pid])
+                elif spid.isdigit() and 0 <= int(spid) < len(self.practice):
+                    selected.append(self.practice[int(spid)])
             return selected
         count = int(req.get("count", min(16, len(self.practice))))
         offset = int(req.get("offset", 0))
@@ -223,13 +231,14 @@ class SessionOrchestrator:
             census_path = self.work_dir / "census.jsonl"
             if census_path.is_file():
                 c_rows = [json.loads(ln) for ln in census_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
-                ids = set(str(x) for x in (req.get("problem_ids") or []))
-                for r in c_rows:
-                    if not ids or str(r["problem_id"]) in ids:
+                raw_pids = req.get("problem_ids") or []
+                str_ids = set(str(x) for x in raw_pids)
+                int_ids = {int(x) for x in raw_pids if isinstance(x, int) or str(x).isdigit()}
+                for idx, r in enumerate(c_rows):
+                    if not raw_pids or str(r["problem_id"]) in str_ids or idx in int_ids:
                         texts.append(r["response_text"])
         elif req.get("problem_ids"):
-            by_id = {str(p["problem_id"]): p for p in self.practice}
-            texts = [by_id[str(pid)]["question"] for pid in req["problem_ids"] if str(pid) in by_id]
+            texts = [p["question"] for p in self._select_problems(req)]
 
         texts = texts[: self.config.read_max_texts]
         if not texts:
@@ -258,7 +267,15 @@ class SessionOrchestrator:
             import numpy as np  # type: ignore[import-not-found]
 
             out_npz = self.work_dir / f"read_{read_res.pass_id}.npz"
-            np_arrays = {k: np.asarray(to_nested_list(v), dtype="float32") for k, v in read_res.arrays.items()}
+            np_arrays = {}
+            for k, v in read_res.arrays.items():
+                dtype = "int64" if k.endswith("_lengths") else "float32"
+                if isinstance(v, np.ndarray):
+                    np_arrays[k] = v.astype(dtype, copy=False)
+                elif getattr(type(v), "__module__", "").startswith("torch"):
+                    np_arrays[k] = v.detach().cpu().numpy().astype(dtype, copy=False)
+                else:
+                    np_arrays[k] = np.asarray(to_nested_list(v), dtype=dtype)
             np.savez(str(out_npz), **np_arrays)
             return out_npz
         except Exception:

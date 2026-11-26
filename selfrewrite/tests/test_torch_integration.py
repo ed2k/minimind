@@ -472,6 +472,142 @@ class TestTorchIntegration(unittest.TestCase):
             self.assertTrue(prov["frozen_for_eval"])
             self.assertFalse(any(p.requires_grad for p in model.parameters()))
 
+    def test_local_dir_pretrained_and_fast_save_read_result(self) -> None:
+        from unittest.mock import patch
+
+        from selfrewrite.backends.base import ReadResult
+        from selfrewrite.backends.hf_gpu_backend import HFGPUBackend
+        from selfrewrite.config import ComputeProfile
+        from selfrewrite.session import SessionOrchestrator
+
+        model = _DummyLM()
+        tok = _DummyTokenizer()
+        prof = ComputeProfile(
+            name="test_cpu",
+            device="cpu",
+            dtype="float32",
+            quantization="none",
+            vram_gb=0,
+            editor_max_context=512,
+            answer_max_tokens=16,
+            starting_diagnosis_n=4,
+            gen_batch_size=2,
+            max_wall_time_sec=60,
+            tensor_storage="json",
+        )
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ckpt_dir = root / "frozen_student"
+            ckpt_dir.mkdir(parents=True, exist_ok=True)
+            if HAS_SAFETENSORS:
+                from safetensors.torch import save_file  # type: ignore[import-not-found]
+
+                save_file({k: v.detach().cpu() for k, v in model.state_dict().items()}, str(ckpt_dir / "model.safetensors"))
+
+            with (
+                patch("huggingface_hub.snapshot_download", side_effect=AssertionError("snapshot_download must not be called for local dir")),
+                patch("transformers.AutoTokenizer.from_pretrained", return_value=tok),
+                patch("selfrewrite.backends.hf_gpu_backend.load_hf_model", return_value=model),
+            ):
+                loaded = HFGPUBackend.from_pretrained(str(ckpt_dir), profile=prof)
+            self.assertGreater(len(loaded.tensor_shapes()), 0)
+
+            if HAS_NUMPY:
+                fake_orch = SimpleNamespace(work_dir=root / "WORK")
+                fake_orch.work_dir.mkdir(parents=True, exist_ok=True)
+                rr = ReadResult(
+                    pass_id=3,
+                    arrays={
+                        "layer_0_hidden": torch.randn(2, 4),
+                        "layer_0_hidden_lengths": np.array([2, 4], dtype=np.int64),
+                    },
+                    summary={},
+                )
+                out_npz = SessionOrchestrator._save_read_result(fake_orch, rr)
+                self.assertEqual(out_npz.suffix, ".npz")
+                with np.load(str(out_npz)) as z:
+                    self.assertEqual(z["layer_0_hidden"].dtype, np.float32)
+                    self.assertEqual(z["layer_0_hidden_lengths"].dtype, np.int64)
+                    self.assertEqual(z["layer_0_hidden_lengths"].tolist(), [2, 4])
+
+    def test_work_prefix_fast_outlier_helpers_and_eos_batch_trim(self) -> None:
+        import time
+        from unittest.mock import patch
+
+        from selfrewrite.backends.hf_gpu_backend import HFGPUBackend
+        from selfrewrite.config import ComputeProfile, SessionConfig
+        from selfrewrite.helpers import clip_outliers_median, outlier_ratios
+        from selfrewrite.sandbox import SealedPythonSandbox
+        from selfrewrite.tasks.datasets import Problem
+
+        # 1. Fast strided median path for >262,144 elements in outlier_ratios & clip_outliers_median
+        big = torch.ones((600, 600), dtype=torch.float32)
+        big[0, 0] = 500.0
+        t0 = time.monotonic()
+        stats = outlier_ratios({"big": big})
+        clipped = clip_outliers_median(big, factor=15.0)
+        self.assertLess(time.monotonic() - t0, 1.0)
+        self.assertGreater(stats["big"]["ratio_max_to_median"], 400.0)
+        self.assertLessEqual(float(clipped.abs().max().item()), 15.0 + 1e-4)
+
+        # 2. WORK/ relative path normalization in SealedPythonSandbox
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            work_dir = root / "WORK"
+            work_dir.mkdir(parents=True, exist_ok=True)
+            spec_path = root / "weights.json"
+            data_path = root / "weights.json.data"
+            data_path.write_text(json.dumps({"w": [[1.0, 2.0], [3.0, 4.0]]}), encoding="utf-8")
+            spec_path.write_text(
+                json.dumps({"mode": "json_tensors", "data_path": str(data_path), "shapes": {"w": [2, 2]}}),
+                encoding="utf-8",
+            )
+            sb = SealedPythonSandbox(work_dir, spec_path, timeout_sec=10.0)
+            try:
+                res = sb.run(
+                    "with open('WORK/notes.md', 'w', encoding='utf-8') as f:\n"
+                    "    f.write('hello work\\n')\n"
+                    "txt = Path('WORK/notes.md').read_text(encoding='utf-8')\n"
+                    "print('READ_OK', txt.strip())"
+                )
+                self.assertTrue(res["ok"], res)
+                self.assertIn("READ_OK hello work", res["output"])
+                self.assertTrue((work_dir / "notes.md").is_file())
+                self.assertFalse((work_dir / "WORK").exists())
+            finally:
+                sb.close()
+
+        # 3. EOS truncation in padded batch even when non-pad tokens appear after EOS
+        model = _DummyLM()
+        tok = _DummyTokenizer()
+        prof = ComputeProfile(
+            name="test_cpu",
+            device="cpu",
+            dtype="float32",
+            quantization="none",
+            vram_gb=0,
+            editor_max_context=512,
+            answer_max_tokens=16,
+            starting_diagnosis_n=4,
+            gen_batch_size=2,
+            max_wall_time_sec=60,
+            tensor_storage="json",
+        )
+        backend = HFGPUBackend(model=model, tokenizer=tok, profile=prof, model_id="dummy-lm")
+        cfg = SessionConfig(task="improve", protocol=2, answer_max_tokens=16, editor_max_new_tokens=16)
+
+        def _fake_generate(input_ids, **kwargs):
+            bsz = int(input_ids.shape[0])
+            row0 = torch.tensor([5, tok.eos_token_id, 9, 9, 9, 9], dtype=torch.long)
+            row1 = torch.tensor([5, 6, 7, 8, 9, 10], dtype=torch.long)
+            tail = torch.stack([row0 if i == 0 else row1 for i in range(bsz)], dim=0)
+            return torch.cat([input_ids, tail], dim=1)
+
+        with patch.object(model, "generate", side_effect=_fake_generate):
+            recs = backend.generate_batch([Problem("a", "q1", "42"), Problem("b", "q2", "42")], None, 1, 6, cfg)
+        self.assertEqual(recs[0].num_tokens, 2)
+        self.assertEqual(recs[1].num_tokens, 6)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -349,9 +349,14 @@ class HFGPUBackend(TargetBackend, EditorBackend):
         from huggingface_hub import snapshot_download  # type: ignore[import-not-found]
         from transformers import AutoTokenizer  # type: ignore[import-not-found]
 
-        local_dir = Path(canonical_dir) if canonical_dir else Path(
-            snapshot_download(repo_id=model_id, cache_dir=str(cache_dir) if cache_dir else None)
-        )
+        if canonical_dir is not None:
+            local_dir = Path(canonical_dir).resolve()
+        elif Path(model_id).is_dir():
+            local_dir = Path(model_id).resolve()
+        else:
+            local_dir = Path(
+                snapshot_download(repo_id=model_id, cache_dir=str(cache_dir) if cache_dir else None)
+            )
         tokenizer = AutoTokenizer.from_pretrained(str(local_dir), trust_remote_code=trust_remote_code)
         tokenizer.padding_side = "left"
         if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
@@ -403,7 +408,15 @@ class HFGPUBackend(TargetBackend, EditorBackend):
         return "cpu"
 
     def _format_user_prompt(self, question: str, require_thinking: bool = True) -> str:
-        messages = [{"role": "user", "content": question}]
+        messages: list[dict[str, str]] = []
+        if require_thinking:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": "Think briefly without repeating checks, then output only the final answer in \\boxed{}.",
+                }
+            )
+        messages.append({"role": "user", "content": question})
         if hasattr(self.tokenizer, "apply_chat_template"):
             try:
                 return self.tokenizer.apply_chat_template(
@@ -432,7 +445,17 @@ class HFGPUBackend(TargetBackend, EditorBackend):
         if hasattr(self.tokenizer, "padding_side"):
             self.tokenizer.padding_side = "left"
         pad_tok = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id
-        eos_tok = self.tokenizer.eos_token_id
+        eos_set: set[int] = set()
+        for raw_eos in (
+            self.tokenizer.eos_token_id,
+            getattr(getattr(self.model, "generation_config", None), "eos_token_id", None),
+        ):
+            if raw_eos is None:
+                continue
+            if isinstance(raw_eos, (list, tuple, set)):
+                eos_set.update(int(x) for x in raw_eos if x is not None)
+            else:
+                eos_set.add(int(raw_eos))
         batch_size = max(1, int(self.profile.gen_batch_size))
 
         dev = self._model_device(self.model)
@@ -483,19 +506,21 @@ class HFGPUBackend(TargetBackend, EditorBackend):
 
                     for b_idx, pid in enumerate(pids):
                         new_ids = gen_ids[b_idx][prompt_width:]
-                        if pad_tok is not None and new_ids.numel() > 0:
-                            end = int(new_ids.shape[0])
-                            if pad_tok != eos_tok:
+                        n_len = int(new_ids.shape[0])
+                        if n_len > 0:
+                            eos_cut = None
+                            if eos_set:
+                                for k in range(n_len):
+                                    if int(new_ids[k].item()) in eos_set:
+                                        eos_cut = k + 1
+                                        break
+                            if eos_cut is not None:
+                                new_ids = new_ids[:eos_cut]
+                            elif pad_tok is not None and int(pad_tok) not in eos_set:
+                                end = n_len
                                 while end > 0 and int(new_ids[end - 1].item()) == int(pad_tok):
                                     end -= 1
-                            else:
-                                while (
-                                    end > 1
-                                    and int(new_ids[end - 1].item()) == int(pad_tok)
-                                    and int(new_ids[end - 2].item()) == int(pad_tok)
-                                ):
-                                    end -= 1
-                            new_ids = new_ids[:end]
+                                new_ids = new_ids[:end]
                         text = self.tokenizer.decode(new_ids, skip_special_tokens=False)
                         out.append(
                             GenerationRecord(
@@ -564,7 +589,13 @@ class HFGPUBackend(TargetBackend, EditorBackend):
                             hooks.append(mlp_down.register_forward_pre_hook(_mk_pre(l_idx)))
 
                 try:
-                    outputs = self.model(input_ids=input_ids, use_cache=False)
+                    if target in ("hidden", "mlp"):
+                        try:
+                            outputs = self.model(input_ids=input_ids, use_cache=False, logits_to_keep=1)
+                        except TypeError:
+                            outputs = self.model(input_ids=input_ids, use_cache=False)
+                    else:
+                        outputs = self.model(input_ids=input_ids, use_cache=False)
                 finally:
                     for h in hooks:
                         h.remove()
